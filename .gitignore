@@ -25,3 +25,8 @@ data/
 
 # fastembed model cache (downloaded ONNX models)
 .fastembed_cache/
+
+# Claude Code / MPM tooling (machine-local, not project state)
+.claude/
+.claude-mpm/
+.pre-commit-config.yaml
