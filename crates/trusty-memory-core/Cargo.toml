@@ -29,3 +29,7 @@ r2d2_sqlite = { workspace = true }
 # utils
 lru = { workspace = true }
 tiktoken-rs = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true }
