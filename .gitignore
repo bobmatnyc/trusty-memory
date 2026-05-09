@@ -1,0 +1,24 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Env / secrets
+.env
+.env.local
+*.pid
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# trusty-memory runtime data
+.trusty-memory/
+data/
+*.usearch
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm

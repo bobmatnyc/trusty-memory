@@ -1,0 +1,31 @@
+[package]
+name = "trusty-memory-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core types, storage, and retrieval for trusty-memory"
+license = "MIT"
+
+[dependencies]
+# workspace
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+
+# storage
+usearch = "2.25"
+fastembed = "5"
+rusqlite = { version = "0.39", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.33"
+
+# utils
+lru = "0.12"
+tiktoken-rs = "0.5"

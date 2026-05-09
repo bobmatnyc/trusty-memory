@@ -1,0 +1,18 @@
+[package]
+name = "trusty-memory-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "MCP server (stdio + HTTP/SSE) for trusty-memory"
+license = "MIT"
+
+[dependencies]
+trusty-memory-core = { path = "../trusty-memory-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+clap = { workspace = true }

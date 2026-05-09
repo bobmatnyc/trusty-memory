@@ -1,0 +1,47 @@
+[workspace]
+members = ["crates/trusty-memory-core", "crates/trusty-memory-mcp", "."]
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dashmap = "5"
+parking_lot = "0.12"
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+reqwest = { version = "0.12", features = ["json"], default-features = false }
+clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
+
+[package]
+name = "trusty-memory"
+version = "0.1.0"
+edition = "2021"
+description = "Machine-wide AI memory service with Memory Palace architecture"
+license = "MIT"
+repository = "https://github.com/bobmatnyc/trusty-memory"
+
+[[bin]]
+name = "trusty-memory"
+path = "src/main.rs"
+
+[dependencies]
+trusty-memory-core = { path = "crates/trusty-memory-core" }
+trusty-memory-mcp = { path = "crates/trusty-memory-mcp" }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+dotenvy = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }

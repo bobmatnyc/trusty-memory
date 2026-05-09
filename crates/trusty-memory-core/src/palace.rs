@@ -1,0 +1,127 @@
+//! Memory Palace data model: Palace -> Wing -> Room -> Closet -> Drawer.
+//!
+//! Why: A 5-level spatial hierarchy is the load-bearing concept for trusty-memory's
+//! progressive retrieval; modeling it as Rust types keeps the rest of the system
+//! compiler-checked.
+//! What: Defines `PalaceId`, `Palace`, `Wing`, `RoomType`, `Room`, and `Drawer`.
+//! Test: `cargo test -p trusty-memory-core palace::` constructs each type and
+//! verifies serde round-trips.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use uuid::Uuid;
+
+/// Stable, human-readable identifier for a Palace (e.g. `"trusty-memory"`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PalaceId(pub String);
+
+impl PalaceId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PalaceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Top-level namespace for a project or domain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Palace {
+    pub id: PalaceId,
+    pub name: String,
+    pub description: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub data_dir: PathBuf,
+}
+
+/// A wing groups rooms by domain area or agent persona.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Wing {
+    pub id: Uuid,
+    pub palace_id: PalaceId,
+    pub name: String,
+}
+
+/// Topical category for a Room. Custom variants allow project-specific topics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RoomType {
+    Frontend,
+    Backend,
+    Testing,
+    Planning,
+    Documentation,
+    Research,
+    Configuration,
+    Meetings,
+    General,
+    Custom(String),
+}
+
+/// A room is a topic-bound container of drawers within a wing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Room {
+    pub id: Uuid,
+    pub wing_id: Uuid,
+    pub room_type: RoomType,
+}
+
+/// Atomic memory unit: verbatim text plus metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Drawer {
+    pub id: Uuid,
+    pub room_id: Uuid,
+    pub content: String,
+    /// Importance in [0.0, 1.0]. Used to rank L1 essential drawers.
+    pub importance: f32,
+    pub source_file: Option<PathBuf>,
+    pub created_at: DateTime<Utc>,
+    pub tags: Vec<String>,
+}
+
+impl Drawer {
+    /// Create a new drawer with default importance (0.5) and no tags.
+    ///
+    /// Why: Most call sites only need to specify room_id and content; this avoids
+    /// boilerplate at insertion points.
+    /// What: Returns a `Drawer` with a fresh UUID and `created_at = now`.
+    /// Test: Assert `Drawer::new(room, "x").importance == 0.5` and `id != Uuid::nil()`.
+    pub fn new(room_id: Uuid, content: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            room_id,
+            content: content.into(),
+            importance: 0.5,
+            source_file: None,
+            created_at: Utc::now(),
+            tags: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drawer_new_has_default_importance() {
+        let d = Drawer::new(Uuid::new_v4(), "hello");
+        assert_eq!(d.importance, 0.5);
+        assert_eq!(d.content, "hello");
+        assert!(d.tags.is_empty());
+    }
+
+    #[test]
+    fn palace_id_display_matches_str() {
+        let id = PalaceId::new("trusty-memory");
+        assert_eq!(id.to_string(), "trusty-memory");
+        assert_eq!(id.as_str(), "trusty-memory");
+    }
+}
