@@ -1,13 +1,21 @@
-//! Vector store trait and usearch HNSW implementation stub.
+//! Vector store trait and usearch HNSW implementation.
 //!
 //! Why: Most queries hit the vector index; making it pluggable lets us mock it in
 //! tests and swap implementations without touching retrieval code.
-//! What: `VectorStore` async trait + `UsearchStore` placeholder.
-//! Test: Once implemented, `upsert` then `search` should return the inserted id
-//! at rank 0 with score >= 0.99 for an identical query vector.
+//! What: `VectorStore` async trait + `UsearchStore` backed by an
+//! `Arc<RwLock<usearch::Index>>` persisted to disk after each mutation.
+//! Test: `upsert` then `search` returns the inserted id at rank 0 with score
+//! at least 0.99 for an identical query vector; `remove` then `search` no
+//! longer returns the removed id; reopening the store from the same path
+//! retrieves previously inserted vectors.
 
-use anyhow::Result;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
 use async_trait::async_trait;
+use parking_lot::RwLock;
+use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -23,11 +31,276 @@ pub trait VectorStore: Send + Sync {
     async fn remove(&self, id: Uuid) -> Result<()>;
 }
 
+/// Initial capacity reserved when creating a new index. usearch grows the
+/// index dynamically when `add` exceeds capacity, but reserving a reasonable
+/// chunk up front avoids many tiny reallocations during palace warm-up.
+const DEFAULT_INITIAL_CAPACITY: usize = 1024;
+
+/// Convert a UUID into a u64 key suitable for usearch.
+///
+/// Why: usearch keys are u64 but our drawer ids are UUIDs. Taking the first 8
+/// bytes (little-endian) of the UUID is collision-resistant enough for a
+/// per-palace index (UUID v4 entropy in those bytes is 64 bits).
+/// What: Returns `u64::from_le_bytes(uuid.as_bytes()[..8])`.
+/// Test: Round-trip via `key_to_uuid` preserves the first 8 bytes.
+fn uuid_to_key(id: Uuid) -> u64 {
+    let bytes = id.as_bytes();
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&bytes[..8]);
+    u64::from_le_bytes(head)
+}
+
+/// Reverse of `uuid_to_key`. Last 8 bytes of the resulting UUID are zero —
+/// search results are matched back to drawers via the first-8-byte prefix.
+///
+/// Why: We only ever round-trip keys we wrote ourselves; callers must reconcile
+/// the returned UUID with their own drawer table by prefix or by storing the
+/// `(key -> drawer_id)` mapping at upsert time.
+/// What: Builds a 16-byte UUID with `key.to_le_bytes()` in the first 8 bytes
+/// and zeros in the last 8.
+/// Test: `key_to_uuid(uuid_to_key(id))` matches `id` on the first 8 bytes.
+fn key_to_uuid(key: u64) -> Uuid {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&key.to_le_bytes());
+    Uuid::from_bytes(bytes)
+}
+
 /// usearch HNSW-backed store.
 ///
 /// Why: usearch gives us high-quality HNSW with disk persistence and a tiny C++
 /// dependency. We wrap the index in `Arc<RwLock<_>>` so many concurrent reads
 /// (search) never block each other; only mutations take the write lock.
-/// What: Stub — real impl will hold an `Arc<RwLock<usearch::Index>>`.
-/// Test: Insert a vector, search with the same vector, expect score ~ 1.0.
-pub struct UsearchStore;
+/// What: Holds an `Arc<RwLock<usearch::Index>>` plus the on-disk path and
+/// vector dimensionality. `upsert` / `remove` persist the index after every
+/// mutation; `search` returns hits with score = `1.0 - distance` (cosine).
+/// Test: See module-level tests covering insert+search, remove, and reload.
+pub struct UsearchStore {
+    index: Arc<RwLock<Index>>,
+    path: PathBuf,
+    #[allow(dead_code)]
+    dim: usize,
+}
+
+impl UsearchStore {
+    /// Open or create a usearch HNSW index at `path` with `dim`-dimensional
+    /// f32 vectors and cosine similarity.
+    ///
+    /// Why: A palace's vector index must survive process restarts; opening
+    /// transparently from the same path is the contract the registry relies
+    /// on.
+    /// What: If `path` exists, build an `Index` matching the on-disk header
+    /// and `load` it; otherwise build a fresh `Index` with sensible defaults
+    /// and reserve initial capacity. Either way, return a store wrapping it
+    /// in `Arc<RwLock<_>>`.
+    /// Test: Create store, upsert, drop store, reopen at the same path,
+    /// search returns the previously inserted vector.
+    pub fn new(path: PathBuf, dim: usize) -> Result<Self> {
+        let options = IndexOptions {
+            dimensions: dim,
+            metric: MetricKind::Cos,
+            quantization: ScalarKind::F32,
+            ..Default::default()
+        };
+
+        let index = Index::new(&options)
+            .map_err(|e| anyhow::anyhow!("failed to create usearch index: {e}"))?;
+
+        if path.exists() {
+            let path_str = path
+                .to_str()
+                .with_context(|| format!("usearch path is not valid UTF-8: {path:?}"))?;
+            index.load(path_str).map_err(|e| {
+                anyhow::anyhow!("failed to load usearch index from {path_str}: {e}")
+            })?;
+        } else {
+            // Ensure parent directory exists before any future save.
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("failed to create parent dir for usearch index: {parent:?}")
+                    })?;
+                }
+            }
+            index
+                .reserve(DEFAULT_INITIAL_CAPACITY)
+                .map_err(|e| anyhow::anyhow!("failed to reserve usearch capacity: {e}"))?;
+        }
+
+        Ok(Self {
+            index: Arc::new(RwLock::new(index)),
+            path,
+            dim,
+        })
+    }
+}
+
+#[async_trait]
+impl VectorStore for UsearchStore {
+    async fn upsert(&self, id: Uuid, embedding: Vec<f32>) -> Result<()> {
+        let index = self.index.clone();
+        let path = self.path.clone();
+        // Index operations are CPU/IO-bound C++ calls; run on a blocking thread
+        // so we don't stall the async reactor.
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let guard = index.write();
+            let key = uuid_to_key(id);
+
+            // Grow capacity if we're at the limit. usearch's `add` can fail
+            // when capacity is exhausted; reserve in chunks rather than
+            // doubling on every insert.
+            let size = guard.size();
+            let capacity = guard.capacity();
+            if size + 1 > capacity {
+                let new_capacity = (capacity.max(DEFAULT_INITIAL_CAPACITY)).saturating_mul(2);
+                guard
+                    .reserve(new_capacity)
+                    .map_err(|e| anyhow::anyhow!("failed to grow usearch capacity: {e}"))?;
+            }
+
+            // `add` updates an existing key's vector in-place when the index
+            // was built with `multi=false` (our default).
+            guard
+                .add(key, &embedding)
+                .map_err(|e| anyhow::anyhow!("failed to add vector to usearch: {e}"))?;
+
+            let path_str = path
+                .to_str()
+                .with_context(|| format!("usearch path is not valid UTF-8: {path:?}"))?;
+            guard
+                .save(path_str)
+                .map_err(|e| anyhow::anyhow!("failed to save usearch index: {e}"))?;
+            Ok(())
+        })
+        .await
+        .context("upsert task panicked")??;
+        Ok(())
+    }
+
+    async fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<VectorHit>> {
+        let index = self.index.clone();
+        let query = query.to_vec();
+        tokio::task::spawn_blocking(move || -> Result<Vec<VectorHit>> {
+            let guard = index.read();
+            let matches = guard
+                .search(&query, top_k)
+                .map_err(|e| anyhow::anyhow!("usearch search failed: {e}"))?;
+
+            let mut hits: Vec<VectorHit> = matches
+                .keys
+                .into_iter()
+                .zip(matches.distances)
+                .map(|(key, distance)| VectorHit {
+                    drawer_id: key_to_uuid(key),
+                    // Cosine distance in usearch is `1 - cosine_similarity`,
+                    // so similarity = 1 - distance. Clamp to keep the
+                    // floating-point boundary clean for callers that compare
+                    // to thresholds like 0.99.
+                    score: (1.0_f32 - distance).clamp(0.0, 1.0),
+                })
+                .collect();
+
+            // usearch already returns ascending distance, so descending score
+            // is implied — but make it explicit for downstream consumers.
+            hits.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            Ok(hits)
+        })
+        .await
+        .context("search task panicked")?
+    }
+
+    async fn remove(&self, id: Uuid) -> Result<()> {
+        let index = self.index.clone();
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let guard = index.write();
+            let key = uuid_to_key(id);
+            guard
+                .remove(key)
+                .map_err(|e| anyhow::anyhow!("failed to remove vector from usearch: {e}"))?;
+
+            let path_str = path
+                .to_str()
+                .with_context(|| format!("usearch path is not valid UTF-8: {path:?}"))?;
+            guard
+                .save(path_str)
+                .map_err(|e| anyhow::anyhow!("failed to save usearch index: {e}"))?;
+            Ok(())
+        })
+        .await
+        .context("remove task panicked")??;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn unit_vec(dim: usize, seed: u32) -> Vec<f32> {
+        let raw: Vec<f32> = (0..dim).map(|i| ((i as u32 + seed) as f32) + 1.0).collect();
+        let norm: f32 = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+        raw.into_iter().map(|x| x / norm).collect()
+    }
+
+    #[tokio::test]
+    async fn upsert_then_search_returns_same_vector_at_rank_0() {
+        let dir = tempdir().unwrap();
+        let store = UsearchStore::new(dir.path().join("test.usearch"), 384).unwrap();
+        let id = Uuid::new_v4();
+        let v = unit_vec(384, 0);
+
+        store.upsert(id, v.clone()).await.unwrap();
+        let hits = store.search(&v, 1).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(uuid_to_key(hits[0].drawer_id), uuid_to_key(id));
+        assert!(hits[0].score >= 0.99, "score was {}", hits[0].score);
+    }
+
+    #[tokio::test]
+    async fn remove_clears_vector() {
+        let dir = tempdir().unwrap();
+        let store = UsearchStore::new(dir.path().join("test.usearch"), 384).unwrap();
+        let id = Uuid::new_v4();
+        let v = unit_vec(384, 7);
+        store.upsert(id, v.clone()).await.unwrap();
+        store.remove(id).await.unwrap();
+
+        let hits = store.search(&v, 5).await.unwrap();
+        assert!(
+            !hits
+                .iter()
+                .any(|h| uuid_to_key(h.drawer_id) == uuid_to_key(id)),
+            "removed id still present in results"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_and_reload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.usearch");
+        let id = Uuid::new_v4();
+        let v = unit_vec(384, 13);
+        {
+            let store = UsearchStore::new(path.clone(), 384).unwrap();
+            store.upsert(id, v.clone()).await.unwrap();
+        }
+        let store2 = UsearchStore::new(path, 384).unwrap();
+        let hits = store2.search(&v, 1).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(uuid_to_key(hits[0].drawer_id), uuid_to_key(id));
+        assert!(hits[0].score >= 0.99, "score was {}", hits[0].score);
+    }
+
+    #[test]
+    fn uuid_key_round_trip_preserves_prefix() {
+        let id = Uuid::new_v4();
+        let key = uuid_to_key(id);
+        let round = key_to_uuid(key);
+        assert_eq!(&id.as_bytes()[..8], &round.as_bytes()[..8]);
+    }
+}
