@@ -56,3 +56,5 @@ dotenvy = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,89 @@
+//! Why: Lock the MCP tool surface so accidental schema drift breaks CI before
+//! a Claude Code client sees it.
+//! What: Verifies all 7 tools are advertised and the JSON-RPC handshake +
+//! tools/call round-trip return the expected envelope shapes.
+//! Test: `cargo test --test mcp_server_test`.
+
+use serde_json::json;
+use trusty_memory_mcp::{handle_message, tools::tool_definitions, AppState};
+
+#[test]
+fn all_seven_tools_are_advertised() {
+    let defs = tool_definitions();
+    let tools = defs
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .expect("tools array");
+    assert_eq!(tools.len(), 7, "expected exactly 7 MCP tools");
+
+    let names: Vec<&str> = tools
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+        .collect();
+
+    for expected in [
+        "memory_remember",
+        "memory_recall",
+        "memory_recall_deep",
+        "palace_create",
+        "palace_list",
+        "kg_assert",
+        "kg_query",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "missing tool {expected} in {names:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn initialize_then_list_then_call_handshake() {
+    let state = AppState::new();
+
+    // 1) initialize
+    let init = handle_message(
+        &state,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "it", "version": "0"}}
+        }),
+    )
+    .await;
+    assert_eq!(init["result"]["protocolVersion"], "2024-11-05");
+
+    // 2) initialized notification — no response
+    let notif = handle_message(
+        &state,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .await;
+    assert!(notif.is_null());
+
+    // 3) tools/list
+    let list = handle_message(
+        &state,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    )
+    .await;
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 7);
+
+    // 4) tools/call
+    let call = handle_message(
+        &state,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "memory_remember",
+                "arguments": {"palace": "it-palace", "text": "first memory"}
+            }
+        }),
+    )
+    .await;
+    let content = call["result"]["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "text");
+    assert!(content[0]["text"].as_str().unwrap().contains("drawer_id"));
+}
