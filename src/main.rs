@@ -143,12 +143,42 @@ async fn main() -> Result<()> {
             skip_migration,
             migrate_only,
         } => {
-            println!("trusty-memory setup");
-            println!("  non_interactive: {non_interactive}");
-            println!("  skip_migration: {skip_migration}");
-            println!("  migrate_only: {migrate_only}");
-            println!("(full implementation in #14)");
+            let opts = cli::setup::SetupOpts {
+                non_interactive,
+                skip_migration,
+                migrate_only,
+            };
+            cli::setup::handle_setup(opts, &out).await?;
         }
+
+        Commands::Chat {
+            message,
+            top_k,
+            remember,
+        } => {
+            let opts = cli::chat::ChatOpts {
+                message,
+                remember,
+                top_k,
+            };
+            cli::chat::handle_chat(&palace, opts, &out).await?;
+        }
+
+        Commands::Config(sub) => match sub {
+            cli::ConfigCommands::Show => {
+                let cfg = cli::config::UserConfig::load()?;
+                let path = cli::config::default_config_path()?;
+                println!("config: {}", path.display());
+                println!("{}", toml::to_string_pretty(&cfg)?);
+            }
+            cli::ConfigCommands::Set { key, value } => {
+                let mut cfg = cli::config::UserConfig::load().unwrap_or_default();
+                cfg.set_dotted(&key, &value)?;
+                cfg.save()?;
+                let path = cli::config::default_config_path()?;
+                println!("set {key} in {}", path.display());
+            }
+        },
 
         Commands::Status => {
             let binary = std::env::current_exe()?;

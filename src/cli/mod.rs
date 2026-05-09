@@ -13,6 +13,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 pub mod analytics;
+pub mod chat;
+pub mod config;
 pub mod decay;
 pub mod dream;
 pub mod git;
@@ -21,6 +23,7 @@ pub mod kuzu;
 pub mod output;
 pub mod palace;
 pub mod palace_resolver;
+pub mod setup;
 
 #[derive(Parser)]
 #[command(
@@ -160,6 +163,28 @@ pub enum Commands {
         mcp: bool,
     },
 
+    /// Chat with an OpenRouter model using palace memory as context.
+    #[command(
+        after_help = "Examples:\n  trusty-memory chat \"what do you know about the auth system?\"\n  trusty-memory chat \"summarize today\" --remember\n  trusty-memory chat \"deploy steps\" --palace ops"
+    )]
+    Chat {
+        /// Message to send to the model.
+        message: String,
+        /// Top-k drawers to include in the memory context.
+        #[arg(short = 'k', long, default_value = "10")]
+        top_k: usize,
+        /// Persist the assistant response back into the palace.
+        #[arg(long)]
+        remember: bool,
+    },
+
+    /// Manage user configuration in `~/.trusty-memory/config.toml`.
+    #[command(
+        subcommand,
+        after_help = "Examples:\n  trusty-memory config show\n  trusty-memory config set openrouter.api_key sk-or-..."
+    )]
+    Config(ConfigCommands),
+
     /// Machine setup wizard.
     Setup {
         #[arg(long)]
@@ -289,4 +314,12 @@ pub enum DreamCommands {
     Run,
     /// Show last dream run stats.
     Status,
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCommands {
+    /// Print the resolved user configuration.
+    Show,
+    /// Set a dotted config key (e.g. `openrouter.api_key sk-or-...`).
+    Set { key: String, value: String },
 }
