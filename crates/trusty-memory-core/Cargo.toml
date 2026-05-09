@@ -20,12 +20,12 @@ dashmap = { workspace = true }
 parking_lot = { workspace = true }
 
 # storage
-usearch = "2.25"
-fastembed = "5"
-rusqlite = { version = "0.39", features = ["bundled"] }
-r2d2 = "0.8"
-r2d2_sqlite = "0.33"
+usearch = { workspace = true }
+fastembed = { workspace = true }
+rusqlite = { workspace = true }
+r2d2 = { workspace = true }
+r2d2_sqlite = { workspace = true }
 
 # utils
-lru = "0.12"
-tiktoken-rs = "0.5"
+lru = { workspace = true }
+tiktoken-rs = { workspace = true }
