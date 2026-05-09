@@ -336,16 +336,94 @@ impl McpDriver {
 
 // ── Per-system MCP configs ──────────────────────────────────────────────────
 
-/// Default content-prefix matcher: scans the concatenated text blocks of an
-/// MCP tool result for the first 40 chars of each known doc, mapping back to
-/// bench ids in insertion order.
+/// Rank-preserving content matcher for mempalace `mempalace_search` responses.
 ///
-/// Why: Both mempalace_search and kuzu_recall return free-text or JSON blobs
-/// that include the original drawer/memory content; matching on a prefix is
-/// robust to whichever surface form the server picks.
+/// Why: `mempalace_search` returns a JSON object (embedded as a string inside
+/// `content[0].text`) with a `results` array ordered by relevance score.
+/// The previous `extract_by_content_match` iterated the *corpus* in insertion
+/// order and emitted every doc whose 40-char prefix appeared anywhere in the
+/// blob — causing results to come out in corpus order (d1 before d20) rather
+/// than in the rank order mempalace computed. This destroyed R@1 and MRR for
+/// any query whose highest-ranked doc was not also the lowest-numbered doc in
+/// the corpus.
+/// What: Parses the embedded JSON from `content[0].text`, iterates the
+/// `results[]` array in the order the server returned them, and maps each
+/// `result.text` back to a bench doc id by 40-char prefix comparison against
+/// the corpus lookup table. Falls back to the generic blob scan if the JSON
+/// does not have a `results` key (e.g. older server versions).
+/// Test: Exercised end-to-end via `bench compare --mempalace`.
+fn extract_mempalace_search(
+    result: &serde_json::Value,
+    corpus: &[(String, String)],
+) -> Vec<String> {
+    // Build a prefix -> bench-id lookup once (O(n) on corpus size).
+    let prefix_map: Vec<(String, &str)> = corpus
+        .iter()
+        .map(|(id, content)| {
+            let prefix: String = content.chars().take(40).collect();
+            (prefix.trim().to_string(), id.as_str())
+        })
+        .collect();
+
+    // Extract the raw text from content[0].text (mempalace embeds JSON there).
+    let text = result
+        .get("content")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Try to parse the structured JSON response and iterate results in rank order.
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
+        if let Some(results_arr) = parsed.get("results").and_then(|v| v.as_array()) {
+            let mut out: Vec<String> = Vec::new();
+            for hit in results_arr {
+                let hit_text = hit.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                // Match by 40-char prefix against corpus entries.
+                for (prefix, bench_id) in &prefix_map {
+                    if !prefix.is_empty() && hit_text.starts_with(prefix.as_str()) {
+                        let id = bench_id.to_string();
+                        if !out.contains(&id) {
+                            out.push(id);
+                        }
+                        break;
+                    }
+                }
+            }
+            if !out.is_empty() {
+                return out;
+            }
+        }
+    }
+
+    // Fallback: generic blob scan (corpus-order, used if JSON parse fails).
+    let blob = if text.is_empty() {
+        result.to_string()
+    } else {
+        text.to_string()
+    };
+    let mut out: Vec<String> = Vec::new();
+    for (prefix, bench_id) in &prefix_map {
+        if !prefix.is_empty() && blob.contains(prefix.as_str()) {
+            let id = bench_id.to_string();
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// Generic content-prefix matcher for MCP systems that return free-text blobs.
+///
+/// Why: kuzu_recall and other systems that do not return structured JSON need a
+/// fallback that at least finds which docs are present. Rank fidelity is best-
+/// effort here since there is no machine-readable rank signal.
 /// What: Concatenates `result.content[*].text` (or stringifies the result),
-/// then walks `corpus` and emits each id whose content prefix appears.
-/// Test: Exercised end-to-end via `bench compare --mempalace --kuzu`.
+/// then walks `corpus` in insertion order and emits each id whose 40-char
+/// content prefix appears.
+/// Test: Exercised end-to-end via `bench compare --kuzu`.
 fn extract_by_content_match(
     result: &serde_json::Value,
     corpus: &[(String, String)],
@@ -401,7 +479,7 @@ pub fn mempalace_config(palace_path: PathBuf) -> McpDriverConfig {
         },
         search_tool: "mempalace_search".into(),
         search_args_fn: |q, k| serde_json::json!({"query": q, "limit": k}),
-        extract_ids_fn: extract_by_content_match,
+        extract_ids_fn: extract_mempalace_search,
     }
 }
 
@@ -820,6 +898,62 @@ mod tests {
         assert_eq!(m.recall_at_1, 0.0);
         assert_eq!(m.recall_at_k, 0.0);
         assert_eq!(m.mrr, 0.0);
+    }
+
+    /// Verifies that `extract_mempalace_search` preserves the rank order
+    /// returned by the server's `results[]` array rather than the corpus
+    /// insertion order.
+    ///
+    /// Why: The previous `extract_by_content_match` iterated the corpus in
+    /// insertion order, so a doc ranked #1 by mempalace could appear at
+    /// position 4 in the output if three lower-numbered docs also appeared in
+    /// the top-K blob. This test pins the fixed behaviour.
+    /// What: Constructs a synthetic MCP response where d3 ranks first, then
+    /// d1; asserts the extraction returns [d3, d1], not [d1, d3].
+    /// Test: This test itself.
+    #[test]
+    fn extract_mempalace_preserves_rank_order() {
+        // Corpus: d1, d2, d3 in insertion order.
+        let corpus: Vec<(String, String)> = vec![
+            ("d1".into(), "Alpha beta gamma delta epsilon zeta eta theta iota kappa.".into()),
+            ("d2".into(), "Lambda mu nu xi omicron pi rho sigma tau upsilon phi chi.".into()),
+            ("d3".into(), "Omega psi chi phi upsilon tau sigma rho pi omicron xi nu.".into()),
+        ];
+
+        // Synthetic mempalace_search response: d3 ranked first, d1 second, d2 absent.
+        let response_text = serde_json::json!({
+            "query": "test",
+            "results": [
+                {"text": "Omega psi chi phi upsilon tau sigma rho pi omicron xi nu.", "similarity": 0.9},
+                {"text": "Alpha beta gamma delta epsilon zeta eta theta iota kappa.", "similarity": 0.4},
+            ]
+        })
+        .to_string();
+
+        let mcp_result = serde_json::json!({
+            "content": [{"type": "text", "text": response_text}]
+        });
+
+        let ids = extract_mempalace_search(&mcp_result, &corpus);
+        assert_eq!(
+            ids,
+            vec!["d3", "d1"],
+            "expected rank order [d3, d1] (server-returned), got {ids:?}"
+        );
+    }
+
+    /// Verifies that `extract_mempalace_search` falls back gracefully to the
+    /// blob scan when the text is not valid JSON.
+    #[test]
+    fn extract_mempalace_fallback_on_plain_text() {
+        let corpus: Vec<(String, String)> = vec![
+            ("d1".into(), "The quick brown fox jumps over the lazy dog.".into()),
+        ];
+        let mcp_result = serde_json::json!({
+            "content": [{"type": "text", "text": "The quick brown fox jumps over the lazy dog."}]
+        });
+        let ids = extract_mempalace_search(&mcp_result, &corpus);
+        assert_eq!(ids, vec!["d1"]);
     }
 
     /// End-to-end: insert all 20 docs into a fresh trusty palace, run all 10
