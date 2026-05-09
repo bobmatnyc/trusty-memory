@@ -1,0 +1,30 @@
+{"type":"document","id":"d1","content":"The Rust borrow checker enforces memory safety at compile time without garbage collection.","room":"Backend","tags":["rust","memory-safety"]}
+{"type":"document","id":"d2","content":"fastembed uses the all-MiniLM-L6-v2 model producing 384-dimensional vectors.","room":"Backend","tags":["embeddings","ml"]}
+{"type":"document","id":"d3","content":"SQLite WAL mode allows concurrent readers with a single writer, ideal for read-heavy workloads.","room":"Backend","tags":["sqlite","database"]}
+{"type":"document","id":"d4","content":"The MCP protocol uses JSON-RPC 2.0 over stdio for tool-calling between Claude and servers.","room":"Backend","tags":["mcp","protocol"]}
+{"type":"document","id":"d5","content":"HNSW (Hierarchical Navigable Small World) graphs provide approximate nearest-neighbor search in O(log N) time.","room":"Backend","tags":["vector-search","algorithms"]}
+{"type":"document","id":"d6","content":"tokio::task::spawn_blocking moves CPU-intensive or blocking I/O off the async reactor thread.","room":"Backend","tags":["tokio","async"]}
+{"type":"document","id":"d7","content":"DashMap provides concurrent hash map access without global locks, suitable for registry patterns.","room":"Backend","tags":["concurrency","rust"]}
+{"type":"document","id":"d8","content":"The Memory Palace hierarchy: Palace → Wing → Room → Closet → Drawer organizes memories spatially.","room":"General","tags":["architecture","memory-palace"]}
+{"type":"document","id":"d9","content":"L0 loads identity.txt (~100 tokens) on every request. L1 pre-caches top-15 drawers by importance.","room":"General","tags":["retrieval","architecture"]}
+{"type":"document","id":"d10","content":"Temporal decay: effective_importance = base * 2^(-age_days/half_life) + accumulated_boost.","room":"General","tags":["decay","scoring"]}
+{"type":"document","id":"d11","content":"FNV-1a hash: offset_basis=14695981039346656037, prime=1099511628211. Used for query normalization.","room":"Backend","tags":["hashing","analytics"]}
+{"type":"document","id":"d12","content":"Palace persistence: palace.json holds metadata, identity.txt holds L0 text, l1_cache.json snapshots top-15 drawers.","room":"General","tags":["persistence","storage"]}
+{"type":"document","id":"d13","content":"OpenRouter provides an OpenAI-compatible API at https://openrouter.ai/api/v1/chat/completions.","room":"General","tags":["openrouter","llm"]}
+{"type":"document","id":"d14","content":"Conventional commits: feat, fix, chore, docs, test, refactor, perf. Breaking changes marked with !.","room":"General","tags":["git","conventions"]}
+{"type":"document","id":"d15","content":"The KG triple schema: subject, predicate, object, valid_from, valid_to, confidence, provenance.","room":"Backend","tags":["knowledge-graph","schema"]}
+{"type":"document","id":"d16","content":"r2d2 connection pools over SQLite; each checkout is a physical connection with WAL mode enabled.","room":"Backend","tags":["sqlite","r2d2"]}
+{"type":"document","id":"d17","content":"usearch index is saved after every upsert via index.save(path). Capacity auto-doubles when full.","room":"Backend","tags":["usearch","vector-store"]}
+{"type":"document","id":"d18","content":"Palace cold-start benchmark: usearch reopen ~10 µs, KG open ~1.2 ms. Combined under 2 ms.","room":"General","tags":["performance","benchmarks"]}
+{"type":"document","id":"d19","content":"The setup wizard discovers Claude Code projects by walking ~/Projects for .claude/ or CLAUDE.md.","room":"General","tags":["setup","cli"]}
+{"type":"document","id":"d20","content":"RecallLog uses FNV-1a to hash normalized queries, tracks hit/miss counts in analytics.db.","room":"General","tags":["analytics","recall"]}
+{"type":"query","id":"q1","text":"how does memory safety work in Rust?","relevant":["d1","d7"]}
+{"type":"query","id":"q2","text":"what embedding model is used?","relevant":["d2"]}
+{"type":"query","id":"q3","text":"how does SQLite handle concurrent reads?","relevant":["d3","d16"]}
+{"type":"query","id":"q4","text":"what is the MCP protocol?","relevant":["d4"]}
+{"type":"query","id":"q5","text":"how fast is vector search?","relevant":["d5","d18"]}
+{"type":"query","id":"q6","text":"what is the palace hierarchy structure?","relevant":["d8","d9"]}
+{"type":"query","id":"q7","text":"how does temporal decay work?","relevant":["d10"]}
+{"type":"query","id":"q8","text":"how are palaces persisted to disk?","relevant":["d12","d17"]}
+{"type":"query","id":"q9","text":"what is the knowledge graph schema?","relevant":["d15"]}
+{"type":"query","id":"q10","text":"how does hit tracking work?","relevant":["d20","d11"]}

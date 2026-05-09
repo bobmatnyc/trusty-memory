@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 pub mod analytics;
+pub mod bench;
 pub mod chat;
 pub mod config;
 pub mod decay;
@@ -195,6 +196,10 @@ pub enum Commands {
         migrate_only: bool,
     },
 
+    /// Competitive retrieval benchmarking.
+    #[command(subcommand)]
+    Bench(BenchCommands),
+
     /// Show daemon health and palace summary.
     Status,
 
@@ -322,4 +327,37 @@ pub enum ConfigCommands {
     Show,
     /// Set a dotted config key (e.g. `openrouter.api_key sk-or-...`).
     Set { key: String, value: String },
+}
+
+#[derive(Subcommand)]
+pub enum BenchCommands {
+    /// Compare retrieval quality across systems on a labeled corpus.
+    #[command(
+        after_help = "Examples:\n  trusty-memory bench compare\n  trusty-memory bench compare --systems trusty,mempalace --mempalace-cmd 'mempalace serve --mcp'\n  trusty-memory bench compare --top-k 10"
+    )]
+    Compare(BenchCompareArgs),
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct BenchCompareArgs {
+    /// Path to JSONL corpus (documents + labeled queries).
+    #[arg(long, default_value = "tests/fixtures/bench_corpus.jsonl")]
+    pub corpus: PathBuf,
+
+    /// K for Recall@K.
+    #[arg(long, default_value = "5")]
+    pub top_k: usize,
+
+    /// Comma-separated systems to compare. trusty is always usable; add
+    /// mempalace and/or kuzu to drive their MCP servers.
+    #[arg(long, value_delimiter = ',', default_value = "trusty")]
+    pub systems: Vec<String>,
+
+    /// Command line for the mempalace MCP server (used when `mempalace` in --systems).
+    #[arg(long)]
+    pub mempalace_cmd: Option<String>,
+
+    /// Command line for the kuzu-memory MCP server (used when `kuzu` in --systems).
+    #[arg(long)]
+    pub kuzu_cmd: Option<String>,
 }

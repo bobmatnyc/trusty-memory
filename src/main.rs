@@ -180,6 +180,19 @@ async fn main() -> Result<()> {
             }
         },
 
+        Commands::Bench(sub) => match sub {
+            cli::BenchCommands::Compare(args) => {
+                let opts = cli::bench::BenchCompareOpts {
+                    corpus: args.corpus,
+                    top_k: args.top_k,
+                    systems: args.systems,
+                    mempalace_cmd: args.mempalace_cmd,
+                    kuzu_cmd: args.kuzu_cmd,
+                };
+                cli::bench::handle_bench_compare(opts).await?;
+            }
+        },
+
         Commands::Status => {
             let binary = std::env::current_exe()?;
             let root = cli::palace::data_root()?;
