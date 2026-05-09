@@ -224,18 +224,43 @@ impl SystemDriver for TrustyDriver {
 
 // ── MCP subprocess driver ───────────────────────────────────────────────────
 
+/// Configuration for an MCP-speaking peer system.
+///
+/// Why: Different MCP memory servers (mempalace, kuzu-memory) use different
+/// tool names and argument shapes. Rather than hard-coding one shape, we
+/// parameterize the driver with closures that map bench data into the
+/// system's expected JSON.
+/// What: Carries the spawn command, env, working dir, and the per-system
+/// (insert_tool, search_tool) names and arg/extract functions.
+/// Test: `mempalace_config` and `kuzu_config` produce configs used by the
+/// integration run; the field set is exercised end-to-end by `handle_bench_compare`.
+/// `(result, corpus_pairs) -> matching bench ids`.
+pub type ExtractIdsFn = fn(&serde_json::Value, &[(String, String)]) -> Vec<String>;
+
+pub struct McpDriverConfig {
+    pub name: String,
+    pub cmd: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub working_dir: Option<PathBuf>,
+    pub insert_tool: String,
+    pub insert_args_fn: fn(&BenchDoc) -> serde_json::Value,
+    pub search_tool: String,
+    pub search_args_fn: fn(&str, usize) -> serde_json::Value,
+    pub extract_ids_fn: ExtractIdsFn,
+}
+
 /// Drives a peer system over MCP stdio (JSON-RPC 2.0).
 ///
 /// Why: mempalace and kuzu-memory both expose MCP servers; talking to them via
 /// their published surface is the most honest comparison we can run.
-/// What: Spawns `cmd` as a subprocess, performs the `initialize` handshake,
-/// then maps `insert` / `query` to `tools/call` for `memory_remember` /
-/// `memory_recall` (or the configured tool names).
-/// Test: Manual — run against a real `mempalace serve` binary.
+/// What: Spawns the configured command as a subprocess, performs the
+/// `initialize` handshake, then maps `insert` / `query` to `tools/call`
+/// using the per-system tool names and arg builders.
+/// Test: Manual — run against real `mempalace-mcp` and `kuzu-memory mcp`
+/// binaries via `bench compare --mempalace --kuzu`.
 pub struct McpDriver {
     name: String,
-    insert_tool: String,
-    query_tool: String,
+    cfg: McpDriverConfig,
     /// Mapping of bench doc ids to their content; we scan the recall response
     /// text for these substrings since MCP returns free-text content blocks.
     doc_index: Arc<Mutex<Vec<(String, String)>>>,
@@ -250,20 +275,30 @@ struct McpInner {
 }
 
 impl McpDriver {
-    pub async fn spawn(name: impl Into<String>, command_line: &str) -> Result<Self> {
-        let mut parts = command_line.split_whitespace();
-        let program = parts
-            .next()
-            .ok_or_else(|| anyhow!("empty mcp command line: {command_line:?}"))?;
-        let args: Vec<&str> = parts.collect();
+    pub async fn spawn(cfg: McpDriverConfig) -> Result<Self> {
+        let program = cfg
+            .cmd
+            .first()
+            .ok_or_else(|| anyhow!("empty mcp command for {}", cfg.name))?
+            .clone();
+        let args: Vec<String> = cfg.cmd.iter().skip(1).cloned().collect();
 
-        let mut child = Command::new(program)
+        let mut command = Command::new(&program);
+        command
             .args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        for (k, v) in &cfg.env {
+            command.env(k, v);
+        }
+        if let Some(dir) = &cfg.working_dir {
+            command.current_dir(dir);
+        }
+
+        let mut child = command
             .spawn()
-            .with_context(|| format!("spawn MCP server: {command_line}"))?;
+            .with_context(|| format!("spawn MCP server: {} {:?}", program, args))?;
 
         let stdin = child
             .stdin
@@ -289,22 +324,113 @@ impl McpDriver {
         });
         let _ = inner.rpc("initialize", init_params).await;
 
+        let name = cfg.name.clone();
         Ok(Self {
-            name: name.into(),
-            insert_tool: "memory_remember".into(),
-            query_tool: "memory_recall".into(),
+            name,
+            cfg,
             doc_index: Arc::new(Mutex::new(Vec::new())),
             inner: Arc::new(Mutex::new(inner)),
         })
     }
+}
 
-    /// Override the MCP tool names used for insert/query (default
-    /// `memory_remember` / `memory_recall`).
-    #[allow(dead_code)]
-    pub fn with_tool_names(mut self, insert: &str, query: &str) -> Self {
-        self.insert_tool = insert.to_string();
-        self.query_tool = query.to_string();
-        self
+// ── Per-system MCP configs ──────────────────────────────────────────────────
+
+/// Default content-prefix matcher: scans the concatenated text blocks of an
+/// MCP tool result for the first 40 chars of each known doc, mapping back to
+/// bench ids in insertion order.
+///
+/// Why: Both mempalace_search and kuzu_recall return free-text or JSON blobs
+/// that include the original drawer/memory content; matching on a prefix is
+/// robust to whichever surface form the server picks.
+/// What: Concatenates `result.content[*].text` (or stringifies the result),
+/// then walks `corpus` and emits each id whose content prefix appears.
+/// Test: Exercised end-to-end via `bench compare --mempalace --kuzu`.
+fn extract_by_content_match(
+    result: &serde_json::Value,
+    corpus: &[(String, String)],
+) -> Vec<String> {
+    let mut blob = String::new();
+    if let Some(arr) = result.get("content").and_then(|v| v.as_array()) {
+        for c in arr {
+            if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
+                blob.push_str(t);
+                blob.push('\n');
+            }
+        }
+    }
+    if blob.is_empty() {
+        blob = result.to_string();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for (id, content) in corpus {
+        let needle: String = content.chars().take(40).collect();
+        let needle = needle.trim();
+        if !needle.is_empty() && blob.contains(needle) && !out.contains(id) {
+            out.push(id.clone());
+        }
+    }
+    out
+}
+
+/// Build an MCP driver config for `mempalace-mcp` v3.3+.
+///
+/// Why: mempalace exposes `mempalace_add_drawer` and `mempalace_search` with
+/// `wing` / `room` / `content` / `query` / `limit` arg shapes that differ
+/// from our own surface.
+/// What: Returns a config that targets a pre-initialized palace at
+/// `palace_path` via `MEMPALACE_PATH`.
+/// Test: `bench compare --mempalace` against the bench fixture.
+pub fn mempalace_config(palace_path: PathBuf) -> McpDriverConfig {
+    McpDriverConfig {
+        name: "mempalace".into(),
+        cmd: vec![
+            "mempalace-mcp".into(),
+            "--palace".into(),
+            palace_path.display().to_string(),
+        ],
+        env: vec![],
+        working_dir: None,
+        insert_tool: "mempalace_add_drawer".into(),
+        insert_args_fn: |doc| {
+            serde_json::json!({
+                "wing": "bench",
+                "room": doc.room.clone().unwrap_or_else(|| "General".to_string()),
+                "content": doc.content,
+            })
+        },
+        search_tool: "mempalace_search".into(),
+        search_args_fn: |q, k| serde_json::json!({"query": q, "limit": k}),
+        extract_ids_fn: extract_by_content_match,
+    }
+}
+
+/// Build an MCP driver config for `kuzu-memory mcp` v1.12+.
+///
+/// Why: kuzu-memory uses `kuzu_remember` (sync store) and `kuzu_recall`
+/// (semantic retrieval); it stores per-directory state, so we run it inside
+/// a freshly initialized temp dir.
+/// What: Returns a config with `working_dir` set to the pre-initialized
+/// kuzu project directory.
+/// Test: `bench compare --kuzu` against the bench fixture.
+pub fn kuzu_config(project_dir: PathBuf) -> McpDriverConfig {
+    McpDriverConfig {
+        name: "kuzu-memory".into(),
+        cmd: vec!["kuzu-memory".into(), "mcp".into()],
+        env: vec![],
+        working_dir: Some(project_dir),
+        insert_tool: "kuzu_remember".into(),
+        insert_args_fn: |doc| {
+            serde_json::json!({
+                "content": doc.content,
+                "memory_type": "identity",
+                "knowledge_type": "note",
+                "importance": 0.8,
+            })
+        },
+        search_tool: "kuzu_recall".into(),
+        search_args_fn: |q, k| serde_json::json!({"query": q, "limit": k}),
+        extract_ids_fn: extract_by_content_match,
     }
 }
 
@@ -352,72 +478,29 @@ impl SystemDriver for McpDriver {
             let mut idx = self.doc_index.lock().await;
             idx.push((doc.id.clone(), doc.content.clone()));
         }
-        let mut args = serde_json::Map::new();
-        args.insert(
-            "text".into(),
-            serde_json::Value::String(doc.content.clone()),
-        );
-        if let Some(room) = &doc.room {
-            args.insert("room".into(), serde_json::Value::String(room.clone()));
-        }
-        if !doc.tags.is_empty() {
-            args.insert(
-                "tags".into(),
-                serde_json::Value::Array(
-                    doc.tags
-                        .iter()
-                        .cloned()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            );
-        }
+        let arguments = (self.cfg.insert_args_fn)(doc);
         let params = serde_json::json!({
-            "name": self.insert_tool,
-            "arguments": serde_json::Value::Object(args),
+            "name": self.cfg.insert_tool,
+            "arguments": arguments,
         });
         let mut inner = self.inner.lock().await;
         inner.rpc("tools/call", params).await.map(|_| ())
     }
 
     async fn query(&self, q: &str, top_k: usize) -> Result<Vec<String>> {
+        let arguments = (self.cfg.search_args_fn)(q, top_k);
         let params = serde_json::json!({
-            "name": self.query_tool,
-            "arguments": {
-                "query": q,
-                "top_k": top_k,
-            },
+            "name": self.cfg.search_tool,
+            "arguments": arguments,
         });
         let result = {
             let mut inner = self.inner.lock().await;
             inner.rpc("tools/call", params).await?
         };
-        // MCP tool responses use {"content":[{"type":"text","text":"..."}]}.
-        // We scan the concatenated text for known doc contents and map them
-        // back to bench ids. This is approximate but matches how a human
-        // judge would score the response.
-        let mut blob = String::new();
-        if let Some(arr) = result.get("content").and_then(|v| v.as_array()) {
-            for c in arr {
-                if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
-                    blob.push_str(t);
-                    blob.push('\n');
-                }
-            }
-        } else {
-            blob = result.to_string();
-        }
         let idx = self.doc_index.lock().await;
-        let mut out: Vec<String> = Vec::new();
-        for (id, content) in idx.iter() {
-            // Match on a content prefix to be robust to truncation/formatting.
-            let needle: String = content.chars().take(40).collect();
-            if blob.contains(needle.trim()) && !out.contains(id) {
-                out.push(id.clone());
-            }
-            if out.len() >= top_k {
-                break;
-            }
+        let mut out = (self.cfg.extract_ids_fn)(&result, idx.as_slice());
+        if out.len() > top_k {
+            out.truncate(top_k);
         }
         Ok(out)
     }
@@ -519,41 +602,106 @@ fn print_table(rows: &[SystemMetrics], top_k: usize) {
 pub struct BenchCompareOpts {
     pub corpus: PathBuf,
     pub top_k: usize,
-    pub systems: Vec<String>,
-    pub mempalace_cmd: Option<String>,
-    pub kuzu_cmd: Option<String>,
+    pub mempalace: bool,
+    pub kuzu: bool,
+    pub json: bool,
+}
+
+/// Initialize a fresh mempalace at `path` via the `mempalace init` CLI.
+///
+/// Why: `mempalace-mcp` needs an existing palace directory; we create a
+/// scratch one per bench run so results are reproducible.
+/// What: Runs `mempalace init <path> --yes`, returning the path on success.
+/// Test: Exercised by `bench compare --mempalace`.
+fn init_mempalace_palace() -> Result<(PathBuf, tempfile::TempDir)> {
+    let tmp = tempfile::tempdir().context("allocate mempalace bench tempdir")?;
+    let path = tmp.path().to_path_buf();
+    let status = std::process::Command::new("mempalace")
+        .arg("init")
+        .arg(&path)
+        .arg("--yes")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("invoke `mempalace init`")?;
+    if !status.success() {
+        return Err(anyhow!("`mempalace init` exited with status {status:?}"));
+    }
+    // mempalace requires at least one mine pass to actually materialize the
+    // palace database; without it the MCP server reports "No palace found".
+    // Drop a tiny seed file and mine the directory.
+    let seed = path.join(".bench_seed.txt");
+    std::fs::write(&seed, "bench seed file\n").context("write mempalace seed file")?;
+    let status = std::process::Command::new("mempalace")
+        .arg("--palace")
+        .arg(&path)
+        .arg("mine")
+        .arg(&path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("invoke `mempalace mine`")?;
+    if !status.success() {
+        return Err(anyhow!("`mempalace mine` exited with status {status:?}"));
+    }
+    Ok((path, tmp))
+}
+
+/// Initialize a fresh kuzu-memory project at `path` via `kuzu-memory init`.
+///
+/// Why: kuzu-memory keeps state per project directory; the MCP server picks
+/// up `./.kuzu-memory/` from its cwd.
+/// What: Creates a scratch dir, runs `kuzu-memory init` inside it, and
+/// returns the path so the MCP driver can `current_dir(...)` to it.
+/// Test: Exercised by `bench compare --kuzu`.
+fn init_kuzu_project() -> Result<(PathBuf, tempfile::TempDir)> {
+    let tmp = tempfile::tempdir().context("allocate kuzu bench tempdir")?;
+    let path = tmp.path().to_path_buf();
+    let status = std::process::Command::new("kuzu-memory")
+        .arg("init")
+        .current_dir(&path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("invoke `kuzu-memory init`")?;
+    if !status.success() {
+        return Err(anyhow!("`kuzu-memory init` exited with status {status:?}"));
+    }
+    Ok((path, tmp))
+}
+
+/// Holds tempdirs alongside drivers so they live for the bench duration.
+pub struct DriverBundle {
+    pub drivers: Vec<Box<dyn SystemDriver>>,
+    _tempdirs: Vec<tempfile::TempDir>,
 }
 
 /// Build the set of drivers requested by the user.
-async fn build_drivers(opts: &BenchCompareOpts) -> Result<Vec<Box<dyn SystemDriver>>> {
+async fn build_drivers(opts: &BenchCompareOpts) -> Result<DriverBundle> {
     let mut drivers: Vec<Box<dyn SystemDriver>> = Vec::new();
-    let want_trusty = opts.systems.iter().any(|s| s == "trusty");
-    let want_mempalace = opts.systems.iter().any(|s| s == "mempalace");
-    let want_kuzu = opts.systems.iter().any(|s| s == "kuzu");
+    let mut tempdirs: Vec<tempfile::TempDir> = Vec::new();
 
-    if want_trusty {
-        drivers.push(Box::new(TrustyDriver::new().await?));
+    // trusty-memory is always included.
+    drivers.push(Box::new(TrustyDriver::new().await?));
+
+    if opts.mempalace {
+        let (palace_path, tmp) = init_mempalace_palace()?;
+        tempdirs.push(tmp);
+        let cfg = mempalace_config(palace_path);
+        drivers.push(Box::new(McpDriver::spawn(cfg).await?));
     }
-    if want_mempalace {
-        let cmd = opts
-            .mempalace_cmd
-            .as_deref()
-            .ok_or_else(|| anyhow!("--mempalace-cmd required when systems includes mempalace"))?;
-        drivers.push(Box::new(McpDriver::spawn("mempalace", cmd).await?));
+
+    if opts.kuzu {
+        let (project_dir, tmp) = init_kuzu_project()?;
+        tempdirs.push(tmp);
+        let cfg = kuzu_config(project_dir);
+        drivers.push(Box::new(McpDriver::spawn(cfg).await?));
     }
-    if want_kuzu {
-        let cmd = opts
-            .kuzu_cmd
-            .as_deref()
-            .ok_or_else(|| anyhow!("--kuzu-cmd required when systems includes kuzu"))?;
-        drivers.push(Box::new(McpDriver::spawn("kuzu-memory", cmd).await?));
-    }
-    if drivers.is_empty() {
-        return Err(anyhow!(
-            "no systems selected; pass --systems trusty (and optionally mempalace, kuzu)"
-        ));
-    }
-    Ok(drivers)
+
+    Ok(DriverBundle {
+        drivers,
+        _tempdirs: tempdirs,
+    })
 }
 
 /// Top-level `bench compare` entry point.
@@ -575,10 +723,10 @@ pub async fn handle_bench_compare(opts: BenchCompareOpts) -> Result<()> {
         opts.corpus.display()
     );
 
-    let drivers = build_drivers(&opts).await?;
-    let mut all_metrics: Vec<SystemMetrics> = Vec::with_capacity(drivers.len());
+    let bundle = build_drivers(&opts).await?;
+    let mut all_metrics: Vec<SystemMetrics> = Vec::with_capacity(bundle.drivers.len());
 
-    for driver in drivers.iter() {
+    for driver in bundle.drivers.iter() {
         println!(
             "\n[{}] inserting {} docs ...",
             driver.name(),
@@ -606,7 +754,25 @@ pub async fn handle_bench_compare(opts: BenchCompareOpts) -> Result<()> {
         all_metrics.push(m);
     }
 
-    print_table(&all_metrics, opts.top_k);
+    if opts.json {
+        let payload: Vec<serde_json::Value> = all_metrics
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "system": m.name,
+                    "recall_at_1": m.recall_at_1,
+                    "recall_at_k": m.recall_at_k,
+                    "mrr": m.mrr,
+                    "mean_latency_ms": m.mean_latency_ms,
+                    "queries_run": m.queries_run,
+                    "top_k": opts.top_k,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        print_table(&all_metrics, opts.top_k);
+    }
     Ok(())
 }
 

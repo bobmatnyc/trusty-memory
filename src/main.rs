@@ -146,9 +146,9 @@ async fn main() -> Result<()> {
                 let opts = cli::bench::BenchCompareOpts {
                     corpus: args.corpus,
                     top_k: args.top_k,
-                    systems: args.systems,
-                    mempalace_cmd: args.mempalace_cmd,
-                    kuzu_cmd: args.kuzu_cmd,
+                    mempalace: args.mempalace,
+                    kuzu: args.kuzu,
+                    json: args.json,
                 };
                 cli::bench::handle_bench_compare(opts).await?;
             }

@@ -336,7 +336,7 @@ pub enum ConfigCommands {
 pub enum BenchCommands {
     /// Compare retrieval quality across systems on a labeled corpus.
     #[command(
-        after_help = "Examples:\n  trusty-memory bench compare\n  trusty-memory bench compare --systems trusty,mempalace --mempalace-cmd 'mempalace serve --mcp'\n  trusty-memory bench compare --top-k 10"
+        after_help = "Examples:\n  trusty-memory bench compare\n  trusty-memory bench compare --mempalace --kuzu\n  trusty-memory bench compare --mempalace --json\n  trusty-memory bench compare --top-k 10"
     )]
     Compare(BenchCompareArgs),
 }
@@ -351,16 +351,15 @@ pub struct BenchCompareArgs {
     #[arg(long, default_value = "5")]
     pub top_k: usize,
 
-    /// Comma-separated systems to compare. trusty is always usable; add
-    /// mempalace and/or kuzu to drive their MCP servers.
-    #[arg(long, value_delimiter = ',', default_value = "trusty")]
-    pub systems: Vec<String>,
-
-    /// Command line for the mempalace MCP server (used when `mempalace` in --systems).
+    /// Include mempalace (drives `mempalace-mcp` against a fresh palace).
     #[arg(long)]
-    pub mempalace_cmd: Option<String>,
+    pub mempalace: bool,
 
-    /// Command line for the kuzu-memory MCP server (used when `kuzu` in --systems).
+    /// Include kuzu-memory (drives `kuzu-memory mcp` in a fresh project dir).
     #[arg(long)]
-    pub kuzu_cmd: Option<String>,
+    pub kuzu: bool,
+
+    /// Emit machine-readable JSON metrics instead of the formatted table.
+    #[arg(long)]
+    pub json: bool,
 }
