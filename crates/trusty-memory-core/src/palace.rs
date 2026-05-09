@@ -179,10 +179,7 @@ mod tests {
         assert_eq!(RoomType::parse("Backend"), RoomType::Backend);
         assert_eq!(RoomType::parse("docs"), RoomType::Documentation);
         assert_eq!(RoomType::parse("general"), RoomType::General);
-        assert_eq!(
-            RoomType::parse("ops"),
-            RoomType::Custom("ops".to_string())
-        );
+        assert_eq!(RoomType::parse("ops"), RoomType::Custom("ops".to_string()));
     }
 
     #[test]

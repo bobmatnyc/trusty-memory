@@ -20,6 +20,7 @@ use crate::store::palace_store::PalaceStore;
 use crate::store::vector::{UsearchStore, VectorStore};
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -93,6 +94,15 @@ pub struct PalaceHandle {
     /// What: `None` by default so existing tests don't need a log directory.
     /// Test: `recall_logs_events_when_log_present` exercises the wiring.
     pub recall_log: Option<Arc<RecallLog>>,
+    /// Closet pointer index: keyword -> drawer ids. Rebuilt during dream cycles.
+    ///
+    /// Why: Closets accelerate L2 by mapping topic keywords to candidate drawer
+    /// ids without touching the vector store. The map is updated by
+    /// `dream::Dreamer::dream_cycle` via NLP-only tokenization (no LLM calls).
+    /// What: `Arc<RwLock<HashMap<String, Vec<Uuid>>>>` so reads can run
+    /// concurrently with the (rare) dream-time rebuild.
+    /// Test: `dream::tests::closet_refresh_builds_index`.
+    pub closets: Arc<RwLock<HashMap<String, Vec<Uuid>>>>,
 }
 
 impl PalaceHandle {
@@ -120,6 +130,7 @@ impl PalaceHandle {
             data_dir: None,
             decay_config: DecayConfig::default(),
             recall_log: None,
+            closets: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -172,6 +183,7 @@ impl PalaceHandle {
             data_dir: Some(data_dir.clone()),
             decay_config: DecayConfig::default(),
             recall_log: None,
+            closets: Arc::new(RwLock::new(HashMap::new())),
         };
         Ok(Arc::new(handle))
     }
@@ -834,9 +846,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            results
-                .iter()
-                .any(|r| r.drawer.content.contains("tokio")),
+            results.iter().any(|r| r.drawer.content.contains("tokio")),
             "expected to recall the tokio drawer; got {results:?}"
         );
     }

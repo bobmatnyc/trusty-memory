@@ -111,9 +111,8 @@ pub async fn handle(cmd: PalaceCommands, _palace: &str, out: &OutputConfig) -> R
                 out.print_error(&format!("palace '{old}' not found"));
                 return Ok(());
             }
-            std::fs::rename(&from, &to).with_context(|| {
-                format!("rename {} -> {}", from.display(), to.display())
-            })?;
+            std::fs::rename(&from, &to)
+                .with_context(|| format!("rename {} -> {}", from.display(), to.display()))?;
             out.print_success(&format!("renamed '{old}' -> '{new}'"));
         }
     }

@@ -338,7 +338,10 @@ impl McpInner {
         if let Some(err) = resp.get("error") {
             return Err(anyhow!("rpc error: {err}"));
         }
-        Ok(resp.get("result").cloned().unwrap_or(serde_json::Value::Null))
+        Ok(resp
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
     }
 }
 
@@ -350,7 +353,10 @@ impl SystemDriver for McpDriver {
             idx.push((doc.id.clone(), doc.content.clone()));
         }
         let mut args = serde_json::Map::new();
-        args.insert("text".into(), serde_json::Value::String(doc.content.clone()));
+        args.insert(
+            "text".into(),
+            serde_json::Value::String(doc.content.clone()),
+        );
         if let Some(room) = &doc.room {
             args.insert("room".into(), serde_json::Value::String(room.clone()));
         }
@@ -573,7 +579,11 @@ pub async fn handle_bench_compare(opts: BenchCompareOpts) -> Result<()> {
     let mut all_metrics: Vec<SystemMetrics> = Vec::with_capacity(drivers.len());
 
     for driver in drivers.iter() {
-        println!("\n[{}] inserting {} docs ...", driver.name(), corpus.docs.len());
+        println!(
+            "\n[{}] inserting {} docs ...",
+            driver.name(),
+            corpus.docs.len()
+        );
         for doc in &corpus.docs {
             driver
                 .insert(doc)

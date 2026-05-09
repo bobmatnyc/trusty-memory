@@ -7,6 +7,7 @@
 
 pub mod analytics;
 pub mod decay;
+pub mod dream;
 pub mod embed;
 pub mod git;
 pub mod palace;
