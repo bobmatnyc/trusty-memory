@@ -84,6 +84,12 @@ pub struct Drawer {
     pub source_file: Option<PathBuf>,
     pub created_at: DateTime<Utc>,
     pub tags: Vec<String>,
+    /// Timestamp of the most recent recall hit, if any.
+    #[serde(default)]
+    pub last_accessed_at: Option<DateTime<Utc>>,
+    /// Number of times this drawer has been returned in a recall result.
+    #[serde(default)]
+    pub access_count: u32,
 }
 
 impl Drawer {
@@ -102,7 +108,30 @@ impl Drawer {
             source_file: None,
             created_at: Utc::now(),
             tags: Vec::new(),
+            last_accessed_at: None,
+            access_count: 0,
         }
+    }
+
+    /// Accumulated access boost for decay calculation.
+    ///
+    /// Why: Frequently recalled drawers should resist decay; this exposes the
+    /// computed boost so `DecayConfig::effective_importance` stays pure.
+    /// What: `(access_count * config.access_boost).min(config.access_boost_cap)`
+    /// Test: See `decay::tests::drawer_accumulated_boost`.
+    pub fn accumulated_boost(&self, config: &crate::decay::DecayConfig) -> f32 {
+        (self.access_count as f32 * config.access_boost).min(config.access_boost_cap)
+    }
+
+    /// Record a recall hit: update `last_accessed_at` and increment `access_count`.
+    ///
+    /// Why: Retrieval paths must call this when a drawer is returned so the
+    /// access boost reflects real usage.
+    /// What: Sets `last_accessed_at = now()` and saturates `access_count`.
+    /// Test: After two `record_access()` calls, `access_count == 2`.
+    pub fn record_access(&mut self) {
+        self.last_accessed_at = Some(Utc::now());
+        self.access_count = self.access_count.saturating_add(1);
     }
 }
 

@@ -5,6 +5,7 @@
 //! What: Re-exports the palace hierarchy types and the registry.
 //! Test: `cargo test -p trusty-memory-core` exercises construction and registry roundtrips.
 
+pub mod decay;
 pub mod embed;
 pub mod palace;
 pub mod registry;
