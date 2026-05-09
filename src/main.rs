@@ -102,10 +102,7 @@ async fn main() -> Result<()> {
         Commands::Serve { http, mcp: _ } => {
             tracing::info!(?http, "Starting trusty-memory MCP server");
             let state = trusty_memory_mcp::AppState::new();
-            if let Some(addr_str) = http {
-                let addr: std::net::SocketAddr = addr_str
-                    .parse()
-                    .map_err(|e| anyhow::anyhow!("invalid --http address {addr_str:?}: {e}"))?;
+            if let Some(addr) = http {
                 tokio::select! {
                     r = trusty_memory_mcp::run_stdio(state.clone()) => r?,
                     r = trusty_memory_mcp::run_http(state, addr) => r?,

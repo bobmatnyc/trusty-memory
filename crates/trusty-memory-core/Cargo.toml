@@ -43,5 +43,10 @@ default = []
 kuzu = ["dep:kuzu"]
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 tokio = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "retrieval"
+harness = false
