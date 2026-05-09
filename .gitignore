@@ -22,3 +22,6 @@ data/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# fastembed model cache (downloaded ONNX models)
+.fastembed_cache/
