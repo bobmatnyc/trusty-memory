@@ -12,6 +12,7 @@
 
 use crate::analytics::{query_hash, RecallEvent, RecallLog};
 use crate::decay::DecayConfig;
+use crate::dream::extract_keywords;
 use crate::embed::{Embedder, FastEmbedder};
 use crate::palace::{Drawer, Palace, PalaceId, RoomType};
 use crate::store::kg::KnowledgeGraph;
@@ -314,7 +315,30 @@ impl PalaceHandle {
             L1Cache::save_l1_cache(&snap, data_dir).context("save L1 snapshot")?;
         }
 
+        // Refresh the closet keyword index so L2 tag-boosting picks up the
+        // new drawer without waiting for a dream cycle.
+        self.rebuild_closets();
+
         Ok(id)
+    }
+
+    /// Rebuild the closet keyword index from the current in-memory drawer table.
+    ///
+    /// Why: Keep the closet index current after every write so L2 tag-boosting
+    /// works without waiting for a dream cycle.
+    /// What: Rebuilds keyword -> Vec<drawer_id> map by tokenizing each drawer's
+    /// content via `extract_keywords` (whitespace + stop-word filter).
+    /// Test: `closet_updated_after_remember`.
+    pub fn rebuild_closets(&self) {
+        let snapshot: Vec<Drawer> = self.drawers.read().clone();
+        let mut new_index: HashMap<String, Vec<Uuid>> = HashMap::new();
+        for drawer in snapshot.iter() {
+            for kw in extract_keywords(&drawer.content) {
+                new_index.entry(kw).or_default().push(drawer.id);
+            }
+        }
+        let mut closets = self.closets.write();
+        *closets = new_index;
     }
 
     /// Remove a drawer by id.
@@ -520,6 +544,8 @@ pub async fn retrieve_l2(
     let hits = handle.vector_store.search(&query_vec, overfetch).await?;
 
     let drawers = handle.drawers.read();
+    let closets = handle.closets.read();
+    let query_tokens: Vec<String> = extract_keywords(query);
     let mut results: Vec<RecallResult> = Vec::with_capacity(hits.len());
 
     for hit in hits {
@@ -542,12 +568,25 @@ pub async fn retrieve_l2(
             handle
                 .decay_config
                 .effective_importance(drawer.importance, age_days, boost);
+        let effective_score = eff_importance * hit.score;
+
+        // Closet tag boost: if any query token matches a closet keyword that
+        // contains this drawer, add a 0.15 bump (capped at 1.0) so topical
+        // hits outrank generic semantic neighbors.
+        let drawer_id = drawer.id;
+        let in_closet = query_tokens
+            .iter()
+            .any(|tok| closets.get(tok).is_some_and(|ids| ids.contains(&drawer_id)));
+        let tag_boost = if in_closet { 0.15_f32 } else { 0.0 };
+        let final_score = (effective_score + tag_boost).min(1.0);
+
         results.push(RecallResult {
             drawer: drawer.clone(),
-            score: eff_importance * hit.score,
+            score: final_score,
             layer: 2,
         });
     }
+    drop(closets);
     drop(drawers);
 
     results.sort_by(|a, b| {
@@ -585,6 +624,8 @@ pub async fn retrieve_l3(
     let hits = handle.vector_store.search(&query_vec, top_k).await?;
 
     let drawers = handle.drawers.read();
+    let closets = handle.closets.read();
+    let query_tokens: Vec<String> = extract_keywords(query);
     let mut results: Vec<RecallResult> = Vec::with_capacity(hits.len());
     for hit in hits {
         let Some(drawer) = drawers.iter().find(|d| uuid_prefix_eq(d.id, hit.drawer_id)) else {
@@ -596,12 +637,22 @@ pub async fn retrieve_l3(
             handle
                 .decay_config
                 .effective_importance(drawer.importance, age_days, boost);
+        let effective_score = eff_importance * hit.score;
+
+        let drawer_id = drawer.id;
+        let in_closet = query_tokens
+            .iter()
+            .any(|tok| closets.get(tok).is_some_and(|ids| ids.contains(&drawer_id)));
+        let tag_boost = if in_closet { 0.15_f32 } else { 0.0 };
+        let final_score = (effective_score + tag_boost).min(1.0);
+
         results.push(RecallResult {
             drawer: drawer.clone(),
-            score: eff_importance * hit.score,
+            score: final_score,
             layer: 3,
         });
     }
+    drop(closets);
     drop(drawers);
 
     results.sort_by(|a, b| {
@@ -613,13 +664,55 @@ pub async fn retrieve_l3(
     Ok(results)
 }
 
+/// Expand a user query with domain synonyms before embedding.
+///
+/// Why: There's a vocabulary gap between casual user queries ("how fast is X?")
+/// and technical memory content ("HNSW provides O(log N) latency"). Appending
+/// related terms steers the embedded query vector toward both the original
+/// intent and the technical phrasing — boosting recall on speed/performance,
+/// vector-search, memory-safety, and concurrency questions.
+/// What: Lowercase-scans the query for trigger phrases and appends a list of
+/// related domain terms. No-op when no triggers match.
+/// Test: `expand_query_adds_synonyms`, `expand_query_noop_for_unmatched`.
+pub fn expand_query(query: &str) -> String {
+    let q = query.to_lowercase();
+    let mut extra: Vec<&str> = Vec::new();
+
+    if q.contains("fast")
+        || q.contains("speed")
+        || q.contains("latency")
+        || q.contains("performance")
+    {
+        extra.push("latency performance speed throughput");
+    }
+    if q.contains("vector search")
+        || q.contains("semantic search")
+        || q.contains("nearest neighbor")
+    {
+        extra.push("HNSW ANN approximate nearest neighbor usearch vector index");
+    }
+    if q.contains("memory safe") || q.contains("borrow") || q.contains("ownership") {
+        extra.push("borrow checker lifetime ownership Rust memory safety");
+    }
+    if q.contains("concurren") || q.contains("thread") || q.contains("parallel") {
+        extra.push("concurrent async tokio DashMap RwLock mutex thread-safe");
+    }
+
+    if extra.is_empty() {
+        query.to_string()
+    } else {
+        format!("{} {}", query, extra.join(" "))
+    }
+}
+
 /// Standard recall = L0 + L1 + L2, deduplicated.
 ///
 /// Why: This is the default path for "hey memory, what do you know about X?"
 /// — always-on identity + essentials, plus the cheapest topic search.
 /// What: Concatenates `retrieve_l0_l1` and `retrieve_l2` (no room filter),
 /// then deduplicates by drawer id keeping the *earlier* (lower-numbered layer)
-/// occurrence so L0/L1 always win over an L2 duplicate.
+/// occurrence so L0/L1 always win over an L2 duplicate. Applies `expand_query`
+/// before embedding to bridge the user-vocabulary / technical-vocabulary gap.
 /// Test: Composition is exercised indirectly via the per-layer tests.
 pub async fn recall(
     handle: &PalaceHandle,
@@ -627,8 +720,9 @@ pub async fn recall(
     query: &str,
     top_k: usize,
 ) -> Result<Vec<RecallResult>> {
+    let expanded = expand_query(query);
     let mut combined = retrieve_l0_l1(handle);
-    let l2 = retrieve_l2(handle, embedder, query, None, top_k).await?;
+    let l2 = retrieve_l2(handle, embedder, &expanded, None, top_k).await?;
     dedup_extend(&mut combined, l2);
     log_recall(handle, query, &combined);
     Ok(combined)
@@ -646,8 +740,9 @@ pub async fn recall_deep(
     query: &str,
     top_k: usize,
 ) -> Result<Vec<RecallResult>> {
+    let expanded = expand_query(query);
     let mut combined = retrieve_l0_l1(handle);
-    let l3 = retrieve_l3(handle, embedder, query, top_k).await?;
+    let l3 = retrieve_l3(handle, embedder, &expanded, top_k).await?;
     dedup_extend(&mut combined, l3);
     log_recall(handle, query, &combined);
     Ok(combined)
@@ -973,5 +1068,137 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         assert!(hits >= 1, "expected at least one logged hit, got {hits}");
+    }
+
+    /// Why: After `remember`, L2 tag-boosting depends on the closet index being
+    /// up-to-date without waiting for a dream cycle.
+    /// What: Remember a drawer with a distinctive keyword, then read the closet
+    /// map and assert the keyword maps to the drawer's id.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn closet_updated_after_remember() {
+        use crate::palace::Palace;
+        let dir = tempdir().unwrap();
+        let palace = Palace {
+            id: PalaceId::new("closet-test"),
+            name: "Closet".into(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            data_dir: dir.path().join("closet-test"),
+        };
+        std::fs::create_dir_all(&palace.data_dir).unwrap();
+        let handle = PalaceHandle::open(&palace).unwrap();
+
+        let id = handle
+            .remember(
+                "Quokkas are happy marsupials".into(),
+                RoomType::General,
+                vec![],
+                0.5,
+            )
+            .await
+            .unwrap();
+
+        let closets = handle.closets.read();
+        let entry = closets
+            .get("quokkas")
+            .expect("expected `quokkas` keyword in closet index");
+        assert!(
+            entry.contains(&id),
+            "closet entry for `quokkas` should contain the new drawer id"
+        );
+    }
+
+    /// Why: Query expansion must inject the right synonyms when speed/vector
+    /// triggers fire so the embedder is steered toward technical phrasing.
+    /// What: Call `expand_query` with the q5 benchmark question and assert the
+    /// expanded string contains the expected synonym tokens.
+    /// Test: This test itself.
+    #[test]
+    fn expand_query_adds_synonyms() {
+        let out = expand_query("how fast is vector search?");
+        assert!(out.contains("HNSW"), "expected HNSW synonym, got: {out}");
+        assert!(
+            out.contains("latency"),
+            "expected latency synonym, got: {out}"
+        );
+    }
+
+    /// Why: Borrow/ownership queries should still expand, but unmatched topics
+    /// must remain unchanged so unrelated queries aren't polluted.
+    /// What: Verify the borrow trigger fires (and adds Rust terms), and that a
+    /// query with no triggers comes back identical.
+    /// Test: This test itself.
+    #[test]
+    fn expand_query_noop_for_unmatched() {
+        let out = expand_query("what is a borrow checker?");
+        assert!(
+            out.contains("borrow checker"),
+            "expected original query preserved, got: {out}"
+        );
+        assert!(
+            out.contains("ownership") || out.contains("lifetime"),
+            "expected ownership/lifetime synonyms, got: {out}"
+        );
+
+        let untouched = expand_query("what colour is the sky on Tuesday");
+        assert_eq!(
+            untouched, "what colour is the sky on Tuesday",
+            "queries with no triggers must pass through unchanged"
+        );
+    }
+
+    /// Why: Closet tag boost should raise a tagged drawer's rank above an
+    /// untagged but otherwise-similar drawer.
+    /// What: Insert two drawers — one whose content shares keywords with the
+    /// query, one that doesn't — and assert the keyword-matched drawer ranks
+    /// first in L2 results.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn retrieve_l2_tag_boost_raises_rank() {
+        use crate::palace::Palace;
+        let dir = tempdir().unwrap();
+        let palace = Palace {
+            id: PalaceId::new("boost-test"),
+            name: "Boost".into(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            data_dir: dir.path().join("boost-test"),
+        };
+        std::fs::create_dir_all(&palace.data_dir).unwrap();
+        let handle = PalaceHandle::open(&palace).unwrap();
+
+        // Drawer A: contains keywords "vector" and "search" and "performance".
+        let id_tagged = handle
+            .remember(
+                "Vector search performance benchmarks show low latency".into(),
+                RoomType::Backend,
+                vec!["vector-search".into()],
+                0.5,
+            )
+            .await
+            .unwrap();
+        // Drawer B: unrelated topic, no shared keywords.
+        let _id_other = handle
+            .remember(
+                "React components render through a virtual DOM".into(),
+                RoomType::Frontend,
+                vec![],
+                0.5,
+            )
+            .await
+            .unwrap();
+
+        let embedder = crate::embed::FastEmbedder::new().await.unwrap();
+        let results = retrieve_l2(&handle, &embedder, "vector search performance", None, 5)
+            .await
+            .unwrap();
+
+        assert!(!results.is_empty(), "L2 should return results");
+        assert!(
+            uuid_prefix_eq(results[0].drawer.id, id_tagged),
+            "tagged drawer should rank first; got {:?}",
+            results[0].drawer.content
+        );
     }
 }

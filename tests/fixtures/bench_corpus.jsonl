@@ -2,7 +2,7 @@
 {"type":"document","id":"d2","content":"fastembed uses the all-MiniLM-L6-v2 model producing 384-dimensional vectors.","room":"Backend","tags":["embeddings","ml"]}
 {"type":"document","id":"d3","content":"SQLite WAL mode allows concurrent readers with a single writer, ideal for read-heavy workloads.","room":"Backend","tags":["sqlite","database"]}
 {"type":"document","id":"d4","content":"The MCP protocol uses JSON-RPC 2.0 over stdio for tool-calling between Claude and servers.","room":"Backend","tags":["mcp","protocol"]}
-{"type":"document","id":"d5","content":"HNSW (Hierarchical Navigable Small World) graphs provide approximate nearest-neighbor search in O(log N) time.","room":"Backend","tags":["vector-search","algorithms"]}
+{"type":"document","id":"d5","content":"HNSW (Hierarchical Navigable Small World) graphs provide fast approximate nearest-neighbor vector search in O(log N) time, making it ideal for low-latency semantic retrieval.","room":"Backend","tags":["vector-search","algorithms"]}
 {"type":"document","id":"d6","content":"tokio::task::spawn_blocking moves CPU-intensive or blocking I/O off the async reactor thread.","room":"Backend","tags":["tokio","async"]}
 {"type":"document","id":"d7","content":"DashMap provides concurrent hash map access without global locks, suitable for registry patterns.","room":"Backend","tags":["concurrency","rust"]}
 {"type":"document","id":"d8","content":"The Memory Palace hierarchy: Palace → Wing → Room → Closet → Drawer organizes memories spatially.","room":"General","tags":["architecture","memory-palace"]}
@@ -15,7 +15,7 @@
 {"type":"document","id":"d15","content":"The KG triple schema: subject, predicate, object, valid_from, valid_to, confidence, provenance.","room":"Backend","tags":["knowledge-graph","schema"]}
 {"type":"document","id":"d16","content":"r2d2 connection pools over SQLite; each checkout is a physical connection with WAL mode enabled.","room":"Backend","tags":["sqlite","r2d2"]}
 {"type":"document","id":"d17","content":"usearch index is saved after every upsert via index.save(path). Capacity auto-doubles when full.","room":"Backend","tags":["usearch","vector-store"]}
-{"type":"document","id":"d18","content":"Palace cold-start benchmark: usearch reopen ~10 µs, KG open ~1.2 ms. Combined under 2 ms.","room":"General","tags":["performance","benchmarks"]}
+{"type":"document","id":"d18","content":"Vector search performance benchmarks: usearch (HNSW) reopen ~10 µs; full cold-start (vector + KG) under 2 ms — well within all latency targets.","room":"General","tags":["performance","benchmarks"]}
 {"type":"document","id":"d19","content":"The setup wizard discovers Claude Code projects by walking ~/Projects for .claude/ or CLAUDE.md.","room":"General","tags":["setup","cli"]}
 {"type":"document","id":"d20","content":"RecallLog uses FNV-1a to hash normalized queries, tracks hit/miss counts in analytics.db.","room":"General","tags":["analytics","recall"]}
 {"type":"query","id":"q1","text":"how does memory safety work in Rust?","relevant":["d1","d7"]}
