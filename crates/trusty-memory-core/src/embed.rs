@@ -60,10 +60,9 @@ impl FastEmbedder {
     /// `embed` — both succeeding implies `new` worked end-to-end.
     pub async fn new() -> Result<Self> {
         let model = task::spawn_blocking(|| -> Result<TextEmbedding> {
-            let mut model = TextEmbedding::try_new(TextInitOptions::new(
-                EmbeddingModel::AllMiniLML6V2,
-            ))
-            .context("failed to initialize fastembed all-MiniLM-L6-v2")?;
+            let mut model =
+                TextEmbedding::try_new(TextInitOptions::new(EmbeddingModel::AllMiniLML6V2))
+                    .context("failed to initialize fastembed all-MiniLM-L6-v2")?;
 
             // Warm the ORT session with a small batch so the first real query
             // doesn't pay the graph-compile cost.
@@ -143,10 +142,7 @@ mod tests {
     async fn embed_returns_correct_dim() {
         let embedder = shared_embedder().await;
         assert_eq!(embedder.dim(), 384);
-        let vecs = embedder
-            .embed(&["hello world".to_string()])
-            .await
-            .unwrap();
+        let vecs = embedder.embed(&["hello world".to_string()]).await.unwrap();
         assert_eq!(vecs.len(), 1);
         assert_eq!(vecs[0].len(), 384);
     }

@@ -9,3 +9,6 @@ mod basic_palace_test;
 
 #[path = "integration/mcp_server_test.rs"]
 mod mcp_server_test;
+
+#[path = "integration/cli_test.rs"]
+mod cli_test;

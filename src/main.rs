@@ -1,75 +1,105 @@
 //! trusty-memory CLI entry point.
 //!
-//! Why: One binary covers serve, palace admin, and ad-hoc remember/recall —
-//! mirroring how `kuzu-memory` is used so existing muscle memory transfers.
-//! What: clap subcommands dispatched to either the MCP server or core APIs.
-//! Test: `trusty-memory --help` prints all subcommands; `trusty-memory status`
-//! exits 0 with a status line.
+//! Why: One binary covers serve, palace admin, git ingest, kuzu compatibility,
+//! and ad-hoc remember/recall — mirroring how `kuzu-memory` is used so existing
+//! muscle memory transfers.
+//! What: Parses the top-level `Cli` and dispatches to per-subcommand handlers
+//! in the `cli/` module tree.
+//! Test: `cargo test --test integration_tests` plus `--help` and `status`
+//! integration tests in `tests/integration/cli_test.rs`.
+
+mod cli;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
-
-#[derive(Parser)]
-#[command(
-    name = "trusty-memory",
-    version,
-    about = "Machine-wide AI memory service with Memory Palace architecture"
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Start MCP stdio server (and optionally HTTP/SSE).
-    Serve {
-        /// Also bind HTTP/SSE on this address (e.g. `127.0.0.1:3031`).
-        #[arg(long)]
-        http: Option<String>,
-    },
-    /// Manage palaces.
-    Palace {
-        #[command(subcommand)]
-        action: PalaceAction,
-    },
-    /// Store a memory in a palace.
-    Remember {
-        palace: String,
-        text: String,
-        #[arg(long)]
-        room: Option<String>,
-    },
-    /// Retrieve memories from a palace.
-    Recall {
-        palace: String,
-        query: String,
-        #[arg(long, default_value = "5")]
-        top_k: usize,
-    },
-    /// Show service status.
-    Status,
-}
-
-#[derive(Subcommand)]
-enum PalaceAction {
-    /// Create a new palace.
-    New { name: String },
-    /// List all known palaces on this machine.
-    List,
-}
+use clap::{CommandFactory, Parser};
+use clap_complete::generate;
+use cli::output::OutputConfig;
+use cli::palace_resolver::resolve_palace;
+use cli::{Cli, Commands};
+use std::io;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::from_filename(".env.local").ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
 
     let cli = Cli::parse();
 
+    // Init tracing based on verbosity, deferring to RUST_LOG when set.
+    let default_filter = match cli.verbose {
+        0 => "warn",
+        1 => "info",
+        2 => "debug",
+        _ => "trace",
+    };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
+
+    if cli.no_color {
+        colored::control::set_override(false);
+    }
+
+    let palace = resolve_palace(cli.palace.as_deref());
+
+    let out = OutputConfig {
+        json: cli.json,
+        quiet: cli.quiet,
+        no_color: cli.no_color,
+    };
+
     match cli.command {
-        Commands::Serve { http } => {
+        Commands::Remember {
+            text,
+            room,
+            tags,
+            importance,
+        } => {
+            out.print_header(&palace, &room);
+            println!("Storing memory in palace '{palace}' room '{room}'");
+            println!("  importance: {importance}");
+            if !tags.is_empty() {
+                println!("  tags: {}", tags.join(", "));
+            }
+            let preview_len = text.len().min(80);
+            println!("  preview: {}", &text[..preview_len]);
+            out.print_success("stored (registry wiring pending)");
+        }
+
+        Commands::Recall {
+            query,
+            top_k,
+            room,
+            deep,
+            decay: _,
+        } => {
+            out.print_header(&palace, room.as_deref().unwrap_or("all rooms"));
+            let layer = if deep { "L3" } else { "L2" };
+            println!("Recalling '{query}' from '{palace}' (top {top_k}, {layer})");
+            out.print_footer(0, layer, 0);
+        }
+
+        Commands::Forget { id } => {
+            println!("Removing drawer {id} from '{palace}'");
+            out.print_success("removed (registry wiring pending)");
+        }
+
+        Commands::List { limit, room, sort } => {
+            out.print_header(&palace, room.as_deref().unwrap_or("all"));
+            println!("Listing up to {limit} memories sorted by {sort}");
+        }
+
+        Commands::Palace(sub) => cli::palace::handle(sub, &palace, &out).await?,
+        Commands::Kg(sub) => cli::kg::handle(sub, &palace, &out).await?,
+        Commands::Git(sub) => cli::git::handle(sub, &palace, &out).await?,
+        Commands::Kuzu(sub) => cli::kuzu::handle(sub, &palace, &out).await?,
+        Commands::Analytics(sub) => cli::analytics::handle(sub, &palace, &out).await?,
+        Commands::Decay(sub) => cli::decay::handle(sub, &palace, &out).await?,
+        Commands::Dream(sub) => cli::dream::handle(sub, &palace, &out).await?,
+
+        Commands::Serve { http, mcp: _ } => {
             tracing::info!(?http, "Starting trusty-memory MCP server");
             let state = trusty_memory_mcp::AppState::new();
             if let Some(addr_str) = http {
@@ -84,22 +114,31 @@ async fn main() -> Result<()> {
                 trusty_memory_mcp::run_stdio(state).await?;
             }
         }
-        Commands::Palace { action } => match action {
-            PalaceAction::New { name } => println!("Creating palace: {name}"),
-            PalaceAction::List => println!("Listing palaces..."),
-        },
-        Commands::Remember { palace, text, room } => {
-            println!("Storing in palace '{palace}' (room={room:?}): {text}");
-        }
-        Commands::Recall {
-            palace,
-            query,
-            top_k,
+
+        Commands::Setup {
+            non_interactive,
+            skip_migration,
+            migrate_only,
         } => {
-            println!("Recalling from palace '{palace}': {query} (top_k={top_k})");
+            println!("trusty-memory setup");
+            println!("  non_interactive: {non_interactive}");
+            println!("  skip_migration: {skip_migration}");
+            println!("  migrate_only: {migrate_only}");
+            println!("(full implementation in #14)");
         }
+
         Commands::Status => {
-            println!("trusty-memory status: scaffold (not yet implemented)");
+            let binary = std::env::current_exe()?;
+            println!("trusty-memory v{}", env!("CARGO_PKG_VERSION"));
+            println!("binary: {}", binary.display());
+            println!("active palace: {palace}");
+            println!("daemon: not running (serve not started)");
+        }
+
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            generate(shell, &mut cmd, name, &mut io::stdout());
         }
     }
 
