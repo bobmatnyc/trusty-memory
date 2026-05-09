@@ -13,10 +13,12 @@
 use crate::analytics::{query_hash, RecallEvent, RecallLog};
 use crate::decay::DecayConfig;
 use crate::embed::Embedder;
-use crate::palace::{Drawer, PalaceId, RoomType};
+use crate::palace::{Drawer, Palace, PalaceId, RoomType};
 use crate::store::kg::KnowledgeGraph;
+use crate::store::l1_cache::L1Cache;
+use crate::store::palace_store::PalaceStore;
 use crate::store::vector::{UsearchStore, VectorStore};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use std::path::Path;
 use std::sync::Arc;
@@ -70,6 +72,10 @@ pub struct PalaceHandle {
     pub vector_store: Arc<UsearchStore>,
     pub kg: Arc<KnowledgeGraph>,
     pub drawers: Arc<RwLock<Vec<Drawer>>>,
+    /// On-disk data directory for this palace (where palace.json,
+    /// identity.txt, l1_cache.json, the usearch index, and the KG SQLite
+    /// file all live). `None` for in-memory tests built via `new`.
+    pub data_dir: Option<std::path::PathBuf>,
     /// Temporal decay configuration applied during L2/L3 ranking.
     ///
     /// Why: Old drawers should fade unless refreshed by access; baking the
@@ -111,9 +117,83 @@ impl PalaceHandle {
             vector_store: Arc::new(vector_store),
             kg: Arc::new(kg),
             drawers: Arc::new(RwLock::new(Vec::new())),
+            data_dir: None,
             decay_config: DecayConfig::default(),
             recall_log: None,
         }
+    }
+
+    /// Open a palace from disk, hydrating identity.txt, the L1 snapshot, the
+    /// vector index, and the KG.
+    ///
+    /// Why: A long-lived daemon must reconstruct a palace from its on-disk
+    /// state every time the registry is asked for one that isn't yet loaded.
+    /// What: Creates the data directory if missing, loads identity.txt
+    /// (defaulting to empty), loads the L1 snapshot (defaulting to empty),
+    /// opens the usearch index at `<data_dir>/index.usearch` (384-d), and
+    /// opens the KG SQLite at `<data_dir>/kg.db`. The drawer table is
+    /// initialized from the L1 snapshot (the L1 cache is the only
+    /// authoritative drawer metadata until the full drawer table is
+    /// persisted in a follow-up issue).
+    /// Test: `registry_create_and_open` creates a palace, drops the registry,
+    /// and re-opens it.
+    pub fn open(palace: &Palace) -> Result<Arc<PalaceHandle>> {
+        let data_dir = &palace.data_dir;
+        std::fs::create_dir_all(data_dir)
+            .with_context(|| format!("create palace data dir {}", data_dir.display()))?;
+
+        let identity = PalaceStore::load_identity(data_dir)
+            .with_context(|| format!("load identity for {}", palace.id))?
+            .unwrap_or_default();
+
+        let l1_drawers = L1Cache::load_l1_cache(data_dir)
+            .with_context(|| format!("load L1 cache for {}", palace.id))?;
+
+        let vector_path = data_dir.join("index.usearch");
+        let vector_store = UsearchStore::new(vector_path, 384)
+            .with_context(|| format!("open vector store for {}", palace.id))?;
+
+        let kg_path = data_dir.join("kg.db");
+        let kg =
+            KnowledgeGraph::open(&kg_path).with_context(|| format!("open KG for {}", palace.id))?;
+
+        // Seed the drawer table with whatever metadata the L1 snapshot holds
+        // so retrieval has at least the essential drawers available before
+        // any new writes land.
+        let drawers = Arc::new(RwLock::new(l1_drawers.clone()));
+
+        let handle = PalaceHandle {
+            id: palace.id.clone(),
+            identity,
+            l1_drawers,
+            vector_store: Arc::new(vector_store),
+            kg: Arc::new(kg),
+            drawers,
+            data_dir: Some(data_dir.clone()),
+            decay_config: DecayConfig::default(),
+            recall_log: None,
+        };
+        Ok(Arc::new(handle))
+    }
+
+    /// Persist the L1 cache snapshot and identity.txt for this palace.
+    ///
+    /// Why: Mutating paths (drawer ingest, identity edits) must durably record
+    /// state so the next cold start sees up-to-date essentials.
+    /// What: Re-sorts the drawer table by importance descending, snapshots
+    /// the top-15 to `l1_cache.json`, and re-writes `identity.txt`. No-op when
+    /// `data_dir` is `None` (in-memory test handles).
+    /// Test: `registry_create_and_open` confirms identity survives a flush+reopen.
+    pub fn flush(&self) -> Result<()> {
+        let Some(data_dir) = self.data_dir.as_ref() else {
+            return Ok(());
+        };
+        let drawers = self.drawers.read().clone();
+        L1Cache::save_l1_cache(&drawers, data_dir)
+            .with_context(|| format!("save L1 cache for {}", self.id))?;
+        PalaceStore::save_identity(&self.id, &self.identity, data_dir)
+            .with_context(|| format!("save identity for {}", self.id))?;
+        Ok(())
     }
 
     /// Attach a recall analytics log to this handle.

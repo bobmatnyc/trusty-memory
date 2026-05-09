@@ -30,9 +30,7 @@ use uuid::Uuid;
 /// What: Each element is sin(seed * 384 + j); then L2-normalize.
 /// Test: norm of returned vec is approximately 1.0.
 fn synthetic_vec(seed: usize) -> Vec<f32> {
-    let raw: Vec<f32> = (0..384)
-        .map(|j| ((seed * 384 + j) as f32).sin())
-        .collect();
+    let raw: Vec<f32> = (0..384).map(|j| ((seed * 384 + j) as f32).sin()).collect();
     let norm: f32 = raw.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
     raw.iter().map(|x| x / norm).collect()
 }

@@ -65,7 +65,33 @@ async fn main() -> Result<()> {
             }
             let preview_len = text.len().min(80);
             println!("  preview: {}", &text[..preview_len]);
-            out.print_success("stored (registry wiring pending)");
+
+            // Resolve / create the palace on disk. Drawer write path
+            // (vector + KG) lands in a follow-up; this just confirms the
+            // metadata + L1 cache plumbing.
+            let root = cli::palace::data_root()?;
+            let palace_id = trusty_memory_core::PalaceId::new(palace.clone());
+            let root_clone = root.clone();
+            let palace_id_clone = palace_id.clone();
+            let palace_name = palace.clone();
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let reg = trusty_memory_core::PalaceRegistry::new();
+                if reg.open_palace(&root_clone, &palace_id_clone).is_err() {
+                    // Auto-create on first remember.
+                    let p = trusty_memory_core::Palace {
+                        id: palace_id_clone.clone(),
+                        name: palace_name,
+                        description: None,
+                        created_at: chrono::Utc::now(),
+                        data_dir: root_clone.join(palace_id_clone.as_str()),
+                    };
+                    reg.create_palace(&root_clone, p)?;
+                }
+                Ok(())
+            })
+            .await??;
+
+            out.print_success("palace ready (drawer write pending)");
         }
 
         Commands::Recall {
@@ -126,8 +152,16 @@ async fn main() -> Result<()> {
 
         Commands::Status => {
             let binary = std::env::current_exe()?;
+            let root = cli::palace::data_root()?;
+            let root_clone = root.clone();
+            let palaces = tokio::task::spawn_blocking(move || {
+                trusty_memory_core::PalaceRegistry::list_palaces(&root_clone)
+            })
+            .await??;
             println!("trusty-memory v{}", env!("CARGO_PKG_VERSION"));
             println!("binary: {}", binary.display());
+            println!("data_root: {}", root.display());
+            println!("palaces: {}", palaces.len());
             println!("active palace: {palace}");
             println!("daemon: not running (serve not started)");
         }
