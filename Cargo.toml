@@ -40,7 +40,7 @@ tempfile = "3"
 
 [package]
 name = "trusty-memory"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 description = "Machine-wide AI memory service with Memory Palace architecture"
 license = "MIT"
