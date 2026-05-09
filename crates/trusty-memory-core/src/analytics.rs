@@ -33,7 +33,13 @@ pub fn normalize_query(text: &str) -> String {
     let lower = text.to_lowercase();
     let no_punct: String = lower
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == ' ' { c } else { ' ' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect();
     let words: Vec<&str> = no_punct
         .split_whitespace()
