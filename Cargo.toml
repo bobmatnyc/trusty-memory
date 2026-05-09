@@ -34,6 +34,8 @@ kuzu = "0.9"
 clap_complete = "4"
 colored = "2"
 walkdir = "2"
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
 
 [package]
 name = "trusty-memory"
@@ -65,3 +67,4 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }

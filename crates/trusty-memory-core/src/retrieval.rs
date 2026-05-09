@@ -10,6 +10,8 @@
 //! Test: `cargo test -p trusty-memory-core retrieval::` exercises L0/L1 cache
 //! and L2 vector retrieval end-to-end.
 
+use crate::analytics::{query_hash, RecallEvent, RecallLog};
+use crate::decay::DecayConfig;
 use crate::embed::Embedder;
 use crate::palace::{Drawer, PalaceId, RoomType};
 use crate::store::kg::KnowledgeGraph;
@@ -68,6 +70,23 @@ pub struct PalaceHandle {
     pub vector_store: Arc<UsearchStore>,
     pub kg: Arc<KnowledgeGraph>,
     pub drawers: Arc<RwLock<Vec<Drawer>>>,
+    /// Temporal decay configuration applied during L2/L3 ranking.
+    ///
+    /// Why: Old drawers should fade unless refreshed by access; baking the
+    /// config into the handle keeps retrieval calls free of extra parameters
+    /// while still allowing per-palace overrides later.
+    /// What: Defaults to `DecayConfig::default()` (90-day half-life, 0.05 floor).
+    /// Test: `decay_applied_in_l2_score` confirms an aged drawer ranks below a
+    /// fresh one of identical importance.
+    pub decay_config: DecayConfig,
+    /// Optional recall analytics log. When `Some`, each `recall` /
+    /// `recall_deep` call fires a fire-and-forget event per result (or a
+    /// single miss event when the query returned nothing).
+    ///
+    /// Why: Closes the feedback loop without blocking the request path.
+    /// What: `None` by default so existing tests don't need a log directory.
+    /// Test: `recall_logs_events_when_log_present` exercises the wiring.
+    pub recall_log: Option<Arc<RecallLog>>,
 }
 
 impl PalaceHandle {
@@ -92,7 +111,26 @@ impl PalaceHandle {
             vector_store: Arc::new(vector_store),
             kg: Arc::new(kg),
             drawers: Arc::new(RwLock::new(Vec::new())),
+            decay_config: DecayConfig::default(),
+            recall_log: None,
         }
+    }
+
+    /// Attach a recall analytics log to this handle.
+    ///
+    /// Why: Recall logging is opt-in so simple tests don't need to manage a
+    /// SQLite file; production palaces wire one in at construction time.
+    /// What: Builder-style mutator returning `self`.
+    /// Test: `recall_logs_events_when_log_present` uses this to enable logging.
+    pub fn with_recall_log(mut self, log: Arc<RecallLog>) -> Self {
+        self.recall_log = Some(log);
+        self
+    }
+
+    /// Override the decay configuration for this palace.
+    pub fn with_decay_config(mut self, config: DecayConfig) -> Self {
+        self.decay_config = config;
+        self
     }
 
     /// Append a drawer to the in-memory drawer table.
@@ -233,9 +271,15 @@ pub async fn retrieve_l2(
             // Filter is acknowledged but not yet enforceable — see TODO above.
         }
 
+        let age_days = DecayConfig::age_days(drawer.created_at);
+        let boost = drawer.accumulated_boost(&handle.decay_config);
+        let eff_importance =
+            handle
+                .decay_config
+                .effective_importance(drawer.importance, age_days, boost);
         results.push(RecallResult {
             drawer: drawer.clone(),
-            score: drawer.importance * hit.score,
+            score: eff_importance * hit.score,
             layer: 2,
         });
     }
@@ -281,9 +325,15 @@ pub async fn retrieve_l3(
         let Some(drawer) = drawers.iter().find(|d| uuid_prefix_eq(d.id, hit.drawer_id)) else {
             continue;
         };
+        let age_days = DecayConfig::age_days(drawer.created_at);
+        let boost = drawer.accumulated_boost(&handle.decay_config);
+        let eff_importance =
+            handle
+                .decay_config
+                .effective_importance(drawer.importance, age_days, boost);
         results.push(RecallResult {
             drawer: drawer.clone(),
-            score: drawer.importance * hit.score,
+            score: eff_importance * hit.score,
             layer: 3,
         });
     }
@@ -315,6 +365,7 @@ pub async fn recall(
     let mut combined = retrieve_l0_l1(handle);
     let l2 = retrieve_l2(handle, embedder, query, None, top_k).await?;
     dedup_extend(&mut combined, l2);
+    log_recall(handle, query, &combined);
     Ok(combined)
 }
 
@@ -333,7 +384,56 @@ pub async fn recall_deep(
     let mut combined = retrieve_l0_l1(handle);
     let l3 = retrieve_l3(handle, embedder, query, top_k).await?;
     dedup_extend(&mut combined, l3);
+    log_recall(handle, query, &combined);
     Ok(combined)
+}
+
+/// Fire-and-forget recall analytics.
+///
+/// Why: Hit/miss telemetry must never block the request path; spawning a task
+/// keeps logging off the critical path while still capturing every event.
+/// What: If `handle.recall_log` is set, spawns a task that records one event
+/// per non-L0 result, or a single miss event when `results` only contains the
+/// L0 identity (no real recall hits).
+/// Test: `recall_logs_events_when_log_present` confirms the log row appears.
+fn log_recall(handle: &PalaceHandle, query: &str, results: &[RecallResult]) {
+    let Some(log) = handle.recall_log.clone() else {
+        return;
+    };
+    let palace_id = handle.id.as_str().to_string();
+    let q_hash = query_hash(query);
+    // Only count L1+ entries — the synthetic L0 identity is always present
+    // and would otherwise drown out genuine miss signals.
+    let logged: Vec<RecallResult> = results.iter().filter(|r| r.layer > 0).cloned().collect();
+
+    tokio::spawn(async move {
+        let now = chrono::Utc::now();
+        if logged.is_empty() {
+            let _ = log
+                .record(RecallEvent {
+                    palace_id,
+                    query_hash: q_hash,
+                    layer: 3,
+                    drawer_id: None,
+                    score: 0.0,
+                    occurred_at: now,
+                })
+                .await;
+        } else {
+            for r in &logged {
+                let _ = log
+                    .record(RecallEvent {
+                        palace_id: palace_id.clone(),
+                        query_hash: q_hash,
+                        layer: r.layer,
+                        drawer_id: Some(r.drawer.id),
+                        score: r.score,
+                        occurred_at: now,
+                    })
+                    .await;
+            }
+        }
+    });
 }
 
 /// Extend `base` with entries from `extra` whose drawer id isn't already in
@@ -436,5 +536,49 @@ mod tests {
             drawer_id
         );
         assert_eq!(results[0].layer, 2);
+    }
+
+    /// Why: Confirm the recall_log wiring actually fires events end-to-end.
+    /// What: Build a handle with a `RecallLog`, upsert one drawer, run
+    /// `recall`, then poll `hit_count` on the spawned logger task until it
+    /// reports >=1 (with a small bounded retry to allow the spawn to flush).
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn recall_logs_events_when_log_present() {
+        let dir = tempdir().unwrap();
+        let log = Arc::new(RecallLog::open(&dir.path().join("recall.db")).unwrap());
+        let mut handle = make_handle(dir.path()).with_recall_log(log.clone());
+        let embedder = crate::embed::FastEmbedder::new().await.unwrap();
+
+        let room_id = uuid::Uuid::new_v4();
+        let drawer = Drawer::new(room_id, "Rust is a systems programming language");
+        let drawer_id = drawer.id;
+        let vecs = embedder
+            .embed(std::slice::from_ref(&drawer.content))
+            .await
+            .unwrap();
+        handle
+            .vector_store
+            .upsert(drawer_id, vecs[0].clone())
+            .await
+            .unwrap();
+        handle.add_drawer(drawer);
+        handle.refresh_l1();
+
+        let _ = recall(&handle, &embedder, "systems programming Rust", 5)
+            .await
+            .unwrap();
+
+        // The logger task is spawned; poll briefly for it to land at least
+        // one event for our drawer.
+        let mut hits = 0u64;
+        for _ in 0..20 {
+            hits = log.hit_count(drawer_id).await.unwrap();
+            if hits >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(hits >= 1, "expected at least one logged hit, got {hits}");
     }
 }

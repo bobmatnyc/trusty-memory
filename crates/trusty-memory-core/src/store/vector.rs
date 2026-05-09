@@ -9,6 +9,7 @@
 //! longer returns the removed id; reopening the store from the same path
 //! retrieves previously inserted vectors.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -79,6 +80,17 @@ pub struct UsearchStore {
     path: PathBuf,
     #[allow(dead_code)]
     dim: usize,
+    /// Maps usearch u64 key -> original full Uuid, for lossless round-trip.
+    ///
+    /// Why: `key_to_uuid` only recovers the first 8 bytes; without this map
+    /// search results carry zero-padded UUIDs and dedup against the in-memory
+    /// drawer table by full UUID equality silently fails (same drawer can
+    /// appear in both L1 and L2 results).
+    /// What: Populated on every `upsert`, evicted on `remove`. Empty after a
+    /// cold reload from disk (TODO: rebuild from index iteration).
+    /// Test: `upsert_then_l1_l2_no_duplicate` asserts `search` returns the
+    /// original full UUID rather than the zero-padded fallback.
+    key_map: Arc<RwLock<HashMap<u64, Uuid>>>,
 }
 
 impl UsearchStore {
@@ -130,6 +142,11 @@ impl UsearchStore {
             index: Arc::new(RwLock::new(index)),
             path,
             dim,
+            // TODO(reload): on cold-start with an existing index, the key_map
+            // is empty so search results fall back to zero-padded UUIDs. We
+            // should iterate the index and repopulate, or persist the map
+            // alongside the index, before relying on dedup across restarts.
+            key_map: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 }
@@ -138,6 +155,7 @@ impl UsearchStore {
 impl VectorStore for UsearchStore {
     async fn upsert(&self, id: Uuid, embedding: Vec<f32>) -> Result<()> {
         let index = self.index.clone();
+        let key_map = self.key_map.clone();
         let path = self.path.clone();
         // Index operations are CPU/IO-bound C++ calls; run on a blocking thread
         // so we don't stall the async reactor.
@@ -163,6 +181,9 @@ impl VectorStore for UsearchStore {
                 .add(key, &embedding)
                 .map_err(|e| anyhow::anyhow!("failed to add vector to usearch: {e}"))?;
 
+            // Record the full UUID so search() can return it losslessly.
+            key_map.write().insert(key, id);
+
             let path_str = path
                 .to_str()
                 .with_context(|| format!("usearch path is not valid UTF-8: {path:?}"))?;
@@ -178,6 +199,7 @@ impl VectorStore for UsearchStore {
 
     async fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<VectorHit>> {
         let index = self.index.clone();
+        let key_map = self.key_map.clone();
         let query = query.to_vec();
         tokio::task::spawn_blocking(move || -> Result<Vec<VectorHit>> {
             let guard = index.read();
@@ -185,19 +207,30 @@ impl VectorStore for UsearchStore {
                 .search(&query, top_k)
                 .map_err(|e| anyhow::anyhow!("usearch search failed: {e}"))?;
 
+            let map_guard = key_map.read();
             let mut hits: Vec<VectorHit> = matches
                 .keys
                 .into_iter()
                 .zip(matches.distances)
-                .map(|(key, distance)| VectorHit {
-                    drawer_id: key_to_uuid(key),
-                    // Cosine distance in usearch is `1 - cosine_similarity`,
-                    // so similarity = 1 - distance. Clamp to keep the
-                    // floating-point boundary clean for callers that compare
-                    // to thresholds like 0.99.
-                    score: (1.0_f32 - distance).clamp(0.0, 1.0),
+                .map(|(key, distance)| {
+                    // Prefer the original full UUID we stored at upsert; fall
+                    // back to the zero-padded reconstruction for entries we
+                    // haven't seen this session (cold reload from disk).
+                    let drawer_id = map_guard
+                        .get(&key)
+                        .copied()
+                        .unwrap_or_else(|| key_to_uuid(key));
+                    VectorHit {
+                        drawer_id,
+                        // Cosine distance in usearch is `1 - cosine_similarity`,
+                        // so similarity = 1 - distance. Clamp to keep the
+                        // floating-point boundary clean for callers that compare
+                        // to thresholds like 0.99.
+                        score: (1.0_f32 - distance).clamp(0.0, 1.0),
+                    }
                 })
                 .collect();
+            drop(map_guard);
 
             // usearch already returns ascending distance, so descending score
             // is implied — but make it explicit for downstream consumers.
@@ -214,6 +247,7 @@ impl VectorStore for UsearchStore {
 
     async fn remove(&self, id: Uuid) -> Result<()> {
         let index = self.index.clone();
+        let key_map = self.key_map.clone();
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let guard = index.write();
@@ -221,6 +255,7 @@ impl VectorStore for UsearchStore {
             guard
                 .remove(key)
                 .map_err(|e| anyhow::anyhow!("failed to remove vector from usearch: {e}"))?;
+            key_map.write().remove(&key);
 
             let path_str = path
                 .to_str()
@@ -302,5 +337,34 @@ mod tests {
         let key = uuid_to_key(id);
         let round = key_to_uuid(key);
         assert_eq!(&id.as_bytes()[..8], &round.as_bytes()[..8]);
+    }
+
+    /// Why: Confirm that after an upsert+search cycle, the UUID we recover
+    /// from the store equals the full original UUID (last 8 bytes preserved),
+    /// so dedup across L1/L2 doesn't silently fail.
+    /// What: Upsert a vector under a fresh `Uuid::new_v4`, search for it, and
+    /// assert the returned `drawer_id` matches the input bit-for-bit.
+    /// Test: This test itself is the verification.
+    #[tokio::test]
+    async fn upsert_then_l1_l2_no_duplicate() {
+        let dir = tempdir().unwrap();
+        let store = UsearchStore::new(dir.path().join("test.usearch"), 384).unwrap();
+        let id = Uuid::new_v4();
+        let v = unit_vec(384, 42);
+
+        store.upsert(id, v.clone()).await.unwrap();
+        let hits = store.search(&v, 1).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].drawer_id, id,
+            "search must return the full original UUID, not a zero-padded fallback"
+        );
+        // Last 8 bytes must be non-zero (otherwise dedup against the in-memory
+        // drawer table would silently fail).
+        assert_ne!(
+            &hits[0].drawer_id.as_bytes()[8..],
+            &[0u8; 8],
+            "last 8 bytes were zeroed — the key_map round-trip is broken"
+        );
     }
 }

@@ -120,7 +120,15 @@ impl KnowledgeGraph {
             let conn = pool.get().context("failed to get sqlite connection")?;
             let close_ts = triple.valid_from.to_rfc3339();
 
-            conn.execute(
+            // Single atomic transaction: closing the prior active interval and
+            // inserting the new active row must either both succeed or both
+            // fail, otherwise a crash between the two could leave two active
+            // rows for the same (subject, predicate) — violating the invariant
+            // `query_active` relies on.
+            let tx = conn
+                .unchecked_transaction()
+                .context("failed to begin assert transaction")?;
+            tx.execute(
                 "UPDATE triples
                     SET valid_to = ?1
                     WHERE subject = ?2 AND predicate = ?3 AND valid_to IS NULL",
@@ -128,7 +136,7 @@ impl KnowledgeGraph {
             )
             .context("failed to close prior active interval")?;
 
-            conn.execute(
+            tx.execute(
                 "INSERT INTO triples
                     (subject, predicate, object, valid_from, confidence, provenance)
                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -143,6 +151,7 @@ impl KnowledgeGraph {
             )
             .context("failed to insert new active triple")?;
 
+            tx.commit().context("failed to commit assert transaction")?;
             Ok(())
         })
         .await
@@ -287,21 +296,30 @@ mod tests {
     #[tokio::test]
     async fn wal_mode_enabled() {
         let dir = tempdir().unwrap();
-        let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
-        // WAL mode creates a -wal file after first write
+        let db_path = dir.path().join("kg.db");
+        let kg = KnowledgeGraph::open(&db_path).unwrap();
+        // Write something to ensure the DB is fully initialized.
         let triple = Triple {
-            subject: "s".to_string(),
-            predicate: "p".to_string(),
-            object: "o".to_string(),
+            subject: "s".into(),
+            predicate: "p".into(),
+            object: "o".into(),
             valid_from: Utc::now(),
             valid_to: None,
             confidence: 1.0,
             provenance: None,
         };
         kg.assert(triple).await.unwrap();
-        assert!(
-            dir.path().join("kg.db-wal").exists() || dir.path().join("kg.db-shm").exists(),
-            "WAL mode should create -wal or -shm sidecar files"
+        // Verify the actual journal_mode pragma on a fresh connection so we're
+        // not relying on filesystem sidecars (which may be cleaned up between
+        // writes in some SQLite builds).
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            mode.to_lowercase(),
+            "wal",
+            "journal_mode should be wal, got {mode}"
         );
     }
 }

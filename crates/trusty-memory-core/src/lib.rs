@@ -15,4 +15,5 @@ pub mod retrieval;
 pub mod store;
 
 pub use palace::{Drawer, Palace, PalaceId, Room, RoomType, Wing};
-pub use registry::{PalaceHandle, PalaceRegistry};
+pub use registry::PalaceRegistry;
+pub use retrieval::PalaceHandle;
