@@ -51,7 +51,7 @@ pub struct Wing {
 }
 
 /// Topical category for a Room. Custom variants allow project-specific topics.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum RoomType {
     Frontend,
     Backend,

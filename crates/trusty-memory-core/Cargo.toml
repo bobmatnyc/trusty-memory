@@ -30,6 +30,10 @@ r2d2_sqlite = { workspace = true }
 lru = { workspace = true }
 tiktoken-rs = { workspace = true }
 
+# git history extraction
+git2 = { workspace = true }
+regex = { workspace = true }
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true }

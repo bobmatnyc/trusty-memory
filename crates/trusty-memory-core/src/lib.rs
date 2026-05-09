@@ -7,6 +7,7 @@
 
 pub mod decay;
 pub mod embed;
+pub mod git;
 pub mod palace;
 pub mod registry;
 pub mod retrieval;
