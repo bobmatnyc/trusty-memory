@@ -38,12 +38,7 @@ impl DecayConfig {
     /// in decay here keeps retrieval code free of time arithmetic.
     /// What: `(base * 2^(-age_days / half_life) + boost).clamp(floor, 1.0)`
     /// Test: See unit tests — half-life, floor, boost all verified.
-    pub fn effective_importance(
-        &self,
-        base: f32,
-        age_days: f32,
-        accumulated_boost: f32,
-    ) -> f32 {
+    pub fn effective_importance(&self, base: f32, age_days: f32, accumulated_boost: f32) -> f32 {
         let decayed = base * 2f32.powf(-age_days / self.half_life_days);
         let boost = accumulated_boost.min(self.access_boost_cap);
         (decayed + boost).clamp(self.floor, 1.0)

@@ -5,8 +5,8 @@
 
 use chrono::Utc;
 use std::path::PathBuf;
-use trusty_memory_core::{Palace, PalaceId, PalaceRegistry};
 use trusty_memory_core::registry::PalaceHandle;
+use trusty_memory_core::{Palace, PalaceId, PalaceRegistry};
 
 #[test]
 fn registry_register_and_get() {

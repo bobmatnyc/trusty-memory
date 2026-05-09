@@ -25,12 +25,15 @@ tiktoken-rs = "0.5"
 axum = "0.7"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 reqwest = { version = "0.12", features = ["json"], default-features = false }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
 git2 = { version = "0.20", features = ["vendored-libgit2", "vendored-openssl"] }
 regex = "1"
 dirs = "5"
 kuzu = "0.9"
+clap_complete = "4"
+colored = "2"
+walkdir = "2"
 
 [package]
 name = "trusty-memory"
@@ -53,6 +56,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 dotenvy = { workspace = true }
+clap_complete = { workspace = true }
+colored = { workspace = true }
+walkdir = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }

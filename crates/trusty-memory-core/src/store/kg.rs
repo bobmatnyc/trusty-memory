@@ -73,10 +73,8 @@ impl KnowledgeGraph {
         let conn = pool.get().context("failed to get sqlite connection")?;
 
         // Enable WAL mode. `pragma_update` doesn't return rows, so use query_row.
-        conn.query_row("PRAGMA journal_mode=WAL", [], |row| {
-            row.get::<_, String>(0)
-        })
-        .context("failed to enable WAL journal mode")?;
+        conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))
+            .context("failed to enable WAL journal mode")?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS entities (

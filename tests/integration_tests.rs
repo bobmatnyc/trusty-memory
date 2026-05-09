@@ -6,3 +6,6 @@
 
 #[path = "integration/basic_palace_test.rs"]
 mod basic_palace_test;
+
+#[path = "integration/cli_test.rs"]
+mod cli_test;
