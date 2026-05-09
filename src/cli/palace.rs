@@ -69,16 +69,52 @@ pub async fn handle(cmd: PalaceCommands, _palace: &str, out: &OutputConfig) -> R
             out.print_success("created");
         }
         PalaceCommands::Info { id } => {
-            let target = id.as_deref().unwrap_or("(active)");
-            println!("Palace info: {target}");
+            let root = data_root()?;
+            let target_id = id.unwrap_or_else(|| _palace.to_string());
+            let palaces = tokio::task::spawn_blocking({
+                let root = root.clone();
+                move || PalaceRegistry::list_palaces(&root)
+            })
+            .await
+            .context("join list_palaces")??;
+            match palaces.into_iter().find(|p| p.id.as_str() == target_id) {
+                Some(p) => {
+                    println!("id:          {}", p.id);
+                    println!("name:        {}", p.name);
+                    if let Some(d) = p.description {
+                        println!("description: {d}");
+                    }
+                    println!("created_at:  {}", p.created_at.to_rfc3339());
+                    println!("data_dir:    {}", p.data_dir.display());
+                }
+                None => {
+                    out.print_error(&format!("palace '{target_id}' not found"));
+                }
+            }
         }
         PalaceCommands::Delete { name } => {
-            println!("Deleting palace '{name}'");
-            out.print_success("deleted (registry wiring pending)");
+            let root = data_root()?;
+            let palace_dir = root.join(&name);
+            if !palace_dir.exists() {
+                out.print_error(&format!("palace '{name}' not found"));
+                return Ok(());
+            }
+            std::fs::remove_dir_all(&palace_dir)
+                .with_context(|| format!("remove palace dir {}", palace_dir.display()))?;
+            out.print_success(&format!("deleted palace '{name}'"));
         }
         PalaceCommands::Rename { old, new } => {
-            println!("Renaming palace '{old}' -> '{new}'");
-            out.print_success("renamed (registry wiring pending)");
+            let root = data_root()?;
+            let from = root.join(&old);
+            let to = root.join(&new);
+            if !from.exists() {
+                out.print_error(&format!("palace '{old}' not found"));
+                return Ok(());
+            }
+            std::fs::rename(&from, &to).with_context(|| {
+                format!("rename {} -> {}", from.display(), to.display())
+            })?;
+            out.print_success(&format!("renamed '{old}' -> '{new}'"));
         }
     }
     Ok(())

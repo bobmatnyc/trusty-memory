@@ -65,6 +65,32 @@ pub enum RoomType {
     Custom(String),
 }
 
+impl RoomType {
+    /// Parse a string into a `RoomType`, falling back to `Custom` for unknown
+    /// values.
+    ///
+    /// Why: CLI and MCP accept a free-form room string; centralizing the
+    /// canonicalization keeps the matching logic in one place.
+    /// What: Lowercases the input and matches against the stock variants;
+    /// any unrecognized value is wrapped in `Custom`.
+    /// Test: `room_type_parse` asserts case-insensitive matches and Custom
+    /// fallback.
+    pub fn parse(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "frontend" => RoomType::Frontend,
+            "backend" => RoomType::Backend,
+            "testing" | "tests" | "test" => RoomType::Testing,
+            "planning" => RoomType::Planning,
+            "documentation" | "docs" | "doc" => RoomType::Documentation,
+            "research" => RoomType::Research,
+            "configuration" | "config" => RoomType::Configuration,
+            "meetings" | "meeting" => RoomType::Meetings,
+            "general" | "" => RoomType::General,
+            other => RoomType::Custom(other.to_string()),
+        }
+    }
+}
+
 /// A room is a topic-bound container of drawers within a wing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Room {
@@ -145,6 +171,18 @@ mod tests {
         assert_eq!(d.importance, 0.5);
         assert_eq!(d.content, "hello");
         assert!(d.tags.is_empty());
+    }
+
+    #[test]
+    fn room_type_parse() {
+        assert_eq!(RoomType::parse("backend"), RoomType::Backend);
+        assert_eq!(RoomType::parse("Backend"), RoomType::Backend);
+        assert_eq!(RoomType::parse("docs"), RoomType::Documentation);
+        assert_eq!(RoomType::parse("general"), RoomType::General);
+        assert_eq!(
+            RoomType::parse("ops"),
+            RoomType::Custom("ops".to_string())
+        );
     }
 
     #[test]

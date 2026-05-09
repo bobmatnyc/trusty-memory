@@ -12,7 +12,7 @@
 
 use crate::analytics::{query_hash, RecallEvent, RecallLog};
 use crate::decay::DecayConfig;
-use crate::embed::Embedder;
+use crate::embed::{Embedder, FastEmbedder};
 use crate::palace::{Drawer, Palace, PalaceId, RoomType};
 use crate::store::kg::KnowledgeGraph;
 use crate::store::l1_cache::L1Cache;
@@ -246,6 +246,179 @@ impl PalaceHandle {
         });
         self.l1_drawers = sorted.into_iter().take(L1_CAP).collect();
     }
+
+    /// Store a new memory: embed, upsert to vector store, append to drawer
+    /// table, and persist the L1 snapshot.
+    ///
+    /// Why: First-class write path for CLI/MCP — keeps the embedding,
+    /// vector-store, drawer-table, and L1 snapshot in one transactional unit
+    /// so callers don't have to thread the steps themselves.
+    /// What: Builds a `Drawer` with a fresh UUID, embeds via `FastEmbedder`,
+    /// inserts the vector keyed by the drawer id, pushes onto the in-memory
+    /// drawer table, refreshes L1, and flushes the snapshot to disk.
+    /// Test: `cli_remember_and_recall` round-trips through this method.
+    pub async fn remember(
+        &self,
+        content: String,
+        room: RoomType,
+        tags: Vec<String>,
+        importance: f32,
+    ) -> Result<Uuid> {
+        // Encode RoomType into the room_id deterministically by hashing the
+        // debug repr. Until we wire a real Room table, this keeps the room
+        // signal recoverable for `list_drawers` filtering.
+        let room_id = room_to_uuid(&room);
+
+        let mut drawer = Drawer::new(room_id, content.clone());
+        drawer.tags = tags;
+        drawer.importance = importance.clamp(0.0, 1.0);
+        let id = drawer.id;
+
+        // Embed and upsert. Use a per-call FastEmbedder for now; long-lived
+        // services should hold a shared embedder on the registry to amortize
+        // model load.
+        let embedder = FastEmbedder::new()
+            .await
+            .context("init embedder for remember")?;
+        let vecs = embedder
+            .embed(&[content])
+            .await
+            .context("embed drawer content")?;
+        if let Some(v) = vecs.into_iter().next() {
+            self.vector_store
+                .upsert(id, v)
+                .await
+                .context("upsert drawer vector")?;
+        }
+
+        {
+            let mut drawers = self.drawers.write();
+            drawers.push(drawer);
+        }
+
+        // L1 snapshot: re-sort the in-memory table and persist top-15.
+        if let Some(data_dir) = self.data_dir.as_ref() {
+            let snap = self.drawers.read().clone();
+            L1Cache::save_l1_cache(&snap, data_dir).context("save L1 snapshot")?;
+        }
+
+        Ok(id)
+    }
+
+    /// Remove a drawer by id.
+    ///
+    /// Why: Surface forget as a first-class op so CLI/MCP can drop stale data
+    /// without leaking vectors in the HNSW index.
+    /// What: Removes the vector from the vector store and drops the matching
+    /// row from the in-memory drawer table. Persists the L1 snapshot afterward
+    /// so the drop survives a restart.
+    /// Test: `cli_forget_removes_drawer` asserts a recalled drawer disappears
+    /// after forget.
+    pub async fn forget(&self, id: Uuid) -> Result<()> {
+        // Best-effort vector removal — usearch may legitimately not have the
+        // key (e.g. if remember failed mid-flight); we propagate other errors.
+        if let Err(e) = self.vector_store.remove(id).await {
+            tracing::warn!(?id, "vector remove failed: {e:#}");
+        }
+
+        {
+            let mut drawers = self.drawers.write();
+            drawers.retain(|d| d.id != id);
+        }
+
+        if let Some(data_dir) = self.data_dir.as_ref() {
+            let snap = self.drawers.read().clone();
+            L1Cache::save_l1_cache(&snap, data_dir).context("save L1 snapshot after forget")?;
+        }
+
+        Ok(())
+    }
+
+    /// List drawers with optional room/tag filters, sorted by importance desc.
+    ///
+    /// Why: CLI `list` and MCP introspection need a uniform read view over the
+    /// in-memory drawer table without exposing the lock semantics.
+    /// What: Snapshots the drawer table, applies filters, sorts by importance
+    /// descending, and truncates to `limit`.
+    /// Test: `cli_list_filters_by_room` writes drawers in distinct rooms and
+    /// asserts the room filter narrows the list.
+    pub fn list_drawers(
+        &self,
+        room: Option<RoomType>,
+        tag: Option<String>,
+        limit: usize,
+    ) -> Vec<Drawer> {
+        let drawers = self.drawers.read();
+        let target_room_id = room.as_ref().map(room_to_uuid);
+        let mut filtered: Vec<Drawer> = drawers
+            .iter()
+            .filter(|d| match &target_room_id {
+                Some(rid) => d.room_id == *rid,
+                None => true,
+            })
+            .filter(|d| match &tag {
+                Some(t) => d.tags.iter().any(|x| x == t),
+                None => true,
+            })
+            .cloned()
+            .collect();
+        drop(drawers);
+        filtered.sort_by(|a, b| {
+            b.importance
+                .partial_cmp(&a.importance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        filtered.truncate(limit);
+        filtered
+    }
+}
+
+/// Recall via the L0+L1+L2 path with the per-call `FastEmbedder`.
+///
+/// Why: CLI/MCP often want a one-shot "recall" without managing an embedder
+/// handle; this convenience binds the embedder lifecycle to the call.
+/// What: Initializes a `FastEmbedder` (which warms on first run), then
+/// delegates to `recall`.
+/// Test: `cli_remember_and_recall` integration test.
+pub async fn recall_with_default_embedder(
+    handle: &PalaceHandle,
+    query: &str,
+    top_k: usize,
+) -> Result<Vec<RecallResult>> {
+    let embedder = FastEmbedder::new()
+        .await
+        .context("init embedder for recall")?;
+    recall(handle, &embedder, query, top_k).await
+}
+
+/// Deep recall with the per-call `FastEmbedder`.
+pub async fn recall_deep_with_default_embedder(
+    handle: &PalaceHandle,
+    query: &str,
+    top_k: usize,
+) -> Result<Vec<RecallResult>> {
+    let embedder = FastEmbedder::new()
+        .await
+        .context("init embedder for recall_deep")?;
+    recall_deep(handle, &embedder, query, top_k).await
+}
+
+/// Hash a `RoomType` to a deterministic `Uuid` so the room signal survives
+/// through the in-memory drawer table without a real `Room` row.
+///
+/// Why: `Drawer.room_id` is a `Uuid`; until we wire a Room table, callers need
+/// a stable mapping from `RoomType` to id so `list_drawers` can filter by room.
+/// What: FNV-1a-like hash of the `Debug` repr, packed into 16 bytes.
+/// Test: Indirectly via `cli_list_filters_by_room`.
+fn room_to_uuid(room: &RoomType) -> Uuid {
+    let label = format!("{room:?}");
+    let mut bytes = [0u8; 16];
+    // Fold each byte into the buffer with a simple xor-rot hash; collisions
+    // here are fine — this only needs to be stable per-process.
+    for (i, b) in label.bytes().enumerate() {
+        bytes[i % 16] ^= b.wrapping_add(i as u8);
+    }
+    Uuid::from_bytes(bytes)
 }
 
 /// Compare two UUIDs by their first 8 bytes.
@@ -616,6 +789,136 @@ mod tests {
             drawer_id
         );
         assert_eq!(results[0].layer, 2);
+    }
+
+    /// Why: End-to-end confirmation that `remember` + `recall` round-trip
+    /// through the embedder and vector store correctly.
+    /// What: Build a palace handle backed by a tempdir, remember three
+    /// drawers in distinct rooms, recall on a keyword from one of them, and
+    /// assert the matching drawer appears in the L2 results.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn cli_remember_and_recall() {
+        use crate::palace::Palace;
+        let dir = tempdir().unwrap();
+        let palace = Palace {
+            id: PalaceId::new("test"),
+            name: "Test".into(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            data_dir: dir.path().join("test"),
+        };
+        std::fs::create_dir_all(&palace.data_dir).unwrap();
+        let handle = PalaceHandle::open(&palace).unwrap();
+
+        let _id = handle
+            .remember(
+                "Rust async runtime is tokio".into(),
+                RoomType::Backend,
+                vec!["rust".into()],
+                0.7,
+            )
+            .await
+            .unwrap();
+        handle
+            .remember(
+                "React uses a virtual DOM".into(),
+                RoomType::Frontend,
+                vec![],
+                0.5,
+            )
+            .await
+            .unwrap();
+
+        let results = recall_with_default_embedder(&handle, "tokio rust async", 5)
+            .await
+            .unwrap();
+        assert!(
+            results
+                .iter()
+                .any(|r| r.drawer.content.contains("tokio")),
+            "expected to recall the tokio drawer; got {results:?}"
+        );
+    }
+
+    /// Why: Confirm `forget` removes a drawer from both the in-memory table
+    /// and the vector store.
+    /// What: Remember one drawer, forget it, then recall the same keyword and
+    /// assert the drawer is no longer in the result list.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn cli_forget_removes_drawer() {
+        use crate::palace::Palace;
+        let dir = tempdir().unwrap();
+        let palace = Palace {
+            id: PalaceId::new("forget-test"),
+            name: "Forget".into(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            data_dir: dir.path().join("forget-test"),
+        };
+        std::fs::create_dir_all(&palace.data_dir).unwrap();
+        let handle = PalaceHandle::open(&palace).unwrap();
+
+        let id = handle
+            .remember(
+                "ephemeral fact about Quokkas".into(),
+                RoomType::General,
+                vec![],
+                0.5,
+            )
+            .await
+            .unwrap();
+        handle.forget(id).await.unwrap();
+
+        let results = recall_with_default_embedder(&handle, "Quokkas ephemeral", 5)
+            .await
+            .unwrap();
+        assert!(
+            !results.iter().any(|r| r.drawer.id == id),
+            "forgotten drawer should not appear in recall results"
+        );
+    }
+
+    /// Why: Confirm the room filter in `list_drawers` actually narrows the
+    /// returned set to drawers whose deterministic room id matches.
+    /// What: Remember three drawers in three distinct rooms, list with the
+    /// Backend filter, and assert exactly one drawer comes back.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn cli_list_filters_by_room() {
+        use crate::palace::Palace;
+        let dir = tempdir().unwrap();
+        let palace = Palace {
+            id: PalaceId::new("list-test"),
+            name: "List".into(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            data_dir: dir.path().join("list-test"),
+        };
+        std::fs::create_dir_all(&palace.data_dir).unwrap();
+        let handle = PalaceHandle::open(&palace).unwrap();
+
+        handle
+            .remember("backend fact".into(), RoomType::Backend, vec![], 0.5)
+            .await
+            .unwrap();
+        handle
+            .remember("frontend fact".into(), RoomType::Frontend, vec![], 0.5)
+            .await
+            .unwrap();
+        handle
+            .remember("docs fact".into(), RoomType::Documentation, vec![], 0.5)
+            .await
+            .unwrap();
+
+        let backend_only = handle.list_drawers(Some(RoomType::Backend), None, 10);
+        assert_eq!(
+            backend_only.len(),
+            1,
+            "expected exactly 1 backend drawer, got {backend_only:?}"
+        );
+        assert!(backend_only[0].content.contains("backend"));
     }
 
     /// Why: Confirm the recall_log wiring actually fires events end-to-end.

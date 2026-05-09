@@ -21,7 +21,10 @@ pub mod dream;
 pub mod git;
 pub mod kg;
 pub mod kuzu;
+pub mod memory;
 pub mod output;
+
+pub use memory::{handle_forget, handle_list, handle_recall, handle_remember};
 pub mod palace;
 pub mod palace_resolver;
 pub mod setup;

@@ -57,41 +57,7 @@ async fn main() -> Result<()> {
             tags,
             importance,
         } => {
-            out.print_header(&palace, &room);
-            println!("Storing memory in palace '{palace}' room '{room}'");
-            println!("  importance: {importance}");
-            if !tags.is_empty() {
-                println!("  tags: {}", tags.join(", "));
-            }
-            let preview_len = text.len().min(80);
-            println!("  preview: {}", &text[..preview_len]);
-
-            // Resolve / create the palace on disk. Drawer write path
-            // (vector + KG) lands in a follow-up; this just confirms the
-            // metadata + L1 cache plumbing.
-            let root = cli::palace::data_root()?;
-            let palace_id = trusty_memory_core::PalaceId::new(palace.clone());
-            let root_clone = root.clone();
-            let palace_id_clone = palace_id.clone();
-            let palace_name = palace.clone();
-            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let reg = trusty_memory_core::PalaceRegistry::new();
-                if reg.open_palace(&root_clone, &palace_id_clone).is_err() {
-                    // Auto-create on first remember.
-                    let p = trusty_memory_core::Palace {
-                        id: palace_id_clone.clone(),
-                        name: palace_name,
-                        description: None,
-                        created_at: chrono::Utc::now(),
-                        data_dir: root_clone.join(palace_id_clone.as_str()),
-                    };
-                    reg.create_palace(&root_clone, p)?;
-                }
-                Ok(())
-            })
-            .await??;
-
-            out.print_success("palace ready (drawer write pending)");
+            cli::handle_remember(&palace, text, room, tags, importance, &out).await?;
         }
 
         Commands::Recall {
@@ -101,20 +67,15 @@ async fn main() -> Result<()> {
             deep,
             decay: _,
         } => {
-            out.print_header(&palace, room.as_deref().unwrap_or("all rooms"));
-            let layer = if deep { "L3" } else { "L2" };
-            println!("Recalling '{query}' from '{palace}' (top {top_k}, {layer})");
-            out.print_footer(0, layer, 0);
+            cli::handle_recall(&palace, query, top_k, room, deep, &out).await?;
         }
 
         Commands::Forget { id } => {
-            println!("Removing drawer {id} from '{palace}'");
-            out.print_success("removed (registry wiring pending)");
+            cli::handle_forget(&palace, &id, &out).await?;
         }
 
         Commands::List { limit, room, sort } => {
-            out.print_header(&palace, room.as_deref().unwrap_or("all"));
-            println!("Listing up to {limit} memories sorted by {sort}");
+            cli::handle_list(&palace, limit, room, sort, &out).await?;
         }
 
         Commands::Palace(sub) => cli::palace::handle(sub, &palace, &out).await?,
