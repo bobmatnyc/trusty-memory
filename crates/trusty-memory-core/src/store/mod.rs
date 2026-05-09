@@ -7,6 +7,7 @@
 //! Test: See submodule tests.
 
 pub mod kg;
+pub mod kuzu;
 pub mod vector;
 
 pub use kg::{KnowledgeGraph, Triple};

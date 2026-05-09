@@ -29,6 +29,8 @@ clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
 git2 = { version = "0.20", features = ["vendored-libgit2", "vendored-openssl"] }
 regex = "1"
+dirs = "5"
+kuzu = "0.9"
 
 [package]
 name = "trusty-memory"
