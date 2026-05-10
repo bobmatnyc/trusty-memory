@@ -238,6 +238,10 @@ async fn main() -> Result<()> {
             }
         },
 
+        Commands::Hooks(args) => {
+            cli::hooks::handle(args, &palace, &out).await?;
+        }
+
         Commands::Status => {
             let binary = std::env::current_exe()?;
             let root = cli::palace::data_root()?;

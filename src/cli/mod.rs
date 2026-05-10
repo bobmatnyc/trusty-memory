@@ -20,6 +20,7 @@ pub mod convert;
 pub mod decay;
 pub mod dream;
 pub mod git;
+pub mod hooks;
 pub mod kg;
 pub mod kuzu;
 pub mod memory;
@@ -209,6 +210,12 @@ pub enum Commands {
         after_help = "Examples:\n  trusty-memory convert project\n  trusty-memory convert all --dry-run\n  trusty-memory convert project --source kuzu --palace my-app"
     )]
     Convert(ConvertArgs),
+
+    /// Install/manage event hooks (git, Claude Code) for passive memory ingest.
+    #[command(
+        after_help = "Examples:\n  trusty-memory hooks install --git\n  trusty-memory hooks install --claude-code\n  trusty-memory hooks install --all\n  trusty-memory hooks list\n  trusty-memory hooks status"
+    )]
+    Hooks(hooks::HooksArgs),
 
     /// Show daemon health and palace summary.
     Status,
