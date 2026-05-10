@@ -8,7 +8,7 @@
 //! Test: `cargo test --test integration_tests` plus `cargo build` covers
 //! the parse surface; per-handler unit tests live in their own modules.
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -16,6 +16,7 @@ pub mod analytics;
 pub mod bench;
 pub mod chat;
 pub mod config;
+pub mod convert;
 pub mod decay;
 pub mod dream;
 pub mod git;
@@ -203,6 +204,12 @@ pub enum Commands {
     #[command(subcommand)]
     Bench(BenchCommands),
 
+    /// Convert memories from external sources (kuzu-memory, mempalace) into palaces.
+    #[command(
+        after_help = "Examples:\n  trusty-memory convert project\n  trusty-memory convert all --dry-run\n  trusty-memory convert project --source kuzu --palace my-app"
+    )]
+    Convert(ConvertArgs),
+
     /// Show daemon health and palace summary.
     Status,
 
@@ -362,4 +369,44 @@ pub struct BenchCompareArgs {
     /// Emit machine-readable JSON metrics instead of the formatted table.
     #[arg(long)]
     pub json: bool,
+}
+
+/// Arguments for the `convert` subcommand.
+///
+/// Why: Migrates pre-existing memories (kuzu-memory DBs, mempalace WAL) into
+/// trusty-memory palaces so users don't lose history when adopting the new
+/// service.
+/// What: Carries the scope (single project vs whole machine), source filter,
+/// dry-run flag, and palace-name override.
+/// Test: Parse coverage via clap; behavioral tests live in `convert.rs`.
+#[derive(clap::Args, Debug, Clone)]
+pub struct ConvertArgs {
+    /// Scope: "project" (current dir) or "all" (whole machine).
+    #[arg(value_enum)]
+    pub scope: ConvertScope,
+
+    /// Which source to convert from.
+    #[arg(long, value_enum, default_value = "all")]
+    pub source: ConvertSource,
+
+    /// Dry run — print what would be imported without writing.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Override palace name (project mode only).
+    #[arg(long)]
+    pub palace: Option<String>,
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+pub enum ConvertScope {
+    Project,
+    All,
+}
+
+#[derive(ValueEnum, Clone, Debug, PartialEq, Eq)]
+pub enum ConvertSource {
+    Kuzu,
+    Mempalace,
+    All,
 }

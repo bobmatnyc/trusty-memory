@@ -221,6 +221,10 @@ async fn main() -> Result<()> {
             }
         },
 
+        Commands::Convert(args) => {
+            cli::convert::handle_convert(args).await?;
+        }
+
         Commands::Bench(sub) => match sub {
             cli::BenchCommands::Compare(args) => {
                 let opts = cli::bench::BenchCompareOpts {
