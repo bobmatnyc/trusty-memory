@@ -88,7 +88,8 @@ async fn main() -> Result<()> {
 
         Commands::Serve { http, mcp: _ } => {
             tracing::info!(?http, "Starting trusty-memory MCP server");
-            let state = trusty_memory_mcp::AppState::new();
+            let data_root_for_state = cli::palace::data_root()?;
+            let state = trusty_memory_mcp::AppState::new(data_root_for_state);
 
             // Auto-start the Dreamer for every persisted palace so background
             // consolidation runs while the daemon is alive.

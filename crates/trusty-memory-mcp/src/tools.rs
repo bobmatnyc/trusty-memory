@@ -3,7 +3,8 @@
 //! Why: Concentrates the public tool contract in one file so changes are
 //! auditable and the MCP schema stays in sync with the implementation.
 //! What: Defines `MemoryMcpServer`, `tool_definitions()` (the MCP
-//! `tools/list` payload), and the in-process tool dispatcher.
+//! `tools/list` payload), and the in-process tool dispatcher wired to the
+//! real `PalaceRegistry` + retrieval / KG APIs.
 //! Test: `cargo test -p trusty-memory-mcp` validates the schema and dispatch.
 //!
 //! Tools exposed:
@@ -12,11 +13,15 @@
 //! - `memory_recall_deep(palace, query, top_k?)`   -> Vec<Drawer> (L3 deep)
 //! - `palace_create(name, description?)`           -> PalaceId
 //! - `palace_list()`                                -> Vec<PalaceId>
-//! - `kg_assert(palace, subject, predicate, object, confidence?)` -> ()
+//! - `kg_assert(palace, subject, predicate, object, confidence?, provenance?)` -> ()
 //! - `kg_query(palace, subject)`                    -> Vec<Triple>
 
-use anyhow::Result;
+use crate::AppState;
+use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
+use trusty_memory_core::palace::{Palace, PalaceId, RoomType};
+use trusty_memory_core::retrieval::{recall, recall_deep};
+use trusty_memory_core::store::kg::Triple;
 
 /// Marker server type. Reserved for future stateful MCP server impls.
 ///
@@ -136,68 +141,272 @@ pub fn tool_definitions() -> Value {
     })
 }
 
-/// Dispatch a tool call by name to its handler stub.
+/// Parse a `RoomType` from an optional string (`"Backend"`, `"Frontend"`,
+/// etc.) — falls back to `RoomType::General` when unset or unknown.
 ///
-/// Why: Centralises the name → handler mapping so the stdio loop stays small;
-/// once the registry / retrieval engines land, only this fn changes.
-/// What: Returns `Ok(Value)` on success, `Err` on unknown tool / bad args.
-/// Test: `dispatch_tool("memory_remember", { palace, text })` returns a
-/// JSON object with a `drawer_id` field; `dispatch_tool("nope", _)` errors.
-pub async fn dispatch_tool(name: &str, args: Value) -> Result<Value> {
+/// Why: MCP arguments are JSON; we accept the friendly enum-name forms so
+/// callers don't have to learn an internal serialization.
+/// What: Match-on-string returning the corresponding `RoomType`.
+/// Test: Indirectly via `dispatch_remember_then_recall`.
+fn parse_room(s: Option<&str>) -> RoomType {
+    match s.unwrap_or("General") {
+        "Frontend" => RoomType::Frontend,
+        "Backend" => RoomType::Backend,
+        "Testing" => RoomType::Testing,
+        "Planning" => RoomType::Planning,
+        "Documentation" => RoomType::Documentation,
+        "Research" => RoomType::Research,
+        "Configuration" => RoomType::Configuration,
+        "Meetings" => RoomType::Meetings,
+        "General" => RoomType::General,
+        other => RoomType::Custom(other.to_string()),
+    }
+}
+
+/// Resolve (or lazily open) the palace handle for a tool call.
+fn open_palace_handle(
+    state: &AppState,
+    palace_id: &str,
+) -> Result<std::sync::Arc<trusty_memory_core::PalaceHandle>> {
+    let pid = PalaceId::new(palace_id);
+    state
+        .registry
+        .open_palace(&state.data_root, &pid)
+        .with_context(|| format!("open palace {palace_id}"))
+}
+
+/// Dispatch a tool call by name to its real handler.
+///
+/// Why: Centralises the name → handler mapping; every handler now performs a
+/// real read/write against the live `PalaceRegistry` instead of returning a
+/// stub.
+/// What: Returns `Ok(Value)` on success, `Err` on unknown tool / bad args /
+/// underlying failure.
+/// Test: `dispatch_palace_create_persists`, `dispatch_remember_then_recall`,
+/// `dispatch_kg_assert_then_query`, `dispatch_unknown_tool_errors`.
+pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<Value> {
     match name {
         "memory_remember" => {
             let palace = args
                 .get("palace")
                 .and_then(|v| v.as_str())
-                .unwrap_or("default");
-            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let drawer_id = uuid::Uuid::new_v4();
-            let preview_end = text
-                .char_indices()
-                .nth(50)
-                .map(|(i, _)| i)
-                .unwrap_or(text.len());
+                .ok_or_else(|| anyhow!("memory_remember: missing 'palace'"))?;
+            let text = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("memory_remember: missing 'text'"))?
+                .to_string();
+            let room = parse_room(args.get("room").and_then(|v| v.as_str()));
+            let tags: Vec<String> = args
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let handle = open_palace_handle(state, palace)?;
+            let drawer_id = handle
+                .remember(text, room, tags, 0.5)
+                .await
+                .context("PalaceHandle::remember")?;
             Ok(json!({
                 "drawer_id": drawer_id.to_string(),
                 "palace": palace,
                 "status": "stored",
-                "preview": &text[..preview_end],
-                "note": "Registry not yet wired — implement in #6/#15"
             }))
         }
-        "memory_recall" | "memory_recall_deep" => {
+        "memory_recall" => {
             let palace = args
                 .get("palace")
                 .and_then(|v| v.as_str())
-                .unwrap_or("default");
-            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-            Ok(json!({
-                "palace": palace,
-                "query": query,
-                "results": [],
-                "note": "Registry not yet wired — implement in #6/#15"
-            }))
+                .ok_or_else(|| anyhow!("memory_recall: missing 'palace'"))?;
+            let query = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("memory_recall: missing 'query'"))?;
+            let top_k = args
+                .get("top_k")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10) as usize;
+
+            let handle = open_palace_handle(state, palace)?;
+            let embedder = state.embedder().await?;
+            let results = recall(&handle, embedder.as_ref(), query, top_k)
+                .await
+                .context("recall")?;
+            Ok(serialize_recall(palace, query, results))
+        }
+        "memory_recall_deep" => {
+            let palace = args
+                .get("palace")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("memory_recall_deep: missing 'palace'"))?;
+            let query = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("memory_recall_deep: missing 'query'"))?;
+            let top_k = args
+                .get("top_k")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10) as usize;
+
+            let handle = open_palace_handle(state, palace)?;
+            let embedder = state.embedder().await?;
+            let results = recall_deep(&handle, embedder.as_ref(), query, top_k)
+                .await
+                .context("recall_deep")?;
+            Ok(serialize_recall(palace, query, results))
         }
         "palace_create" => {
             let palace_name = args
                 .get("name")
                 .and_then(|v| v.as_str())
-                .unwrap_or("unnamed");
+                .ok_or_else(|| anyhow!("palace_create: missing 'name'"))?;
+            let description = args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let palace = Palace {
+                id: PalaceId::new(palace_name),
+                name: palace_name.to_string(),
+                description,
+                created_at: chrono::Utc::now(),
+                data_dir: state.data_root.join(palace_name),
+            };
+            let _handle = state
+                .registry
+                .create_palace(&state.data_root, palace)
+                .context("create_palace")?;
             Ok(json!({"palace_id": palace_name, "status": "created"}))
         }
-        "palace_list" => Ok(json!({"palaces": []})),
-        "kg_assert" => Ok(json!({"status": "asserted"})),
+        "palace_list" => {
+            let root = state.data_root.clone();
+            let palaces = tokio::task::spawn_blocking(move || {
+                trusty_memory_core::PalaceRegistry::list_palaces(&root)
+            })
+            .await
+            .context("join list_palaces")??;
+            let ids: Vec<String> = palaces.iter().map(|p| p.id.as_str().to_string()).collect();
+            Ok(json!({"palaces": ids}))
+        }
+        "kg_assert" => {
+            let palace = args
+                .get("palace")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("kg_assert: missing 'palace'"))?;
+            let subject = args
+                .get("subject")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("kg_assert: missing 'subject'"))?
+                .to_string();
+            let predicate = args
+                .get("predicate")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("kg_assert: missing 'predicate'"))?
+                .to_string();
+            let object = args
+                .get("object")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("kg_assert: missing 'object'"))?
+                .to_string();
+            let confidence = args
+                .get("confidence")
+                .and_then(|v| v.as_f64())
+                .map(|c| (c as f32).clamp(0.0, 1.0))
+                .unwrap_or(1.0);
+            let provenance = args
+                .get("provenance")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            let handle = open_palace_handle(state, palace)?;
+            let triple = Triple {
+                subject,
+                predicate,
+                object,
+                valid_from: chrono::Utc::now(),
+                valid_to: None,
+                confidence,
+                provenance,
+            };
+            handle.kg.assert(triple).await.context("kg.assert")?;
+            Ok(json!({"status": "asserted"}))
+        }
         "kg_query" => {
-            let subject = args.get("subject").and_then(|v| v.as_str()).unwrap_or("");
-            Ok(json!({"subject": subject, "triples": []}))
+            let palace = args
+                .get("palace")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("kg_query: missing 'palace'"))?;
+            let subject = args
+                .get("subject")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("kg_query: missing 'subject'"))?;
+            let handle = open_palace_handle(state, palace)?;
+            let triples = handle
+                .kg
+                .query_active(subject)
+                .await
+                .context("kg.query_active")?;
+            let payload: Vec<Value> = triples
+                .iter()
+                .map(|t| {
+                    json!({
+                        "subject": t.subject,
+                        "predicate": t.predicate,
+                        "object": t.object,
+                        "valid_from": t.valid_from.to_rfc3339(),
+                        "valid_to": t.valid_to.as_ref().map(|d| d.to_rfc3339()),
+                        "confidence": t.confidence,
+                        "provenance": t.provenance,
+                    })
+                })
+                .collect();
+            Ok(json!({"subject": subject, "triples": payload}))
         }
         other => anyhow::bail!("unknown tool: {other}"),
     }
 }
 
+/// Serialize `recall` results into a JSON shape the MCP client can render.
+fn serialize_recall(
+    palace: &str,
+    query: &str,
+    results: Vec<trusty_memory_core::retrieval::RecallResult>,
+) -> Value {
+    let payload: Vec<Value> = results
+        .iter()
+        .map(|r| {
+            json!({
+                "drawer_id": r.drawer.id.to_string(),
+                "content":   r.drawer.content,
+                "score":     r.score,
+                "layer":     r.layer,
+                "tags":      r.drawer.tags,
+                "importance": r.drawer.importance,
+            })
+        })
+        .collect();
+    json!({
+        "palace": palace,
+        "query": query,
+        "results": payload,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::AppState;
+
+    fn test_state() -> AppState {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        AppState::new(root)
+    }
 
     #[test]
     fn tool_definitions_lists_seven_tools() {
@@ -224,18 +433,104 @@ mod tests {
         }
     }
 
+    /// Why: Confirm `palace_create` actually persists a palace under the
+    /// configured data root and `palace_list` then sees it.
     #[tokio::test]
-    async fn dispatch_remember_returns_drawer_id() {
-        let result = dispatch_tool("memory_remember", json!({"palace": "p1", "text": "hello"}))
+    async fn dispatch_palace_create_persists() {
+        let state = test_state();
+        let created =
+            dispatch_tool(&state, "palace_create", json!({"name": "alpha"}))
+                .await
+                .expect("palace_create");
+        assert_eq!(created["palace_id"], "alpha");
+
+        let listed = dispatch_tool(&state, "palace_list", json!({}))
             .await
-            .expect("dispatch ok");
-        assert!(result.get("drawer_id").is_some());
-        assert_eq!(result.get("palace").and_then(|v| v.as_str()), Some("p1"));
+            .expect("palace_list");
+        let ids = listed["palaces"].as_array().expect("palaces array");
+        assert!(ids.iter().any(|v| v.as_str() == Some("alpha")));
+    }
+
+    /// Why: End-to-end confirmation that a remembered drawer is recallable
+    /// through the MCP tool surface using the real embedder + retrieval path.
+    #[tokio::test]
+    async fn dispatch_remember_then_recall() {
+        let state = test_state();
+        let _ = dispatch_tool(&state, "palace_create", json!({"name": "beta"}))
+            .await
+            .expect("palace_create");
+
+        let remembered = dispatch_tool(
+            &state,
+            "memory_remember",
+            json!({
+                "palace": "beta",
+                "text": "Quokkas are the happiest marsupials in Australia",
+                "room": "General",
+                "tags": ["wildlife"],
+            }),
+        )
+        .await
+        .expect("memory_remember");
+        assert!(remembered["drawer_id"].as_str().is_some());
+
+        let recalled = dispatch_tool(
+            &state,
+            "memory_recall",
+            json!({"palace": "beta", "query": "Quokkas marsupials Australia", "top_k": 5}),
+        )
+        .await
+        .expect("memory_recall");
+        let results = recalled["results"].as_array().expect("results");
+        assert!(
+            results
+                .iter()
+                .any(|r| r["content"].as_str().unwrap_or("").contains("Quokkas")),
+            "expected to recall the Quokkas drawer; got {results:?}"
+        );
+    }
+
+    /// Why: Confirm `kg_assert` writes a triple and `kg_query` returns it
+    /// through the MCP tool surface.
+    #[tokio::test]
+    async fn dispatch_kg_assert_then_query() {
+        let state = test_state();
+        let _ = dispatch_tool(&state, "palace_create", json!({"name": "gamma"}))
+            .await
+            .expect("palace_create");
+
+        let _ = dispatch_tool(
+            &state,
+            "kg_assert",
+            json!({
+                "palace": "gamma",
+                "subject": "alice",
+                "predicate": "works_at",
+                "object": "Acme",
+                "confidence": 0.9,
+                "provenance": "test",
+            }),
+        )
+        .await
+        .expect("kg_assert");
+
+        let queried = dispatch_tool(
+            &state,
+            "kg_query",
+            json!({"palace": "gamma", "subject": "alice"}),
+        )
+        .await
+        .expect("kg_query");
+        let triples = queried["triples"].as_array().expect("triples array");
+        assert_eq!(triples.len(), 1);
+        assert_eq!(triples[0]["object"], "Acme");
+        assert_eq!(triples[0]["predicate"], "works_at");
     }
 
     #[tokio::test]
     async fn dispatch_unknown_tool_errors() {
-        let err = dispatch_tool("does_not_exist", json!({}))
+        let state = test_state();
+        let err = dispatch_tool(&state, "does_not_exist", json!({}))
             .await
             .expect_err("should error");
         assert!(err.to_string().contains("unknown tool"));
