@@ -129,6 +129,59 @@ impl Dreamer {
         })
     }
 
+    /// Spawn the background dream loop with a cooperative shutdown signal.
+    ///
+    /// Why: A long-running daemon needs to stop its background workers cleanly
+    /// on SIGTERM / Ctrl-C; otherwise the process can block on shutdown waiting
+    /// for an in-flight cycle, or worse, terminate mid-cycle and leave on-disk
+    /// state inconsistent. A `tokio::sync::watch` channel is the cheapest way
+    /// to fan out a single cancel signal to every spawned task.
+    /// What: Spawns a tokio task that races the inter-cycle sleep against the
+    /// shutdown signal. When `shutdown` flips to `true`, the loop logs and
+    /// exits cleanly. When the shutdown sender is dropped, the loop also
+    /// exits (treated as a cancel).
+    /// Test: `dreamer_shutdown_terminates_loop` — spawn the loop, flip the
+    /// shutdown flag, await the join handle.
+    pub fn start_with_shutdown(
+        self: Arc<Self>,
+        handle: Arc<PalaceHandle>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let interval = Duration::from_secs(self.config.idle_secs.max(1));
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    res = shutdown.changed() => {
+                        // Sender closed (`Err`) or value changed to true: shut down.
+                        if res.is_err() || *shutdown.borrow() {
+                            tracing::info!(palace = %handle.id, "dreamer shutting down");
+                            return;
+                        }
+                    }
+                }
+                if *shutdown.borrow() {
+                    tracing::info!(palace = %handle.id, "dreamer shutting down");
+                    return;
+                }
+                if !self.is_idle() {
+                    continue;
+                }
+                match self.dream_cycle(&handle).await {
+                    Ok(stats) => tracing::info!(
+                        palace = %handle.id,
+                        merged = stats.merged,
+                        pruned = stats.pruned,
+                        closets_updated = stats.closets_updated,
+                        duration_ms = stats.duration_ms,
+                        "dream cycle complete"
+                    ),
+                    Err(e) => tracing::warn!(palace = %handle.id, "dream cycle failed: {e:#}"),
+                }
+            }
+        })
+    }
+
     /// Run one synchronous dream cycle: dedup, prune, closet refresh, flush.
     ///
     /// Why: Consolidation must happen as a single, bounded unit so we can
@@ -512,6 +565,33 @@ mod tests {
             handle.drawers.read().is_empty(),
             "low-importance aged drawer should be removed"
         );
+    }
+
+    /// Why: The serve daemon must be able to terminate the dream loop on
+    /// SIGTERM/Ctrl-C; verify the watch-channel shutdown path actually causes
+    /// the spawned task to exit instead of looping forever.
+    /// What: Spawn `start_with_shutdown` with `idle_secs=10` (so it would
+    /// otherwise sleep), flip the shutdown flag, and assert the join handle
+    /// completes within a short bounded timeout.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn dreamer_shutdown_terminates_loop() {
+        let handle = open_test_handle("dream-shutdown").await;
+        let dreamer = Arc::new(Dreamer::new(DreamConfig {
+            idle_secs: 10,
+            ..DreamConfig::default()
+        }));
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let join = dreamer.clone().start_with_shutdown(handle, rx);
+
+        // Yield once so the task is scheduled.
+        tokio::task::yield_now().await;
+        tx.send(true).expect("send shutdown signal");
+
+        // The task should exit promptly — bound the wait to keep the test fast.
+        let outcome = tokio::time::timeout(Duration::from_secs(2), join).await;
+        assert!(outcome.is_ok(), "dream loop did not exit within 2s of shutdown");
+        outcome.unwrap().expect("join handle clean exit");
     }
 
     /// Why: After a dream cycle, the closet index should map keywords from

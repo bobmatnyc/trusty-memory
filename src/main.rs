@@ -89,14 +89,93 @@ async fn main() -> Result<()> {
         Commands::Serve { http, mcp: _ } => {
             tracing::info!(?http, "Starting trusty-memory MCP server");
             let state = trusty_memory_mcp::AppState::new();
-            if let Some(addr) = http {
+
+            // Auto-start the Dreamer for every persisted palace so background
+            // consolidation runs while the daemon is alive.
+            //
+            // Why: Issue #21 — operators expect background dedup/prune/closet
+            // refresh without having to invoke a separate command. We discover
+            // every palace under data_root, open it, and spawn a per-palace
+            // dream loop with a shared shutdown signal so all loops terminate
+            // cleanly when the daemon stops.
+            // What: A `tokio::sync::watch::Sender<bool>` fans out shutdown to
+            // every spawned dream task; the join handles are kept so we can
+            // await them on exit (best-effort).
+            // Test: `dreamer_shutdown_terminates_loop` covers cancellation;
+            // discovery is exercised manually via `trusty-memory serve`.
+            let (shutdown_tx, shutdown_rx) =
+                tokio::sync::watch::channel(false);
+            let mut dream_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+            match cli::palace::data_root() {
+                Ok(root) => {
+                    match trusty_memory_core::PalaceRegistry::list_palaces(&root) {
+                        Ok(palaces) => {
+                            let registry = trusty_memory_core::PalaceRegistry::new();
+                            for p in palaces {
+                                match registry.open_palace(&root, &p.id) {
+                                    Ok(handle) => {
+                                        let dreamer = std::sync::Arc::new(
+                                            trusty_memory_core::dream::Dreamer::new(
+                                                trusty_memory_core::dream::DreamConfig::default(),
+                                            ),
+                                        );
+                                        dream_handles.push(
+                                            dreamer.start_with_shutdown(
+                                                handle,
+                                                shutdown_rx.clone(),
+                                            ),
+                                        );
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        palace = %p.id,
+                                        "failed to open palace for dreamer: {e:#}"
+                                    ),
+                                }
+                            }
+                            tracing::info!(
+                                count = dream_handles.len(),
+                                "Dreamer started — background consolidation active"
+                            );
+                        }
+                        Err(e) => tracing::warn!(
+                            "failed to enumerate palaces for Dreamer: {e:#}"
+                        ),
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "failed to resolve data root for Dreamer: {e:#}"
+                ),
+            }
+
+            let serve_result = if let Some(addr) = http {
                 tokio::select! {
-                    r = trusty_memory_mcp::run_stdio(state.clone()) => r?,
-                    r = trusty_memory_mcp::run_http(state, addr) => r?,
+                    r = trusty_memory_mcp::run_stdio(state.clone()) => r,
+                    r = trusty_memory_mcp::run_http(state, addr) => r,
+                    _ = tokio::signal::ctrl_c() => {
+                        tracing::info!("ctrl-c received, shutting down");
+                        Ok(())
+                    }
                 }
             } else {
-                trusty_memory_mcp::run_stdio(state).await?;
+                tokio::select! {
+                    r = trusty_memory_mcp::run_stdio(state) => r,
+                    _ = tokio::signal::ctrl_c() => {
+                        tracing::info!("ctrl-c received, shutting down");
+                        Ok(())
+                    }
+                }
+            };
+
+            // Signal every dream task to exit and wait briefly for cleanup.
+            let _ = shutdown_tx.send(true);
+            for jh in dream_handles {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    jh,
+                )
+                .await;
             }
+            serve_result?;
         }
 
         Commands::Setup {
