@@ -7,12 +7,14 @@
 //! Test: Asserting (s,p,o) twice should close the first interval and open a
 //! new one; `query_active` returns only the latest.
 
+use crate::palace::Drawer;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Triple {
@@ -96,7 +98,17 @@ impl KnowledgeGraph {
             );
 
             CREATE INDEX IF NOT EXISTS idx_triples_subj_active
-                ON triples(subject) WHERE valid_to IS NULL;",
+                ON triples(subject) WHERE valid_to IS NULL;
+
+            CREATE TABLE IF NOT EXISTS drawers (
+                id          TEXT PRIMARY KEY,
+                room_id     TEXT NOT NULL,
+                content     TEXT NOT NULL,
+                importance  REAL NOT NULL DEFAULT 0.5,
+                tags        TEXT NOT NULL DEFAULT '[]',
+                source_file TEXT,
+                created_at  TEXT NOT NULL
+            );",
         )
         .context("failed to run schema migrations")?;
 
@@ -227,6 +239,137 @@ impl KnowledgeGraph {
         .context("query_active spawn_blocking join error")??;
         Ok(triples)
     }
+
+    /// Persist a drawer's metadata. Called from `PalaceHandle::remember`.
+    ///
+    /// Why: The HNSW index stores only vectors keyed by UUID prefix — without
+    /// the metadata persisted alongside, vector hits map to nothing after a
+    /// cold restart and retrieval silently drops every result beyond the L1
+    /// snapshot (issue #32).
+    /// What: INSERT OR REPLACE on the `drawers` table. Tags are JSON-encoded;
+    /// `source_file` is stored as a string path; `created_at` is RFC3339.
+    /// Test: `upsert_drawer_then_load_drawers_round_trips`.
+    pub fn upsert_drawer(&self, drawer: &Drawer) -> Result<()> {
+        let conn = self.pool.get().context("failed to get sqlite connection")?;
+        let tags = serde_json::to_string(&drawer.tags).context("serialize drawer tags")?;
+        let source_file = drawer
+            .source_file
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        conn.execute(
+            "INSERT INTO drawers
+                (id, room_id, content, importance, tags, source_file, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+              ON CONFLICT(id) DO UPDATE SET
+                room_id     = excluded.room_id,
+                content     = excluded.content,
+                importance  = excluded.importance,
+                tags        = excluded.tags,
+                source_file = excluded.source_file,
+                created_at  = excluded.created_at",
+            rusqlite::params![
+                drawer.id.to_string(),
+                drawer.room_id.to_string(),
+                drawer.content,
+                drawer.importance as f64,
+                tags,
+                source_file,
+                drawer.created_at.to_rfc3339(),
+            ],
+        )
+        .context("failed to upsert drawer")?;
+        Ok(())
+    }
+
+    /// Remove a drawer's metadata by ID. Called from `PalaceHandle::forget`.
+    ///
+    /// Why: Forgetting must clear both the vector index and the persistent
+    /// metadata row, otherwise restart would resurrect the drawer.
+    /// What: DELETE FROM drawers WHERE id = ?1. No-op if id is unknown.
+    /// Test: `delete_drawer_removes_row`.
+    pub fn delete_drawer(&self, id: Uuid) -> Result<()> {
+        let conn = self.pool.get().context("failed to get sqlite connection")?;
+        conn.execute(
+            "DELETE FROM drawers WHERE id = ?1",
+            rusqlite::params![id.to_string()],
+        )
+        .context("failed to delete drawer")?;
+        Ok(())
+    }
+
+    /// Load all drawer metadata. Called from `PalaceHandle::open`.
+    ///
+    /// Why: Cold-start retrieval needs the full drawer table to map every
+    /// HNSW vector hit back to metadata; without this, only the 15 drawers
+    /// in the L1 snapshot are recoverable.
+    /// What: SELECT * FROM drawers, parsing tags as JSON, source_file as
+    /// optional path, created_at as RFC3339. Rows with malformed data are
+    /// skipped with a warning rather than aborting the whole load.
+    /// Test: `upsert_drawer_then_load_drawers_round_trips`.
+    pub fn load_drawers(&self) -> Result<Vec<Drawer>> {
+        let conn = self.pool.get().context("failed to get sqlite connection")?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, room_id, content, importance, tags, source_file, created_at
+                   FROM drawers",
+            )
+            .context("failed to prepare load_drawers statement")?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })
+            .context("failed to query drawers")?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (id_s, room_id_s, content, importance, tags_s, source_file_s, created_s) =
+                row.context("failed to read drawer row")?;
+            let id = match Uuid::parse_str(&id_s) {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::warn!(id = %id_s, "skip drawer with invalid id: {e}");
+                    continue;
+                }
+            };
+            let room_id = match Uuid::parse_str(&room_id_s) {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::warn!(id = %id_s, "skip drawer with invalid room_id: {e}");
+                    continue;
+                }
+            };
+            let tags: Vec<String> = serde_json::from_str(&tags_s).unwrap_or_default();
+            let source_file: Option<PathBuf> = source_file_s.map(PathBuf::from);
+            let created_at = match DateTime::parse_from_rfc3339(&created_s) {
+                Ok(dt) => dt.with_timezone(&Utc),
+                Err(e) => {
+                    tracing::warn!(id = %id_s, "skip drawer with invalid created_at: {e}");
+                    continue;
+                }
+            };
+            out.push(Drawer {
+                id,
+                room_id,
+                content,
+                importance: importance as f32,
+                source_file,
+                created_at,
+                tags,
+                last_accessed_at: None,
+                access_count: 0,
+            });
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -291,6 +434,53 @@ mod tests {
         let active = kg.query_active("alice").await.unwrap();
         assert_eq!(active.len(), 1, "should have exactly 1 active triple");
         assert_eq!(active[0].object, "Beta Inc");
+    }
+
+    #[test]
+    fn upsert_drawer_then_load_drawers_round_trips() {
+        let dir = tempdir().unwrap();
+        let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
+        let room_id = Uuid::new_v4();
+        let mut d = Drawer::new(room_id, "the cold-start drawer");
+        d.importance = 0.83;
+        d.tags = vec!["alpha".into(), "beta".into()];
+        d.source_file = Some(PathBuf::from("/tmp/source.md"));
+        kg.upsert_drawer(&d).unwrap();
+
+        let loaded = kg.load_drawers().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, d.id);
+        assert_eq!(loaded[0].room_id, room_id);
+        assert_eq!(loaded[0].content, "the cold-start drawer");
+        assert!((loaded[0].importance - 0.83).abs() < 1e-5);
+        assert_eq!(loaded[0].tags, vec!["alpha".to_string(), "beta".into()]);
+        assert_eq!(loaded[0].source_file, Some(PathBuf::from("/tmp/source.md")));
+    }
+
+    #[test]
+    fn delete_drawer_removes_row() {
+        let dir = tempdir().unwrap();
+        let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
+        let d = Drawer::new(Uuid::new_v4(), "to be deleted");
+        kg.upsert_drawer(&d).unwrap();
+        kg.delete_drawer(d.id).unwrap();
+        let loaded = kg.load_drawers().unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn upsert_drawer_replaces_existing_row() {
+        let dir = tempdir().unwrap();
+        let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
+        let mut d = Drawer::new(Uuid::new_v4(), "original");
+        kg.upsert_drawer(&d).unwrap();
+        d.content = "updated".into();
+        d.importance = 0.95;
+        kg.upsert_drawer(&d).unwrap();
+        let loaded = kg.load_drawers().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].content, "updated");
+        assert!((loaded[0].importance - 0.95).abs() < 1e-5);
     }
 
     #[tokio::test]

@@ -169,10 +169,39 @@ impl PalaceHandle {
         let kg =
             KnowledgeGraph::open(&kg_path).with_context(|| format!("open KG for {}", palace.id))?;
 
-        // Seed the drawer table with whatever metadata the L1 snapshot holds
-        // so retrieval has at least the essential drawers available before
-        // any new writes land.
-        let drawers = Arc::new(RwLock::new(l1_drawers.clone()));
+        // Load full drawer table from SQLite (the persistent source of truth).
+        // Fall back to an empty list on error so a corrupt table doesn't make
+        // the palace unopenable — the L1 snapshot still provides essentials.
+        let persisted_drawers = match kg.load_drawers() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(palace = %palace.id, "load_drawers failed, falling back to L1 only: {e:#}");
+                Vec::new()
+            }
+        };
+
+        // Merge: persisted is authoritative; L1 snapshot fills gaps for
+        // palaces created before drawer persistence existed (issue #32 migration).
+        let mut all_drawers = persisted_drawers;
+        for l1 in &l1_drawers {
+            if !all_drawers.iter().any(|d| d.id == l1.id) {
+                all_drawers.push(l1.clone());
+            }
+        }
+
+        // Surface orphaned vectors so operators can re-ingest if needed.
+        let index_count = vector_store.index_size();
+        let drawer_count = all_drawers.len();
+        if index_count > drawer_count + 5 {
+            tracing::warn!(
+                palace = %palace.id,
+                index_vectors = index_count,
+                drawer_records = drawer_count,
+                "vector index has orphaned entries — consider re-ingesting"
+            );
+        }
+
+        let drawers = Arc::new(RwLock::new(all_drawers));
 
         let handle = PalaceHandle {
             id: palace.id.clone(),
@@ -304,6 +333,12 @@ impl PalaceHandle {
                 .context("upsert drawer vector")?;
         }
 
+        // Persist drawer metadata BEFORE the in-memory push so a crash mid-op
+        // cannot leave an in-memory drawer with no SQLite row backing it.
+        self.kg
+            .upsert_drawer(&drawer)
+            .context("persist drawer metadata")?;
+
         {
             let mut drawers = self.drawers.write();
             drawers.push(drawer);
@@ -355,6 +390,12 @@ impl PalaceHandle {
         // key (e.g. if remember failed mid-flight); we propagate other errors.
         if let Err(e) = self.vector_store.remove(id).await {
             tracing::warn!(?id, "vector remove failed: {e:#}");
+        }
+
+        // Drop persistent metadata alongside the vector so cold restart
+        // doesn't resurrect this drawer (issue #32).
+        if let Err(e) = self.kg.delete_drawer(id) {
+            tracing::warn!(?id, "drawer metadata delete failed: {e:#}");
         }
 
         {
@@ -1145,6 +1186,74 @@ mod tests {
         assert_eq!(
             untouched, "what colour is the sky on Tuesday",
             "queries with no triggers must pass through unchanged"
+        );
+    }
+
+    /// Why: Regression test for issue #32 — after a cold restart, L2/L3 must
+    /// still resolve vector hits to drawers beyond the top-15 L1 snapshot.
+    /// What: Remember 20 drawers, drop the handle, reopen the palace from the
+    /// same data_dir, and recall a keyword from a drawer that is NOT in the
+    /// top-15 by importance. The drawer must still come back.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn cold_restart_recalls_beyond_l1_snapshot() {
+        use crate::palace::Palace;
+        let dir = tempdir().unwrap();
+        let palace = Palace {
+            id: PalaceId::new("cold-restart"),
+            name: "Cold".into(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            data_dir: dir.path().join("cold-restart"),
+        };
+        std::fs::create_dir_all(&palace.data_dir).unwrap();
+
+        // Use a separate scope so the first handle (and its Arc-wrapped
+        // vector store) is fully dropped before we reopen.
+        let needle_id = {
+            let handle = PalaceHandle::open(&palace).unwrap();
+            // 19 high-importance filler drawers (importance 0.9) — these will
+            // dominate the top-15 L1 snapshot.
+            for i in 0..19 {
+                handle
+                    .remember(
+                        format!("filler drawer number {i} about generic topics"),
+                        RoomType::General,
+                        vec![],
+                        0.9,
+                    )
+                    .await
+                    .unwrap();
+            }
+            // The needle: low importance so it cannot be in the L1 top-15,
+            // distinctive vocabulary so the query lands on it.
+            handle
+                .remember(
+                    "the pangolin is a scaly nocturnal mammal".into(),
+                    RoomType::Research,
+                    vec![],
+                    0.1,
+                )
+                .await
+                .unwrap()
+        };
+
+        // Reopen the palace — simulating a cold restart.
+        let handle2 = PalaceHandle::open(&palace).unwrap();
+
+        // Drawer table should be fully hydrated, not just the 15-entry L1.
+        let count = handle2.drawers.read().len();
+        assert!(
+            count >= 20,
+            "expected >=20 drawers after cold reopen, got {count}"
+        );
+
+        let results = recall_with_default_embedder(&handle2, "pangolin scaly mammal", 10)
+            .await
+            .unwrap();
+        assert!(
+            results.iter().any(|r| r.drawer.id == needle_id),
+            "low-importance drawer beyond L1 must still be recallable after cold restart; got {results:?}"
         );
     }
 

@@ -149,6 +149,16 @@ impl UsearchStore {
             key_map: Arc::new(RwLock::new(HashMap::new())),
         })
     }
+
+    /// Number of vectors currently in the index.
+    ///
+    /// Why: Cold-start diagnostics compare the HNSW size to the drawer table
+    /// size to surface orphaned vectors (issue #32).
+    /// What: Acquires a read lock and returns `Index::size()`.
+    /// Test: Indirectly via `PalaceHandle::open` warnings.
+    pub fn index_size(&self) -> usize {
+        self.index.read().size()
+    }
 }
 
 #[async_trait]
