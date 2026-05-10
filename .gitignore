@@ -3,6 +3,11 @@
 **/*.rs.bk
 Cargo.lock.bak
 
+# UI build artifacts
+/ui/node_modules/
+/ui/dist/
+/ui/.vite/
+
 # Env / secrets
 .env
 .env.local

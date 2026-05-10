@@ -19,6 +19,7 @@ use trusty_memory_core::embed::FastEmbedder;
 use trusty_memory_core::PalaceRegistry;
 
 pub mod tools;
+pub mod web;
 
 pub use tools::MemoryMcpServer;
 
@@ -222,26 +223,36 @@ pub async fn run_stdio(state: AppState) -> Result<()> {
     Ok(())
 }
 
-/// Run the optional HTTP/SSE companion server.
+/// Run the optional HTTP/SSE + web admin server.
 ///
 /// Why: A long-running daemon mode lets non-stdio clients (browsers, curl,
-/// future remote agents) hit `/health` and stream events from `/sse`.
-/// What: axum router exposing `/health` and a stub `/sse` endpoint.
-/// Test: `curl http://127.0.0.1:<port>/health` returns `ok` (manual).
-pub async fn run_http(state: AppState, addr: std::net::SocketAddr) -> Result<()> {
-    use axum::{routing::get, Router};
-    use tower_http::trace::TraceLayer;
+/// future remote agents) hit `/health`, the `/api/v1/*` REST surface, and the
+/// embedded admin SPA.
+/// What: axum router built from `web::router()` plus a `/sse` stub for the
+/// existing MCP-over-SSE clients. Caller provides a pre-bound listener so
+/// port auto-detection lives at the call site.
+/// Test: `cargo test -p trusty-memory-mcp web::tests` exercises the router
+/// shape; manual: `curl http://127.0.0.1:<port>/health` returns `ok`.
+pub async fn run_http_on(state: AppState, listener: tokio::net::TcpListener) -> Result<()> {
+    use axum::routing::get;
 
-    let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
+    let app = web::router()
         .route("/sse", get(sse_handler))
-        .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    info!("HTTP server listening on {addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let local = listener.local_addr().ok();
+    if let Some(a) = local {
+        info!("HTTP server listening on http://{a}");
+        eprintln!("HTTP server listening on http://{a}");
+    }
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Convenience: bind `addr` and serve via [`run_http_on`].
+pub async fn run_http(state: AppState, addr: std::net::SocketAddr) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    run_http_on(state, listener).await
 }
 
 /// Stub SSE handler returning a single connected event.
