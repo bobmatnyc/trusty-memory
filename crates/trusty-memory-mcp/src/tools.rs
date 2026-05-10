@@ -47,9 +47,48 @@ impl Default for MemoryMcpServer {
 ///
 /// Why: Claude Code calls `tools/list` once on connect and uses the schema
 /// to drive the tool picker; the schema is the source of truth for arg names.
+/// `palace` is required only when the server has no `--palace` default
+/// configured — when a default is set, the schema omits `palace` from
+/// `required` so clients can drop it.
 /// What: Returns a JSON object `{ "tools": [...] }` with all 7 tool defs.
-/// Test: Assert the array length is 7 and contains every expected name.
+/// Test: `tool_definitions_lists_seven_tools`,
+/// `tool_definitions_drops_palace_required_when_default_set`.
 pub fn tool_definitions() -> Value {
+    tool_definitions_with(false)
+}
+
+/// Variant of `tool_definitions` aware of whether a default palace is
+/// configured. When `has_default` is true, the `palace` argument is moved
+/// out of the `required` list for every tool that takes it.
+///
+/// Why: Lets `handle_message` emit a schema that matches the running
+/// server's actual contract — clients reading the schema should see exactly
+/// what they need to send.
+/// What: Builds the same shape as `tool_definitions` but with conditional
+/// `required` arrays.
+/// Test: `tool_definitions_drops_palace_required_when_default_set`.
+pub fn tool_definitions_with(has_default: bool) -> Value {
+    let memory_remember_required: Vec<&str> = if has_default {
+        vec!["text"]
+    } else {
+        vec!["palace", "text"]
+    };
+    let memory_recall_required: Vec<&str> = if has_default {
+        vec!["query"]
+    } else {
+        vec!["palace", "query"]
+    };
+    let kg_assert_required: Vec<&str> = if has_default {
+        vec!["subject", "predicate", "object"]
+    } else {
+        vec!["palace", "subject", "predicate", "object"]
+    };
+    let kg_query_required: Vec<&str> = if has_default {
+        vec!["subject"]
+    } else {
+        vec!["palace", "subject"]
+    };
+
     json!({
         "tools": [
             {
@@ -58,12 +97,12 @@ pub fn tool_definitions() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "palace": {"type": "string", "description": "Palace ID"},
+                        "palace": {"type": "string", "description": "Palace ID (optional if server started with --palace)"},
                         "text":   {"type": "string", "description": "Memory content"},
                         "room":   {"type": "string", "description": "Room type (optional)"},
                         "tags":   {"type": "array", "items": {"type": "string"}}
                     },
-                    "required": ["palace", "text"]
+                    "required": memory_remember_required,
                 }
             },
             {
@@ -76,7 +115,7 @@ pub fn tool_definitions() -> Value {
                         "query":  {"type": "string"},
                         "top_k":  {"type": "integer", "default": 10}
                     },
-                    "required": ["palace", "query"]
+                    "required": memory_recall_required,
                 }
             },
             {
@@ -89,7 +128,7 @@ pub fn tool_definitions() -> Value {
                         "query":  {"type": "string"},
                         "top_k":  {"type": "integer", "default": 10}
                     },
-                    "required": ["palace", "query"]
+                    "required": memory_recall_required,
                 }
             },
             {
@@ -122,7 +161,7 @@ pub fn tool_definitions() -> Value {
                         "confidence": {"type": "number", "default": 1.0},
                         "provenance": {"type": "string"}
                     },
-                    "required": ["palace", "subject", "predicate", "object"]
+                    "required": kg_assert_required,
                 }
             },
             {
@@ -134,7 +173,7 @@ pub fn tool_definitions() -> Value {
                         "palace":  {"type": "string"},
                         "subject": {"type": "string"}
                     },
-                    "required": ["palace", "subject"]
+                    "required": kg_query_required,
                 }
             }
         ]
@@ -175,6 +214,27 @@ fn open_palace_handle(
         .with_context(|| format!("open palace {palace_id}"))
 }
 
+/// Resolve a palace argument, falling back to `state.default_palace` when
+/// the caller omitted `palace`.
+///
+/// Why: `serve --palace <name>` lets the operator bind a process to a single
+/// project namespace; tool calls then no longer need to repeat the palace
+/// every time. This helper centralises the precedence rule (explicit arg
+/// wins over default) and produces a uniform error when neither is set.
+/// What: Returns the explicit `args["palace"]` string if present, otherwise
+/// `state.default_palace`. Errors with a helpful message if both are absent.
+/// Test: `default_palace_used_when_arg_omitted` and
+/// `dispatch_unknown_tool_errors`.
+fn resolve_palace<'a>(state: &'a AppState, args: &'a Value, tool: &str) -> Result<String> {
+    if let Some(p) = args.get("palace").and_then(|v| v.as_str()) {
+        return Ok(p.to_string());
+    }
+    state
+        .default_palace
+        .clone()
+        .ok_or_else(|| anyhow!("{tool}: missing 'palace' (no --palace default configured)"))
+}
+
 /// Dispatch a tool call by name to its real handler.
 ///
 /// Why: Centralises the name → handler mapping; every handler now performs a
@@ -187,10 +247,8 @@ fn open_palace_handle(
 pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<Value> {
     match name {
         "memory_remember" => {
-            let palace = args
-                .get("palace")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("memory_remember: missing 'palace'"))?;
+            let palace = resolve_palace(state, &args, "memory_remember")?;
+            let palace = palace.as_str();
             let text = args
                 .get("text")
                 .and_then(|v| v.as_str())
@@ -219,46 +277,34 @@ pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<
             }))
         }
         "memory_recall" => {
-            let palace = args
-                .get("palace")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("memory_recall: missing 'palace'"))?;
+            let palace = resolve_palace(state, &args, "memory_recall")?;
             let query = args
                 .get("query")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("memory_recall: missing 'query'"))?;
-            let top_k = args
-                .get("top_k")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(10) as usize;
+            let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
-            let handle = open_palace_handle(state, palace)?;
+            let handle = open_palace_handle(state, &palace)?;
             let embedder = state.embedder().await?;
             let results = recall(&handle, embedder.as_ref(), query, top_k)
                 .await
                 .context("recall")?;
-            Ok(serialize_recall(palace, query, results))
+            Ok(serialize_recall(&palace, query, results))
         }
         "memory_recall_deep" => {
-            let palace = args
-                .get("palace")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("memory_recall_deep: missing 'palace'"))?;
+            let palace = resolve_palace(state, &args, "memory_recall_deep")?;
             let query = args
                 .get("query")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("memory_recall_deep: missing 'query'"))?;
-            let top_k = args
-                .get("top_k")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(10) as usize;
+            let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
-            let handle = open_palace_handle(state, palace)?;
+            let handle = open_palace_handle(state, &palace)?;
             let embedder = state.embedder().await?;
             let results = recall_deep(&handle, embedder.as_ref(), query, top_k)
                 .await
                 .context("recall_deep")?;
-            Ok(serialize_recall(palace, query, results))
+            Ok(serialize_recall(&palace, query, results))
         }
         "palace_create" => {
             let palace_name = args
@@ -293,10 +339,8 @@ pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<
             Ok(json!({"palaces": ids}))
         }
         "kg_assert" => {
-            let palace = args
-                .get("palace")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("kg_assert: missing 'palace'"))?;
+            let palace = resolve_palace(state, &args, "kg_assert")?;
+            let palace = palace.as_str();
             let subject = args
                 .get("subject")
                 .and_then(|v| v.as_str())
@@ -336,15 +380,12 @@ pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<
             Ok(json!({"status": "asserted"}))
         }
         "kg_query" => {
-            let palace = args
-                .get("palace")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("kg_query: missing 'palace'"))?;
+            let palace = resolve_palace(state, &args, "kg_query")?;
             let subject = args
                 .get("subject")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("kg_query: missing 'subject'"))?;
-            let handle = open_palace_handle(state, palace)?;
+            let handle = open_palace_handle(state, &palace)?;
             let triples = handle
                 .kg
                 .query_active(subject)
@@ -408,6 +449,40 @@ mod tests {
         AppState::new(root)
     }
 
+    /// Why: Issue #26 — when the server is started with `--palace`, the
+    /// `tools/list` schema must drop `palace` from the `required` array for
+    /// every tool that accepts it, so MCP clients know it's optional.
+    /// Test: Build the schema both ways and check the required arrays.
+    #[test]
+    fn tool_definitions_drops_palace_required_when_default_set() {
+        let with_default = tool_definitions_with(true);
+        let without_default = tool_definitions_with(false);
+        for (name, palace_required_when_no_default) in [
+            ("memory_remember", true),
+            ("memory_recall", true),
+            ("memory_recall_deep", true),
+            ("kg_assert", true),
+            ("kg_query", true),
+        ] {
+            for (defs, has_default) in [(&with_default, true), (&without_default, false)] {
+                let tools = defs["tools"].as_array().unwrap();
+                let tool = tools.iter().find(|t| t["name"] == name).unwrap();
+                let required: Vec<&str> = tool["inputSchema"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect();
+                let palace_required = required.contains(&"palace");
+                let expected = palace_required_when_no_default && !has_default;
+                assert_eq!(
+                    palace_required, expected,
+                    "tool={name} has_default={has_default} required={required:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn tool_definitions_lists_seven_tools() {
         let defs = tool_definitions();
@@ -438,10 +513,9 @@ mod tests {
     #[tokio::test]
     async fn dispatch_palace_create_persists() {
         let state = test_state();
-        let created =
-            dispatch_tool(&state, "palace_create", json!({"name": "alpha"}))
-                .await
-                .expect("palace_create");
+        let created = dispatch_tool(&state, "palace_create", json!({"name": "alpha"}))
+            .await
+            .expect("palace_create");
         assert_eq!(created["palace_id"], "alpha");
 
         let listed = dispatch_tool(&state, "palace_list", json!({}))

@@ -915,9 +915,18 @@ mod tests {
     fn extract_mempalace_preserves_rank_order() {
         // Corpus: d1, d2, d3 in insertion order.
         let corpus: Vec<(String, String)> = vec![
-            ("d1".into(), "Alpha beta gamma delta epsilon zeta eta theta iota kappa.".into()),
-            ("d2".into(), "Lambda mu nu xi omicron pi rho sigma tau upsilon phi chi.".into()),
-            ("d3".into(), "Omega psi chi phi upsilon tau sigma rho pi omicron xi nu.".into()),
+            (
+                "d1".into(),
+                "Alpha beta gamma delta epsilon zeta eta theta iota kappa.".into(),
+            ),
+            (
+                "d2".into(),
+                "Lambda mu nu xi omicron pi rho sigma tau upsilon phi chi.".into(),
+            ),
+            (
+                "d3".into(),
+                "Omega psi chi phi upsilon tau sigma rho pi omicron xi nu.".into(),
+            ),
         ];
 
         // Synthetic mempalace_search response: d3 ranked first, d1 second, d2 absent.
@@ -946,9 +955,10 @@ mod tests {
     /// blob scan when the text is not valid JSON.
     #[test]
     fn extract_mempalace_fallback_on_plain_text() {
-        let corpus: Vec<(String, String)> = vec![
-            ("d1".into(), "The quick brown fox jumps over the lazy dog.".into()),
-        ];
+        let corpus: Vec<(String, String)> = vec![(
+            "d1".into(),
+            "The quick brown fox jumps over the lazy dog.".into(),
+        )];
         let mcp_result = serde_json::json!({
             "content": [{"type": "text", "text": "The quick brown fox jumps over the lazy dog."}]
         });
@@ -991,9 +1001,7 @@ mod tests {
             let top1 = results.first().cloned().unwrap_or_default();
             let hit = relevant.iter().any(|r| r == &top1);
             if !hit {
-                eprintln!(
-                    "  miss {qid}: top1={top1:?} expected={relevant:?} got={results:?}"
-                );
+                eprintln!("  miss {qid}: top1={top1:?} expected={relevant:?} got={results:?}");
             }
         }
         assert!(

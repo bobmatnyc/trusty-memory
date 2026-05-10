@@ -137,10 +137,7 @@ fn install_git_hook() -> Result<()> {
         std::fs::set_permissions(&hook_path, perms).context("chmod +x post-commit")?;
     }
 
-    eprintln!(
-        "✓ Installed git post-commit hook → {}",
-        hook_path.display()
-    );
+    eprintln!("✓ Installed git post-commit hook → {}", hook_path.display());
     Ok(())
 }
 
@@ -160,8 +157,8 @@ fn install_claude_hooks() -> Result<()> {
         let backup = path.with_extension("json.bak");
         std::fs::copy(&path, &backup)
             .with_context(|| format!("backup {} to {}", path.display(), backup.display()))?;
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         if raw.trim().is_empty() {
             json!({})
         } else {
@@ -242,17 +239,16 @@ pub fn merge_claude_settings(existing: &Value, additions: &Value) -> Value {
         let Some(new_entries) = new_arr.as_array() else {
             continue;
         };
-        let target = hooks_obj
-            .entry(event.clone())
-            .or_insert_with(|| json!([]));
+        let target = hooks_obj.entry(event.clone()).or_insert_with(|| json!([]));
         if !target.is_array() {
             *target = json!([]);
         }
         let target_arr = target.as_array_mut().expect("ensured array above");
         for entry in new_entries {
-            if !target_arr.iter().any(|existing_entry| {
-                contains_command(existing_entry, entry)
-            }) {
+            if !target_arr
+                .iter()
+                .any(|existing_entry| contains_command(existing_entry, entry))
+            {
                 target_arr.push(entry.clone());
             }
         }
@@ -661,9 +657,9 @@ async fn fire_claude_post_tool_use(palace: &str) -> Result<()> {
     // stored within the last 60s. This fires constantly during active sessions.
     let recent = handle.list_drawers(None, Some(tag_tool), 5);
     let now = chrono::Utc::now();
-    let too_recent = recent.iter().any(|d| {
-        (now - d.created_at).num_seconds() < 60
-    });
+    let too_recent = recent
+        .iter()
+        .any(|d| (now - d.created_at).num_seconds() < 60);
     if too_recent {
         return Ok(());
     }
@@ -764,7 +760,8 @@ mod tests {
 
     #[test]
     fn parse_claude_stop_payload_full() {
-        let json_str = r#"{"session_id":"abc-123","transcript_path":"/tmp/t.jsonl","stop_hook_active":true}"#;
+        let json_str =
+            r#"{"session_id":"abc-123","transcript_path":"/tmp/t.jsonl","stop_hook_active":true}"#;
         let p = parse_claude_stop_payload(json_str);
         assert_eq!(p.session_id.as_deref(), Some("abc-123"));
         assert_eq!(p.transcript_path.as_deref(), Some("/tmp/t.jsonl"));
@@ -850,7 +847,9 @@ mod tests {
             .flat_map(|a| a.iter())
             .filter_map(|c| c.get("command").and_then(|c| c.as_str()))
             .collect();
-        assert!(cmds.iter().any(|s| s.contains("trusty-memory hooks fire claude.stop")));
+        assert!(cmds
+            .iter()
+            .any(|s| s.contains("trusty-memory hooks fire claude.stop")));
         assert!(cmds.contains(&"echo other"));
     }
 

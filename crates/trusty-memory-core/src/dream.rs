@@ -590,7 +590,10 @@ mod tests {
 
         // The task should exit promptly — bound the wait to keep the test fast.
         let outcome = tokio::time::timeout(Duration::from_secs(2), join).await;
-        assert!(outcome.is_ok(), "dream loop did not exit within 2s of shutdown");
+        assert!(
+            outcome.is_ok(),
+            "dream loop did not exit within 2s of shutdown"
+        );
         outcome.unwrap().expect("join handle clean exit");
     }
 

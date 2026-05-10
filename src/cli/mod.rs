@@ -167,6 +167,13 @@ pub enum Commands {
         /// stdio MCP mode (used by Claude Code hook)
         #[arg(long)]
         mcp: bool,
+        /// Default palace for MCP tool calls when `palace` arg is omitted.
+        ///
+        /// Auto-created on startup if it does not exist. Returned in the
+        /// `initialize` response under `serverInfo.default_palace` so MCP
+        /// clients can verify the namespace they're bound to.
+        #[arg(long, value_name = "NAME")]
+        palace: Option<String>,
     },
 
     /// Chat with an OpenRouter model using palace memory as context.

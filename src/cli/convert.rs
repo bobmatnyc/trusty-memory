@@ -86,11 +86,7 @@ async fn convert_all(args: &ConvertArgs) -> Result<()> {
                 print_plan(&palace, &mems, args.dry_run);
                 if !args.dry_run {
                     write_to_palace(&palace, &mems).await?;
-                    println!(
-                        "✓ Converted {} memories → palace '{}'",
-                        mems.len(),
-                        palace
-                    );
+                    println!("✓ Converted {} memories → palace '{}'", mems.len(), palace);
                 }
             }
             Ok(_) => {}
@@ -240,7 +236,10 @@ pub fn read_kuzu_memories(db_path: &Path) -> Result<Vec<RawMemory>> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!("warning: kuzu query failed for {}: {stderr}", db_path.display());
+        eprintln!(
+            "warning: kuzu query failed for {}: {stderr}",
+            db_path.display()
+        );
         return Ok(Vec::new());
     }
 

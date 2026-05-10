@@ -38,6 +38,9 @@ pub struct AppState {
     pub registry: Arc<PalaceRegistry>,
     pub data_root: PathBuf,
     pub embedder: Arc<OnceCell<Arc<FastEmbedder>>>,
+    /// Optional default palace applied to MCP tool calls when the caller
+    /// omits the `palace` argument. Set via `trusty-memory serve --palace`.
+    pub default_palace: Option<String>,
 }
 
 impl AppState {
@@ -47,7 +50,8 @@ impl AppState {
     /// server at different roots — production at `dirs::data_dir`, tests at a
     /// `tempfile::tempdir()`.
     /// What: Builds an empty `PalaceRegistry`, captures the version, and
-    /// allocates an empty `OnceCell` for the embedder.
+    /// allocates an empty `OnceCell` for the embedder. `default_palace` is
+    /// `None`; use `with_default_palace` to set it.
     /// Test: `tools::tests::dispatch_palace_create_persists` constructs an
     /// AppState pointed at a tempdir and round-trips a palace through it.
     pub fn new(data_root: PathBuf) -> Self {
@@ -56,7 +60,21 @@ impl AppState {
             registry: Arc::new(PalaceRegistry::new()),
             data_root,
             embedder: Arc::new(OnceCell::new()),
+            default_palace: None,
         }
+    }
+
+    /// Builder-style setter for the default palace name.
+    ///
+    /// Why: `serve --palace <name>` wants to bind every tool call to a
+    /// project-scoped namespace without forcing every MCP request to repeat
+    /// the palace argument.
+    /// What: Returns `self` with `default_palace = Some(name)`.
+    /// Test: `default_palace_used_when_arg_omitted` covers the resolution
+    /// path; this setter is exercised there.
+    pub fn with_default_palace(mut self, name: Option<String>) -> Self {
+        self.default_palace = name;
+        self
     }
 
     /// Resolve (or initialize) the shared embedder.
@@ -103,21 +121,30 @@ pub async fn handle_message(state: &AppState, msg: Value) -> Value {
     let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
     match method {
-        "initialize" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "trusty-memory", "version": state.version}
+        "initialize" => {
+            let mut server_info = json!({
+                "name": "trusty-memory",
+                "version": state.version,
+            });
+            if let Some(dp) = &state.default_palace {
+                server_info["default_palace"] = json!(dp);
             }
-        }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": server_info,
+                }
+            })
+        }
         // Notifications must NOT receive a response.
         "notifications/initialized" | "notifications/cancelled" => Value::Null,
         "tools/list" => json!({
             "jsonrpc": "2.0",
             "id": id,
-            "result": tools::tool_definitions()
+            "result": tools::tool_definitions_with(state.default_palace.is_some())
         }),
         "tools/call" => {
             let params = msg.get("params").cloned().unwrap_or_default();
@@ -308,5 +335,130 @@ mod tests {
         let s = test_state();
         assert!(!s.version.is_empty());
         assert!(s.registry.is_empty());
+        assert!(s.default_palace.is_none());
+    }
+
+    /// Why: Issue #26 — when `serve --palace <name>` is set, the MCP server
+    /// must (a) report the default in the `initialize` `serverInfo`, (b)
+    /// drop `palace` from the required schema in `tools/list`, and (c) let
+    /// `tools/call` use the default when the caller omits `palace`.
+    /// Test: Construct an AppState with a default palace, create that palace
+    /// on disk via the registry, then call `memory_remember` without a
+    /// `palace` argument and confirm it resolves to the default.
+    #[tokio::test]
+    async fn default_palace_used_when_arg_omitted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+
+        // Pre-create the default palace so remember has somewhere to land.
+        let registry = trusty_memory_core::PalaceRegistry::new();
+        let palace = trusty_memory_core::Palace {
+            id: trusty_memory_core::PalaceId::new("default-pal"),
+            name: "default-pal".to_string(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            data_dir: root.join("default-pal"),
+        };
+        registry
+            .create_palace(&root, palace)
+            .expect("create_palace");
+
+        let state = AppState::new(root).with_default_palace(Some("default-pal".to_string()));
+
+        // (a) initialize advertises the default.
+        let init = handle_message(
+            &state,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
+        )
+        .await;
+        assert_eq!(
+            init["result"]["serverInfo"]["default_palace"], "default-pal",
+            "initialize must echo default_palace in serverInfo"
+        );
+
+        // (b) tools/list drops `palace` from required when default is set.
+        let list = handle_message(
+            &state,
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        )
+        .await;
+        let tools = list["result"]["tools"].as_array().expect("tools array");
+        let remember = tools
+            .iter()
+            .find(|t| t["name"] == "memory_remember")
+            .expect("memory_remember tool");
+        let required: Vec<&str> = remember["inputSchema"]["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            !required.contains(&"palace"),
+            "palace must not be required when default is configured; got {required:?}"
+        );
+        assert!(required.contains(&"text"));
+
+        // (c) tools/call resolves the default when arg is omitted.
+        let call = handle_message(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "memory_remember",
+                    "arguments": {"text": "default-palace test memory"},
+                },
+            }),
+        )
+        .await;
+        // Successful dispatch returns `result.content[0].text` JSON.
+        let text = call["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected success result, got {call}"));
+        let parsed: Value = serde_json::from_str(text).expect("parse content json");
+        assert_eq!(parsed["palace"], "default-pal");
+        assert_eq!(parsed["status"], "stored");
+        assert!(parsed["drawer_id"].as_str().is_some());
+    }
+
+    /// Why: When no default is set, `tools/call` for a palace-bound tool
+    /// without a `palace` argument should error helpfully rather than panic.
+    #[tokio::test]
+    async fn missing_palace_without_default_errors() {
+        let state = test_state();
+        let resp = handle_message(
+            &state,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "memory_recall",
+                    "arguments": {"query": "anything"},
+                },
+            }),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], -32603);
+        let msg = resp["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("missing 'palace'"),
+            "expected helpful error, got: {msg}"
+        );
+    }
+
+    /// Why: initialize without a default palace must omit `default_palace`
+    /// from `serverInfo` so clients can detect the unbound mode.
+    #[tokio::test]
+    async fn initialize_without_default_palace_omits_field() {
+        let state = test_state();
+        let init = handle_message(
+            &state,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
+        )
+        .await;
+        assert!(init["result"]["serverInfo"]["default_palace"].is_null());
     }
 }
