@@ -23,23 +23,9 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Init tracing based on verbosity, deferring to RUST_LOG when set.
-    let default_filter = match cli.verbose {
-        0 => "warn",
-        1 => "info",
-        2 => "debug",
-        _ => "trace",
-    };
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .init();
-
-    if cli.no_color {
-        colored::control::set_override(false);
-    }
+    // Init tracing + colour handling via the shared trusty-common helpers.
+    trusty_common::init_tracing(cli.verbose);
+    trusty_common::maybe_disable_color(cli.no_color);
 
     let palace = resolve_palace(cli.palace.as_deref());
 
@@ -178,7 +164,7 @@ async fn main() -> Result<()> {
                 // Port auto-detect: if `addr` is taken, walk the next 20
                 // ports and use the first free one. Print the actual bound
                 // address so callers (browsers, scripts) know where it landed.
-                let listener = bind_with_auto_port(addr, 20).await?;
+                let listener = trusty_common::bind_with_auto_port(addr, 20).await?;
                 tokio::select! {
                     r = trusty_memory_mcp::run_stdio(state.clone()) => r,
                     r = trusty_memory_mcp::run_http_on(state, listener) => r,
@@ -300,41 +286,4 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Bind to `start_addr`; if the port is already in use, scan up to
-/// `max_attempts` higher ports for a free slot.
-///
-/// Why: When the user runs multiple trusty-memory instances (or relaunches
-/// before the kernel releases the prior socket), strict port binding produces
-/// a noisy failure. Walking forward gives a friendlier developer experience.
-/// What: Returns the first `tokio::net::TcpListener` that binds. The caller
-/// can read `local_addr()` to discover the actual port.
-/// Test: Bind once on a random ephemeral port, then call this with that port
-/// and `max_attempts=5` — it should succeed on a higher port.
-async fn bind_with_auto_port(
-    start_addr: std::net::SocketAddr,
-    max_attempts: u16,
-) -> Result<tokio::net::TcpListener> {
-    use std::io::ErrorKind;
-    let mut addr = start_addr;
-    for attempt in 0..=max_attempts {
-        match tokio::net::TcpListener::bind(addr).await {
-            Ok(l) => return Ok(l),
-            Err(e) if e.kind() == ErrorKind::AddrInUse && attempt < max_attempts => {
-                let next_port = addr.port().saturating_add(1);
-                if next_port == 0 {
-                    anyhow::bail!("ran out of ports while searching for free slot");
-                }
-                addr.set_port(next_port);
-                tracing::warn!(
-                    "port {} in use, trying {}",
-                    addr.port() - 1,
-                    addr.port()
-                );
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-    anyhow::bail!("could not find free port after {max_attempts} attempts")
 }

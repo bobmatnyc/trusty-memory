@@ -171,7 +171,7 @@ impl SystemDriver for TrustyDriver {
 
         let vecs = self
             .embedder
-            .embed(std::slice::from_ref(&doc.content))
+            .embed_batch(std::slice::from_ref(&doc.content))
             .await
             .context("embed bench doc")?;
         let vec0 = vecs

@@ -16,16 +16,13 @@
 use crate::cli::config::UserConfig;
 use crate::cli::output::OutputConfig;
 use crate::cli::palace::data_root;
-use anyhow::{anyhow, Context, Result};
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result};
 use std::sync::Arc;
 use tiktoken_rs::cl100k_base;
+use trusty_common::{openrouter_chat, ChatMessage};
 use trusty_memory_core::retrieval::{recall, RecallResult};
 use trusty_memory_core::{embed::FastEmbedder, PalaceId, PalaceRegistry};
 
-const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
-const HTTP_REFERER: &str = "https://github.com/trusty-memory";
-const X_TITLE: &str = "trusty-memory";
 const DEFAULT_SYSTEM_PROMPT: &str =
     "You are a helpful assistant grounded by the user's trusty-memory palace. \
 Use the MEMORY CONTEXT below as background when relevant. If the context \
@@ -37,36 +34,6 @@ pub struct ChatOpts {
     pub message: String,
     pub remember: bool,
     pub top_k: usize,
-}
-
-/// OpenAI-compatible chat message.
-#[derive(Debug, Serialize)]
-struct ChatMessage<'a> {
-    role: &'a str,
-    content: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatRequest<'a> {
-    model: &'a str,
-    messages: Vec<ChatMessage<'a>>,
-    stream: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatResponse {
-    choices: Vec<Choice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Choice {
-    message: ResponseMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct ResponseMessage {
-    #[serde(default)]
-    content: String,
 }
 
 /// Build a memory-context string from L0+L1+L2 recall results, truncated to
@@ -154,46 +121,19 @@ or `trusty-memory setup`."
         format!("{base_prompt}\n\nMEMORY CONTEXT (palace `{palace_id_str}`):\n{context_str}")
     };
 
-    let req = ChatRequest {
-        model: &cfg.openrouter.model,
-        messages: vec![
-            ChatMessage {
-                role: "system",
-                content: system_content,
-            },
-            ChatMessage {
-                role: "user",
-                content: opts.message.clone(),
-            },
-        ],
-        stream: false,
-    };
-
-    let client = reqwest::Client::builder()
-        .build()
-        .context("build reqwest client")?;
-    let resp = client
-        .post(OPENROUTER_URL)
-        .bearer_auth(&cfg.openrouter.api_key)
-        .header("HTTP-Referer", HTTP_REFERER)
-        .header("X-Title", X_TITLE)
-        .json(&req)
-        .send()
+    let messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: system_content,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: opts.message.clone(),
+        },
+    ];
+    let answer = openrouter_chat(&cfg.openrouter.api_key, &cfg.openrouter.model, messages)
         .await
-        .context("POST openrouter chat completions")?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("openrouter HTTP {status}: {body}"));
-    }
-    let payload: ChatResponse = resp.json().await.context("decode openrouter response")?;
-    let answer = payload
-        .choices
-        .into_iter()
-        .next()
-        .map(|c| c.message.content)
-        .ok_or_else(|| anyhow!("openrouter returned no choices"))?;
+        .context("openrouter chat completions")?;
 
     println!("{answer}");
 

@@ -294,7 +294,7 @@ impl PalaceHandle {
             .await
             .context("init embedder for remember")?;
         let vecs = embedder
-            .embed(&[content])
+            .embed_batch(&[content])
             .await
             .context("embed drawer content")?;
         if let Some(v) = vecs.into_iter().next() {
@@ -535,7 +535,7 @@ pub async fn retrieve_l2(
     if top_k == 0 {
         return Ok(Vec::new());
     }
-    let embeddings = embedder.embed(&[query.to_string()]).await?;
+    let embeddings = embedder.embed_batch(&[query.to_string()]).await?;
     let Some(query_vec) = embeddings.into_iter().next() else {
         return Ok(Vec::new());
     };
@@ -616,7 +616,7 @@ pub async fn retrieve_l3(
     if top_k == 0 {
         return Ok(Vec::new());
     }
-    let embeddings = embedder.embed(&[query.to_string()]).await?;
+    let embeddings = embedder.embed_batch(&[query.to_string()]).await?;
     let Some(query_vec) = embeddings.into_iter().next() else {
         return Ok(Vec::new());
     };
@@ -875,7 +875,7 @@ mod tests {
         let drawer_id = drawer.id;
 
         let vecs = embedder
-            .embed(std::slice::from_ref(&drawer.content))
+            .embed_batch(std::slice::from_ref(&drawer.content))
             .await
             .unwrap();
         handle
@@ -1042,7 +1042,7 @@ mod tests {
         let drawer = Drawer::new(room_id, "Rust is a systems programming language");
         let drawer_id = drawer.id;
         let vecs = embedder
-            .embed(std::slice::from_ref(&drawer.content))
+            .embed_batch(std::slice::from_ref(&drawer.content))
             .await
             .unwrap();
         handle

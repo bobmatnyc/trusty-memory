@@ -10,11 +10,11 @@
 
 use anyhow::Result;
 use serde_json::{json, Value};
-use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
-use tracing::{info, warn};
+use tracing::info;
+use trusty_mcp_core::{error_codes, initialize_response, Request, Response};
 use trusty_memory_core::embed::FastEmbedder;
 use trusty_memory_core::PalaceRegistry;
 
@@ -123,21 +123,12 @@ pub async fn handle_message(state: &AppState, msg: Value) -> Value {
 
     match method {
         "initialize" => {
-            let mut server_info = json!({
-                "name": "trusty-memory",
-                "version": state.version,
-            });
-            if let Some(dp) = &state.default_palace {
-                server_info["default_palace"] = json!(dp);
-            }
+            let extra = state.default_palace.as_ref().map(|dp| json!({ "default_palace": dp }));
+            let result = initialize_response("trusty-memory", &state.version, extra);
             json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}},
-                    "serverInfo": server_info,
-                }
+                "result": result,
             })
         }
         // Notifications must NOT receive a response.
@@ -186,41 +177,50 @@ pub async fn handle_message(state: &AppState, msg: Value) -> Value {
 ///
 /// Why: Claude Code launches MCP servers as child processes and speaks
 /// JSON-RPC over stdin/stdout — this is the primary integration path.
-/// What: Reads one JSON message per line, dispatches via `handle_message`,
-/// writes non-null responses to stdout (notifications produce no output).
-/// Test: Exercised end-to-end by piping JSON to a spawned `serve` process;
-/// `handle_message` covers protocol behaviour in unit tests.
+/// What: Delegates to `trusty_mcp_core::run_stdio_loop`, adapting each
+/// shared `Request` back into the JSON `Value` shape `handle_message`
+/// expects, and translating the returned `Value` into a `Response`.
+/// Notifications (where `handle_message` returns `Value::Null`) become
+/// suppressed responses so the loop emits nothing on the wire.
+/// Test: `handle_message` covers protocol behaviour in unit tests.
 pub async fn run_stdio(state: AppState) -> Result<()> {
     info!("trusty-memory MCP stdio server starting");
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let response = match serde_json::from_str::<Value>(&line) {
-            Ok(msg) => handle_message(&state, msg).await,
-            Err(e) => {
-                warn!("invalid JSON: {e}");
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": Value::Null,
-                    "error": {"code": -32700, "message": "Parse error"}
-                })
+    let state = Arc::new(state);
+    trusty_mcp_core::run_stdio_loop(move |req: Request| {
+        let state = state.clone();
+        async move {
+            // Re-serialise the Request into the JSON shape handle_message expects.
+            // (handle_message predates the shared types and reads loose Values.)
+            let msg = json!({
+                "jsonrpc": req.jsonrpc.unwrap_or_else(|| "2.0".to_string()),
+                "id": req.id.clone().unwrap_or(Value::Null),
+                "method": req.method,
+                "params": req.params.unwrap_or(Value::Null),
+            });
+            let resp_value = handle_message(&state, msg).await;
+            // handle_message returns Value::Null for notifications.
+            if resp_value.is_null() {
+                return Response::suppressed();
             }
-        };
-
-        // Notifications return Value::Null — skip writing any response.
-        if !response.is_null() {
-            let mut out = stdout.lock();
-            writeln!(out, "{response}")?;
-            out.flush()?;
+            // Otherwise it returns the full JSON-RPC envelope as a Value;
+            // re-encode into the shared Response struct so the loop can serialise.
+            let id = resp_value.get("id").cloned();
+            if let Some(result) = resp_value.get("result").cloned() {
+                Response::ok(id, result)
+            } else if let Some(err) = resp_value.get("error") {
+                let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(error_codes::INTERNAL_ERROR as i64) as i32;
+                let message = err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("internal error")
+                    .to_string();
+                Response::err(id, code, message)
+            } else {
+                Response::err(id, error_codes::INTERNAL_ERROR, "malformed handler response")
+            }
         }
-    }
-    Ok(())
+    })
+    .await
 }
 
 /// Run the optional HTTP/SSE + web admin server.

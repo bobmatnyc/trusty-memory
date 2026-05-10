@@ -4022,6 +4022,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusty-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "colored",
+ "dirs 5.0.1",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "trusty-embedder"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "fastembed",
+ "lru",
+ "parking_lot",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "trusty-mcp-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "trusty-memory"
 version = "0.1.10"
 dependencies = [
@@ -4043,6 +4083,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "trusty-common",
  "trusty-memory-core",
  "trusty-memory-mcp",
  "uuid",
@@ -4059,10 +4100,8 @@ dependencies = [
  "criterion",
  "dashmap",
  "dirs 5.0.1",
- "fastembed",
  "git2",
  "kuzu",
- "lru",
  "parking_lot",
  "r2d2",
  "r2d2_sqlite",
@@ -4075,6 +4114,7 @@ dependencies = [
  "tiktoken-rs",
  "tokio",
  "tracing",
+ "trusty-embedder",
  "usearch",
  "uuid",
 ]
@@ -4102,6 +4142,7 @@ dependencies = [
  "tower 0.4.13",
  "tower-http 0.5.2",
  "tracing",
+ "trusty-mcp-core",
  "trusty-memory-core",
  "uuid",
 ]

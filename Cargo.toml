@@ -42,6 +42,9 @@ mime_guess = "2"
 futures = "0.3"
 tokio-stream = "0.1"
 tower = { version = "0.4", features = ["util"] }
+trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core" }
+trusty-embedder = { path = "../trusty-common/crates/trusty-embedder" }
+trusty-common = { path = "../trusty-common/crates/trusty-common" }
 
 [package]
 name = "trusty-memory"
@@ -64,6 +67,7 @@ path = "src/main.rs"
 [dependencies]
 trusty-memory-core = { path = "crates/trusty-memory-core" }
 trusty-memory-mcp = { path = "crates/trusty-memory-mcp" }
+trusty-common = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
