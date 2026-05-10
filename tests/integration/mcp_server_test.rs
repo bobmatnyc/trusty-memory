@@ -1,6 +1,6 @@
 //! Why: Lock the MCP tool surface so accidental schema drift breaks CI before
 //! a Claude Code client sees it.
-//! What: Verifies all 7 tools are advertised and the JSON-RPC handshake +
+//! What: Verifies all 10 tools are advertised and the JSON-RPC handshake +
 //! tools/call round-trip return the expected envelope shapes.
 //! Test: `cargo test --test mcp_server_test`.
 
@@ -8,13 +8,13 @@ use serde_json::json;
 use trusty_memory_mcp::{handle_message, tools::tool_definitions, AppState};
 
 #[test]
-fn all_seven_tools_are_advertised() {
+fn all_tools_are_advertised() {
     let defs = tool_definitions();
     let tools = defs
         .get("tools")
         .and_then(|t| t.as_array())
         .expect("tools array");
-    assert_eq!(tools.len(), 7, "expected exactly 7 MCP tools");
+    assert_eq!(tools.len(), 10, "expected exactly 10 MCP tools");
 
     let names: Vec<&str> = tools
         .iter()
@@ -25,8 +25,11 @@ fn all_seven_tools_are_advertised() {
         "memory_remember",
         "memory_recall",
         "memory_recall_deep",
+        "memory_list",
+        "memory_forget",
         "palace_create",
         "palace_list",
+        "palace_info",
         "kg_assert",
         "kg_query",
     ] {
@@ -74,7 +77,7 @@ async fn initialize_then_list_then_call_handshake() {
         json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
     )
     .await;
-    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 7);
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 10);
 
     // 4) palace_create — the real registry needs the palace on disk before
     //    memory_remember can target it.

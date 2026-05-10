@@ -170,7 +170,7 @@ Send a `tools/list` request to retrieve the full schema for all available tools:
 {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
 ```
 
-The server returns 7 tools. The `palace` argument is marked `required` in each
+The server returns 10 tools. The `palace` argument is marked `required` in each
 tool's `inputSchema.required` array **unless** the server was started with
 `--palace`, in which case `palace` is omitted from `required` (it remains an
 accepted optional field).
@@ -282,6 +282,43 @@ accepted optional field).
           },
           "required": ["palace", "subject"]
         }
+      },
+      {
+        "name": "memory_list",
+        "description": "List drawers in a palace, optionally filtered by room type or tag.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "palace": {"type": "string"},
+            "room":   {"type": "string", "description": "Filter by room type (Frontend, Backend, Testing, Planning, Documentation, Research, Configuration, Meetings, General, or custom)"},
+            "tag":    {"type": "string", "description": "Filter by tag"},
+            "limit":  {"type": "integer", "description": "Max results (default 50)"}
+          },
+          "required": ["palace"]
+        }
+      },
+      {
+        "name": "memory_forget",
+        "description": "Delete a drawer from a palace by its UUID.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "palace":    {"type": "string"},
+            "drawer_id": {"type": "string", "description": "UUID of the drawer to delete"}
+          },
+          "required": ["palace", "drawer_id"]
+        }
+      },
+      {
+        "name": "palace_info",
+        "description": "Get metadata and stats for a single palace.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "palace": {"type": "string"}
+          },
+          "required": ["palace"]
+        }
       }
     ]
   }
@@ -295,8 +332,11 @@ accepted optional field).
 | `memory_remember` | `palace`, `text` | `drawer_id`, `palace`, `status` |
 | `memory_recall` | `palace`, `query` | `palace`, `query`, `results[]` |
 | `memory_recall_deep` | `palace`, `query` | `palace`, `query`, `results[]` |
+| `memory_list` | `palace` | `palace`, `drawers[]` |
+| `memory_forget` | `palace`, `drawer_id` | `status`, `drawer_id`, `palace` |
 | `palace_create` | `name` | `palace_id`, `status` |
 | `palace_list` | (none) | `palaces[]` |
+| `palace_info` | `palace` | `id`, `name`, `drawer_count`, `data_dir` |
 | `kg_assert` | `palace`, `subject`, `predicate`, `object` | `status` |
 | `kg_query` | `palace`, `subject` | `subject`, `triples[]` |
 
@@ -604,6 +644,111 @@ Triple fields:
 | `valid_to` | RFC 3339 string or `null` | When this fact was superseded; `null` means currently active |
 | `confidence` | float in [0.0, 1.0] | Caller-supplied confidence score |
 | `provenance` | string or `null` | Free-form source identifier |
+
+### `memory_list`
+
+List drawers in a palace, optionally filtered by room type or tag. Results are
+sorted by importance descending and capped at `limit` (default 50).
+
+Request:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 40,
+  "method": "tools/call",
+  "params": {
+    "name": "memory_list",
+    "arguments": {
+      "palace": "my-project",
+      "room": "Backend",
+      "tag": "auth",
+      "limit": 20
+    }
+  }
+}
+```
+
+Response (`result.content[0].text` parsed):
+
+```json
+{
+  "palace": "my-project",
+  "drawers": [
+    {
+      "drawer_id": "a3f1c2d4-...",
+      "content": "The API gateway validates JWT tokens using RS256.",
+      "importance": 0.5,
+      "tags": ["auth", "jwt", "api-gateway"],
+      "created_at": "2026-05-10T14:32:00Z"
+    }
+  ]
+}
+```
+
+### `memory_forget`
+
+Delete a drawer from a palace by its UUID. Removes the vector from the HNSW
+index, drops the row from the in-memory drawer table, and persists the L1
+snapshot.
+
+Request:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 41,
+  "method": "tools/call",
+  "params": {
+    "name": "memory_forget",
+    "arguments": {
+      "palace": "my-project",
+      "drawer_id": "a3f1c2d4-1234-5678-9abc-def012345678"
+    }
+  }
+}
+```
+
+Response (`result.content[0].text` parsed):
+
+```json
+{
+  "status": "deleted",
+  "drawer_id": "a3f1c2d4-1234-5678-9abc-def012345678",
+  "palace": "my-project"
+}
+```
+
+### `palace_info`
+
+Get metadata and stats for a single palace.
+
+Request:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 42,
+  "method": "tools/call",
+  "params": {
+    "name": "palace_info",
+    "arguments": {
+      "palace": "my-project"
+    }
+  }
+}
+```
+
+Response (`result.content[0].text` parsed):
+
+```json
+{
+  "id": "my-project",
+  "name": "my-project",
+  "drawer_count": 142,
+  "data_dir": "/Users/alice/Library/Application Support/trusty-memory/my-project"
+}
+```
 
 ---
 

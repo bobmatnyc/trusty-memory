@@ -11,8 +11,11 @@
 //! - `memory_remember(palace, text, room?, tags?)` -> drawer_id
 //! - `memory_recall(palace, query, top_k?)`        -> Vec<Drawer> (L0+L1+L2)
 //! - `memory_recall_deep(palace, query, top_k?)`   -> Vec<Drawer> (L3 deep)
+//! - `memory_list(palace, room?, tag?, limit?)`    -> Vec<Drawer>
+//! - `memory_forget(palace, drawer_id)`            -> ()
 //! - `palace_create(name, description?)`           -> PalaceId
 //! - `palace_list()`                                -> Vec<PalaceId>
+//! - `palace_info(palace)`                          -> palace metadata + stats
 //! - `kg_assert(palace, subject, predicate, object, confidence?, provenance?)` -> ()
 //! - `kg_query(palace, subject)`                    -> Vec<Triple>
 
@@ -22,6 +25,7 @@ use serde_json::{json, Value};
 use trusty_memory_core::palace::{Palace, PalaceId, RoomType};
 use trusty_memory_core::retrieval::{recall, recall_deep};
 use trusty_memory_core::store::kg::Triple;
+use uuid::Uuid;
 
 /// Marker server type. Reserved for future stateful MCP server impls.
 ///
@@ -50,8 +54,8 @@ impl Default for MemoryMcpServer {
 /// `palace` is required only when the server has no `--palace` default
 /// configured — when a default is set, the schema omits `palace` from
 /// `required` so clients can drop it.
-/// What: Returns a JSON object `{ "tools": [...] }` with all 7 tool defs.
-/// Test: `tool_definitions_lists_seven_tools`,
+/// What: Returns a JSON object `{ "tools": [...] }` with all 10 tool defs.
+/// Test: `tool_definitions_lists_all_tools`,
 /// `tool_definitions_drops_palace_required_when_default_set`.
 pub fn tool_definitions() -> Value {
     tool_definitions_with(false)
@@ -87,6 +91,21 @@ pub fn tool_definitions_with(has_default: bool) -> Value {
         vec!["subject"]
     } else {
         vec!["palace", "subject"]
+    };
+    let memory_list_required: Vec<&str> = if has_default {
+        vec![]
+    } else {
+        vec!["palace"]
+    };
+    let memory_forget_required: Vec<&str> = if has_default {
+        vec!["drawer_id"]
+    } else {
+        vec!["palace", "drawer_id"]
+    };
+    let palace_info_required: Vec<&str> = if has_default {
+        vec![]
+    } else {
+        vec!["palace"]
     };
 
     json!({
@@ -174,6 +193,43 @@ pub fn tool_definitions_with(has_default: bool) -> Value {
                         "subject": {"type": "string"}
                     },
                     "required": kg_query_required,
+                }
+            },
+            {
+                "name": "memory_list",
+                "description": "List drawers in a palace, optionally filtered by room type or tag.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "palace": {"type": "string"},
+                        "room":   {"type": "string", "description": "Filter by room type (Frontend, Backend, Testing, Planning, Documentation, Research, Configuration, Meetings, General, or custom)"},
+                        "tag":    {"type": "string", "description": "Filter by tag"},
+                        "limit":  {"type": "integer", "description": "Max results (default 50)"}
+                    },
+                    "required": memory_list_required,
+                }
+            },
+            {
+                "name": "memory_forget",
+                "description": "Delete a drawer from a palace by its UUID.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "palace":    {"type": "string"},
+                        "drawer_id": {"type": "string", "description": "UUID of the drawer to delete"}
+                    },
+                    "required": memory_forget_required,
+                }
+            },
+            {
+                "name": "palace_info",
+                "description": "Get metadata and stats for a single palace.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "palace": {"type": "string"}
+                    },
+                    "required": palace_info_required,
                 }
             }
         ]
@@ -407,6 +463,60 @@ pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<
                 .collect();
             Ok(json!({"subject": subject, "triples": payload}))
         }
+        "memory_list" => {
+            let palace = resolve_palace(state, &args, "memory_list")?;
+            let handle = open_palace_handle(state, &palace)?;
+            let room = args
+                .get("room")
+                .and_then(|v| v.as_str())
+                .map(|s| parse_room(Some(s)));
+            let tag = args
+                .get("tag")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+            let drawers = handle.list_drawers(room, tag, limit);
+            let payload: Vec<Value> = drawers
+                .iter()
+                .map(|d| {
+                    json!({
+                        "drawer_id": d.id.to_string(),
+                        "content": d.content,
+                        "importance": d.importance,
+                        "tags": d.tags,
+                        "created_at": d.created_at.to_rfc3339(),
+                    })
+                })
+                .collect();
+            Ok(json!({"palace": palace, "drawers": payload}))
+        }
+        "memory_forget" => {
+            let palace = resolve_palace(state, &args, "memory_forget")?;
+            let drawer_id_str = args
+                .get("drawer_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("memory_forget: missing 'drawer_id'"))?;
+            let drawer_id = Uuid::parse_str(drawer_id_str)
+                .map_err(|e| anyhow!("memory_forget: invalid drawer_id UUID: {e}"))?;
+            let handle = open_palace_handle(state, &palace)?;
+            handle.forget(drawer_id).await.context("forget")?;
+            Ok(json!({"status": "deleted", "drawer_id": drawer_id_str, "palace": palace}))
+        }
+        "palace_info" => {
+            let palace = resolve_palace(state, &args, "palace_info")?;
+            let handle = open_palace_handle(state, &palace)?;
+            let drawer_count = handle.list_drawers(None, None, usize::MAX).len();
+            let data_dir = handle
+                .data_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string());
+            Ok(json!({
+                "id": handle.id.as_str(),
+                "name": handle.id.as_str(),
+                "drawer_count": drawer_count,
+                "data_dir": data_dir,
+            }))
+        }
         other => anyhow::bail!("unknown tool: {other}"),
     }
 }
@@ -461,6 +571,9 @@ mod tests {
             ("memory_remember", true),
             ("memory_recall", true),
             ("memory_recall_deep", true),
+            ("memory_list", true),
+            ("memory_forget", true),
+            ("palace_info", true),
             ("kg_assert", true),
             ("kg_query", true),
         ] {
@@ -484,13 +597,13 @@ mod tests {
     }
 
     #[test]
-    fn tool_definitions_lists_seven_tools() {
+    fn tool_definitions_lists_all_tools() {
         let defs = tool_definitions();
         let tools = defs
             .get("tools")
             .and_then(|t| t.as_array())
             .expect("tools array");
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 10);
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
@@ -499,8 +612,11 @@ mod tests {
             "memory_remember",
             "memory_recall",
             "memory_recall_deep",
+            "memory_list",
+            "memory_forget",
             "palace_create",
             "palace_list",
+            "palace_info",
             "kg_assert",
             "kg_query",
         ] {

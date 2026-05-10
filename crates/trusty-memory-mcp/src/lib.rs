@@ -317,12 +317,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_returns_seven_tools() {
+    async fn tools_list_returns_all_tools() {
         let state = test_state();
         let req = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
         let resp = handle_message(&state, req).await;
         let tools = resp["result"]["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 10);
     }
 
     #[tokio::test]
