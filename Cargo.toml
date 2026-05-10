@@ -48,7 +48,7 @@ trusty-common = { git = "https://github.com/bobmatnyc/trusty-common", tag = "tru
 
 [package]
 name = "trusty-memory"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 description = "Machine-wide, blazingly fast AI memory service"
 license-file = "LICENSE"
