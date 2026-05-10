@@ -42,9 +42,15 @@ tempfile = "3"
 name = "trusty-memory"
 version = "0.1.8"
 edition = "2021"
-description = "Machine-wide AI memory service with Memory Palace architecture"
-license = "MIT"
+description = "Machine-wide, blazingly fast AI memory service"
+license-file = "LICENSE"
 repository = "https://github.com/bobmatnyc/trusty-memory"
+homepage = "https://github.com/bobmatnyc/trusty-memory"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/trusty-memory-{ target }.tar.xz"
+bin-dir = "trusty-memory-{ target }/trusty-memory{ binary-ext }"
+pkg-fmt = "txz"
 
 [[bin]]
 name = "trusty-memory"
@@ -78,3 +84,8 @@ chrono = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

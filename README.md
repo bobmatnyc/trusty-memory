@@ -5,6 +5,26 @@ Memory Palace (mempalace) architecture.
 
 > One install per machine. Multiple named palaces. Sub-5ms baseline retrieval.
 
+## Installation
+
+### Recommended: Shell installer (no Rust required)
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/bobmatnyc/trusty-memory/releases/latest/download/trusty-memory-installer.sh | sh
+```
+
+### Via cargo-binstall (fast, no compilation)
+
+```sh
+cargo binstall trusty-memory
+```
+
+### Via cargo (compile from source)
+
+```sh
+cargo install trusty-memory
+```
+
 ## What it is
 
 `trusty-memory` is a long-running service that gives LLM agents persistent
@@ -55,4 +75,4 @@ RUST_LOG=info cargo run -- serve --http 127.0.0.1:3031
 
 ## License
 
-MIT.
+[Elastic License 2.0](./LICENSE) (ELv2).
