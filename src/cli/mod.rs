@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 pub mod analytics;
+pub mod backup;
 pub mod bench;
 pub mod chat;
 pub mod config;
@@ -223,6 +224,18 @@ pub enum Commands {
         after_help = "Examples:\n  trusty-memory hooks install --git\n  trusty-memory hooks install --claude-code\n  trusty-memory hooks install --all\n  trusty-memory hooks list\n  trusty-memory hooks status"
     )]
     Hooks(hooks::HooksArgs),
+
+    /// Back up a palace (or all palaces) to a `.tar.gz` archive.
+    #[command(
+        after_help = "Examples:\n  trusty-memory backup my-project\n  trusty-memory backup --all\n  trusty-memory backup my-project -o /tmp/my-project.tar.gz"
+    )]
+    Backup(backup::BackupArgs),
+
+    /// Restore a palace from a `.tar.gz` archive.
+    #[command(
+        after_help = "Examples:\n  trusty-memory restore ./my-project-20260509.tar.gz\n  trusty-memory restore archive.tar.gz --palace renamed\n  trusty-memory restore archive.tar.gz --merge"
+    )]
+    Restore(backup::RestoreArgs),
 
     /// Show daemon health and palace summary.
     Status,

@@ -12,3 +12,6 @@ mod mcp_server_test;
 
 #[path = "integration/cli_test.rs"]
 mod cli_test;
+
+#[path = "integration/backup_restore_test.rs"]
+mod backup_restore_test;

@@ -8,15 +8,14 @@
 //! Test: `cargo test --test integration_tests` plus `--help` and `status`
 //! integration tests in `tests/integration/cli_test.rs`.
 
-mod cli;
-
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
-use cli::output::OutputConfig;
-use cli::palace_resolver::resolve_palace;
-use cli::{Cli, Commands};
 use std::io;
+use trusty_memory::cli;
+use trusty_memory::cli::output::OutputConfig;
+use trusty_memory::cli::palace_resolver::resolve_palace;
+use trusty_memory::cli::{Cli, Commands};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -263,6 +262,14 @@ async fn main() -> Result<()> {
 
         Commands::Hooks(args) => {
             cli::hooks::handle(args, &palace, &out).await?;
+        }
+
+        Commands::Backup(args) => {
+            cli::backup::handle_backup(args, &out).await?;
+        }
+
+        Commands::Restore(args) => {
+            cli::backup::handle_restore(args, &out).await?;
         }
 
         Commands::Status => {
