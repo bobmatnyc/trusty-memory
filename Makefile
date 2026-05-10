@@ -47,7 +47,7 @@ patch: ## Bump patch version in Cargo.toml, commit, tag
 deploy: ## cargo install --path . --locked (installs trusty-memory binary locally)
 	cargo install --path . --locked
 
-smoke: ## Run smoke test script (scripts/smoke-test.sh)
-	bash scripts/smoke-test.sh
+smoke: ## Run smoke test (tests/smoke-test.sh)
+	bash tests/smoke-test.sh
 
 all: lint test build ## lint + test + build (full pre-commit check)
