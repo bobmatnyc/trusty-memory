@@ -4024,6 +4024,7 @@ dependencies = [
 [[package]]
 name = "trusty-common"
 version = "0.1.0"
+source = "git+https://github.com/bobmatnyc/trusty-common?tag=trusty-common-v0.1.0#b419d36ef0d378402f5c45ebb78e46fe9794d352"
 dependencies = [
  "anyhow",
  "colored",
@@ -4040,6 +4041,7 @@ dependencies = [
 [[package]]
 name = "trusty-embedder"
 version = "0.1.0"
+source = "git+https://github.com/bobmatnyc/trusty-common?tag=trusty-embedder-v0.1.0#b419d36ef0d378402f5c45ebb78e46fe9794d352"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4053,6 +4055,7 @@ dependencies = [
 [[package]]
 name = "trusty-mcp-core"
 version = "0.1.0"
+source = "git+https://github.com/bobmatnyc/trusty-common?tag=trusty-mcp-core-v0.1.0#b419d36ef0d378402f5c45ebb78e46fe9794d352"
 dependencies = [
  "anyhow",
  "serde",
