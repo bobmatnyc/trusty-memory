@@ -37,6 +37,51 @@ pub trait VectorStore: Send + Sync {
 /// chunk up front avoids many tiny reallocations during palace warm-up.
 const DEFAULT_INITIAL_CAPACITY: usize = 1024;
 
+/// Sidecar filename appended to the usearch index path, holding the
+/// `u64 -> Uuid` key map as JSON so cold reloads recover the full UUID for
+/// every vector (rather than the zero-padded fallback).
+const KEY_MAP_SIDECAR: &str = ".keymap.json";
+
+/// Build the sidecar path next to the usearch index file.
+fn key_map_sidecar_path(index_path: &std::path::Path) -> PathBuf {
+    let mut s = index_path.as_os_str().to_owned();
+    s.push(KEY_MAP_SIDECAR);
+    PathBuf::from(s)
+}
+
+/// Load `key_map` from disk if present; return empty on any read/parse error.
+///
+/// Why: A best-effort hydrate keeps cold reloads safe. If the sidecar is
+/// missing or corrupt, we degrade to the pre-fix behavior (empty map) instead
+/// of refusing to open the palace.
+/// What: Reads the JSON sidecar as `Vec<(u64, Uuid)>` and collects into a map.
+fn load_key_map_sidecar(index_path: &std::path::Path) -> HashMap<u64, Uuid> {
+    let sidecar = key_map_sidecar_path(index_path);
+    let Ok(bytes) = std::fs::read(&sidecar) else {
+        return HashMap::new();
+    };
+    let Ok(entries) = serde_json::from_slice::<Vec<(u64, Uuid)>>(&bytes) else {
+        tracing::warn!(?sidecar, "key_map sidecar parse failed; starting empty");
+        return HashMap::new();
+    };
+    entries.into_iter().collect()
+}
+
+/// Persist `key_map` to disk next to the usearch index. Best-effort; logs on
+/// failure so an unwritable sidecar doesn't fail the upsert / remove call.
+fn save_key_map_sidecar(index_path: &std::path::Path, key_map: &HashMap<u64, Uuid>) {
+    let sidecar = key_map_sidecar_path(index_path);
+    let entries: Vec<(u64, Uuid)> = key_map.iter().map(|(k, v)| (*k, *v)).collect();
+    match serde_json::to_vec(&entries) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(&sidecar, bytes) {
+                tracing::warn!(?sidecar, "key_map sidecar write failed: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("key_map sidecar serialize failed: {e}"),
+    }
+}
+
 /// Convert a UUID into a u64 key suitable for usearch.
 ///
 /// Why: usearch keys are u64 but our drawer ids are UUIDs. Taking the first 8
@@ -138,15 +183,16 @@ impl UsearchStore {
                 .map_err(|e| anyhow::anyhow!("failed to reserve usearch capacity: {e}"))?;
         }
 
+        // Hydrate key_map from the sidecar file if present; otherwise start
+        // empty. The sidecar lives next to the usearch index and is rewritten
+        // on every upsert / remove (cheap; small JSON).
+        let key_map = load_key_map_sidecar(&path);
+
         Ok(Self {
             index: Arc::new(RwLock::new(index)),
             path,
             dim,
-            // TODO(reload): on cold-start with an existing index, the key_map
-            // is empty so search results fall back to zero-padded UUIDs. We
-            // should iterate the index and repopulate, or persist the map
-            // alongside the index, before relying on dedup across restarts.
-            key_map: Arc::new(RwLock::new(HashMap::new())),
+            key_map: Arc::new(RwLock::new(key_map)),
         })
     }
 
@@ -158,6 +204,64 @@ impl UsearchStore {
     /// Test: Indirectly via `PalaceHandle::open` warnings.
     pub fn index_size(&self) -> usize {
         self.index.read().size()
+    }
+
+    /// Reset the HNSW index to an empty state, discarding all vectors and
+    /// clearing the in-memory + on-disk key map.
+    ///
+    /// Why: When the index has accumulated orphans we cannot address (because
+    /// usearch doesn't expose enumeration and our session `key_map` only
+    /// tracks vectors we wrote ourselves), the cheapest remediation is to
+    /// rebuild from the authoritative drawer table. This method clears the
+    /// index so the caller can re-upsert from drawers.
+    /// What: Replaces the inner `Index` with a fresh one matching the original
+    /// options, saves it (overwriting the on-disk index file), and truncates
+    /// the key_map sidecar.
+    /// Test: Indirectly via the dream compaction rebuild path
+    /// (`dream_cycle_compacts_orphaned_vectors` and live palace cleanup).
+    pub fn reset(&self) -> Result<()> {
+        let options = IndexOptions {
+            dimensions: self.dim,
+            metric: MetricKind::Cos,
+            quantization: ScalarKind::F32,
+            ..Default::default()
+        };
+        let new_index = Index::new(&options)
+            .map_err(|e| anyhow::anyhow!("failed to recreate usearch index: {e}"))?;
+        new_index
+            .reserve(DEFAULT_INITIAL_CAPACITY)
+            .map_err(|e| anyhow::anyhow!("failed to reserve usearch capacity: {e}"))?;
+
+        let path_str = self
+            .path
+            .to_str()
+            .with_context(|| format!("usearch path is not valid UTF-8: {:?}", self.path))?;
+        new_index
+            .save(path_str)
+            .map_err(|e| anyhow::anyhow!("failed to save empty usearch index: {e}"))?;
+
+        *self.index.write() = new_index;
+        {
+            let mut km = self.key_map.write();
+            km.clear();
+            save_key_map_sidecar(&self.path, &km);
+        }
+        Ok(())
+    }
+
+    /// Snapshot of all drawer ids currently tracked by this store's key map.
+    ///
+    /// Why: The dream compaction pass needs to enumerate vector entries so it
+    /// can detect orphans (vectors with no surviving drawer row) and remove
+    /// them. usearch's FFI does not expose a way to iterate all keys, so we
+    /// use the parallel `key_map` populated on every `upsert` as the
+    /// authoritative session view of "what's in the index".
+    /// What: Acquires a read lock on `key_map` and clones the value set.
+    /// Returns an empty vec on cold reload (before any upsert in this
+    /// session) — see the `key_map` TODO for the long-term fix.
+    /// Test: `dream_cycle_compacts_orphaned_vectors` exercises this path.
+    pub fn all_ids(&self) -> Vec<Uuid> {
+        self.key_map.read().values().copied().collect()
     }
 }
 
@@ -192,7 +296,11 @@ impl VectorStore for UsearchStore {
                 .map_err(|e| anyhow::anyhow!("failed to add vector to usearch: {e}"))?;
 
             // Record the full UUID so search() can return it losslessly.
-            key_map.write().insert(key, id);
+            {
+                let mut km = key_map.write();
+                km.insert(key, id);
+                save_key_map_sidecar(&path, &km);
+            }
 
             let path_str = path
                 .to_str()
@@ -265,7 +373,11 @@ impl VectorStore for UsearchStore {
             guard
                 .remove(key)
                 .map_err(|e| anyhow::anyhow!("failed to remove vector from usearch: {e}"))?;
-            key_map.write().remove(&key);
+            {
+                let mut km = key_map.write();
+                km.remove(&key);
+                save_key_map_sidecar(&path, &km);
+            }
 
             let path_str = path
                 .to_str()

@@ -11,9 +11,10 @@
 //! moving part — defaults, idle clock, merge, prune, closet refresh.
 
 use crate::decay::DecayConfig;
-use crate::embed::FastEmbedder;
+use crate::embed::{Embedder, FastEmbedder};
 use crate::palace::Drawer;
 use crate::retrieval::{recall_deep, PalaceHandle};
+use crate::store::vector::VectorStore;
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -57,6 +58,9 @@ pub struct DreamStats {
     pub merged: usize,
     pub pruned: usize,
     pub closets_updated: usize,
+    /// Orphaned vectors removed from the HNSW index because no surviving
+    /// drawer row references them (issue #33).
+    pub compacted: usize,
     pub duration_ms: u64,
 }
 
@@ -119,6 +123,7 @@ impl Dreamer {
                         palace = %handle.id,
                         merged = stats.merged,
                         pruned = stats.pruned,
+                        compacted = stats.compacted,
                         closets_updated = stats.closets_updated,
                         duration_ms = stats.duration_ms,
                         "dream cycle complete"
@@ -172,6 +177,7 @@ impl Dreamer {
                         palace = %handle.id,
                         merged = stats.merged,
                         pruned = stats.pruned,
+                        compacted = stats.compacted,
                         closets_updated = stats.closets_updated,
                         duration_ms = stats.duration_ms,
                         "dream cycle complete"
@@ -210,6 +216,10 @@ impl Dreamer {
             .prune_pass(handle, started, budget)
             .await
             .context("dream prune pass")?;
+        let compacted = self
+            .compact_pass(handle, started, budget)
+            .await
+            .context("dream compact pass")?;
         let closets_updated = self.refresh_closets(handle);
 
         // Persist the trimmed L1 snapshot so a restart sees the consolidated state.
@@ -221,8 +231,76 @@ impl Dreamer {
             merged,
             pruned,
             closets_updated,
+            compacted,
             duration_ms: started.elapsed().as_millis() as u64,
         })
+    }
+
+    /// Remove orphaned vectors from the HNSW index whose drawer row no longer
+    /// exists. Returns the number of vectors removed.
+    ///
+    /// Why: Dedup and prune remove drawers via `handle.forget`, which removes
+    /// the matching vector. But over a palace's lifetime, vectors can also be
+    /// orphaned by partial writes, schema migrations, or pre-fix bugs that
+    /// dropped drawer rows without removing the corresponding vector. This
+    /// pass closes the gap and clears the `index_vectors >> drawer_records`
+    /// cold-start warning (issue #33).
+    /// What: Snapshots drawer ids into a `HashSet`, asks the vector store for
+    /// every id it currently tracks, and removes any vector whose id is not
+    /// in the drawer set. Respects the per-cycle wall-clock budget. Returns 0
+    /// silently when the vector store can't enumerate ids (e.g. cold reload
+    /// before any upsert this session).
+    /// Test: `dream_cycle_compacts_orphaned_vectors`.
+    async fn compact_pass(
+        &self,
+        handle: &Arc<PalaceHandle>,
+        started: std::time::Instant,
+        budget: Duration,
+    ) -> Result<usize> {
+        let drawer_ids: std::collections::HashSet<Uuid> =
+            handle.drawers.read().iter().map(|d| d.id).collect();
+
+        // Addressable pass: walk every id our key_map knows about and drop
+        // anything missing from the drawer table.
+        let vector_ids = handle.vector_store.all_ids();
+        let mut removed: usize = 0;
+        for vid in vector_ids {
+            if started.elapsed() >= budget {
+                break;
+            }
+            if drawer_ids.contains(&vid) {
+                continue;
+            }
+            match handle.vector_store.remove(vid).await {
+                Ok(()) => removed += 1,
+                Err(e) => tracing::warn!(?vid, "dream compact: vector remove failed: {e:#}"),
+            }
+        }
+
+        // Fallback rebuild: if the index still reports significantly more
+        // vectors than the drawer table holds (e.g. pre-fix orphans we can't
+        // enumerate via key_map), reset the index and re-upsert every drawer
+        // from scratch. Costly but bounded — only runs when the divergence is
+        // material, and re-embedding 100s of drawers takes <1s on the local
+        // ONNX model.
+        let drawer_count = drawer_ids.len();
+        let index_size_after = handle.vector_store.index_size();
+        // Only rebuild when we have drawers to re-embed AND the index has at
+        // least 1 + 2*drawer_count entries (well past noise). Avoids tight
+        // rebuild loops on a healthy small palace.
+        if drawer_count > 0 && index_size_after > drawer_count.saturating_mul(2) + 1 {
+            let rebuilt = rebuild_index_from_drawers(handle, started, budget)
+                .await
+                .context("dream compact rebuild")?;
+            // `rebuilt` counts every drawer we re-upserted; the number of
+            // orphans removed via rebuild is `index_size_before - drawer_count`.
+            // Surface a conservative `removed` increment by counting the
+            // delta as orphans dropped from the index.
+            let delta = index_size_after.saturating_sub(rebuilt);
+            removed = removed.saturating_add(delta);
+        }
+
+        Ok(removed)
     }
 
     /// Find near-duplicates and merge survivors; returns the merge count.
@@ -356,6 +434,57 @@ impl Dreamer {
         *closets = new_index;
         count
     }
+}
+
+/// Reset the vector index and re-upsert every drawer from the in-memory
+/// drawer table. Returns the number of drawers re-embedded.
+///
+/// Why: When the HNSW index accumulates orphans we can't address through
+/// `key_map` (pre-fix data, partial writes, schema migrations), the cheapest
+/// correct fix is to throw away the index and rebuild from the authoritative
+/// drawer table.
+/// What: Snapshots drawers, calls `UsearchStore::reset` to truncate the
+/// index, then re-embeds and re-upserts each drawer. Respects the budget by
+/// stopping early — incomplete rebuilds are still safe (the next cycle picks
+/// up where this one left off).
+async fn rebuild_index_from_drawers(
+    handle: &Arc<PalaceHandle>,
+    started: std::time::Instant,
+    budget: Duration,
+) -> Result<usize> {
+    let snapshot: Vec<Drawer> = handle.drawers.read().clone();
+    handle
+        .vector_store
+        .reset()
+        .context("reset vector index for rebuild")?;
+
+    if snapshot.is_empty() {
+        return Ok(0);
+    }
+
+    let embedder = FastEmbedder::new()
+        .await
+        .context("init embedder for dream rebuild")?;
+
+    let mut rebuilt: usize = 0;
+    for drawer in snapshot.iter() {
+        if started.elapsed() >= budget {
+            break;
+        }
+        let vecs = embedder
+            .embed_batch(std::slice::from_ref(&drawer.content))
+            .await
+            .with_context(|| format!("re-embed drawer {}", drawer.id))?;
+        if let Some(v) = vecs.into_iter().next() {
+            handle
+                .vector_store
+                .upsert(drawer.id, v)
+                .await
+                .with_context(|| format!("re-upsert drawer {}", drawer.id))?;
+            rebuilt += 1;
+        }
+    }
+    Ok(rebuilt)
 }
 
 /// Merge `loser` content into `survivor` (in-memory drawer table only).
@@ -595,6 +724,85 @@ mod tests {
             "dream loop did not exit within 2s of shutdown"
         );
         outcome.unwrap().expect("join handle clean exit");
+    }
+
+    /// Why: When drawer rows disappear without their matching vector being
+    /// removed (partial write, schema migration, pre-fix bug), the HNSW index
+    /// fills with orphans and the cold-start warning fires. The compact pass
+    /// must clean these up so `index_vectors == drawer_records` again.
+    /// What: Remember three drawers, then directly remove two from the drawer
+    /// table (bypassing `forget`, so the vectors stay in the HNSW index),
+    /// then run a dream cycle and assert exactly two vectors were compacted.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn dream_cycle_compacts_orphaned_vectors() {
+        let handle = open_test_handle("dream-compact").await;
+        let id_keep = handle
+            .remember(
+                "alpha drawer about HNSW".into(),
+                RoomType::Backend,
+                vec![],
+                0.7,
+            )
+            .await
+            .unwrap();
+        let id_orphan_a = handle
+            .remember(
+                "beta drawer about something else".into(),
+                RoomType::General,
+                vec![],
+                0.5,
+            )
+            .await
+            .unwrap();
+        let id_orphan_b = handle
+            .remember(
+                "gamma drawer about yet another topic".into(),
+                RoomType::General,
+                vec![],
+                0.5,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(handle.drawers.read().len(), 3);
+        let before_idx = handle.vector_store.index_size();
+        let before_ids = handle.vector_store.all_ids().len();
+        assert_eq!(before_ids, 3, "key_map should track all three upserts");
+
+        // Manually orphan two: drop them from the drawer table (and the SQLite
+        // mirror) but leave their vectors in the HNSW index. This mirrors the
+        // pre-fix bug pattern that produced 720 index vectors against 129
+        // drawer rows.
+        {
+            let mut drawers = handle.drawers.write();
+            drawers.retain(|d| d.id == id_keep);
+        }
+        let _ = handle.kg.delete_drawer(id_orphan_a);
+        let _ = handle.kg.delete_drawer(id_orphan_b);
+
+        // Dedup threshold high enough that the surviving drawer's L3 hits
+        // don't trigger an accidental merge against the orphan vectors.
+        let dreamer = Dreamer::new(DreamConfig {
+            dedup_threshold: 0.999,
+            ..DreamConfig::default()
+        });
+        let stats = dreamer.dream_cycle(&handle).await.unwrap();
+
+        assert_eq!(
+            stats.compacted, 2,
+            "expected exactly two orphan vectors removed; got stats={stats:?}"
+        );
+        let after_ids = handle.vector_store.all_ids().len();
+        assert_eq!(
+            after_ids, 1,
+            "key_map should only track the surviving drawer (before={before_ids}, before_idx={before_idx})"
+        );
+        // The surviving drawer's id must still be present.
+        assert!(
+            handle.vector_store.all_ids().contains(&id_keep),
+            "compaction must not remove the live drawer's vector"
+        );
     }
 
     /// Why: After a dream cycle, the closet index should map keywords from

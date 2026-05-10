@@ -26,12 +26,14 @@ pub async fn handle(cmd: DreamCommands, palace: &str, out: &OutputConfig) -> Res
                 out.print_json(&json!({
                     "merged": stats.merged,
                     "pruned": stats.pruned,
+                    "compacted": stats.compacted,
                     "closets_updated": stats.closets_updated,
                     "duration_ms": stats.duration_ms,
                 }));
             } else {
                 println!("merged:          {}", stats.merged);
                 println!("pruned:          {}", stats.pruned);
+                println!("compacted:       {}", stats.compacted);
                 println!("closets_updated: {}", stats.closets_updated);
                 println!("duration_ms:     {}", stats.duration_ms);
             }
