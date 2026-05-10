@@ -870,8 +870,8 @@ mod tests {
     fn bench_corpus_parse() {
         let path = fixture_path();
         let corpus = BenchCorpus::from_path(&path).expect("parse corpus");
-        assert_eq!(corpus.docs.len(), 20, "expected 20 documents");
-        assert_eq!(corpus.queries.len(), 10, "expected 10 queries");
+        assert_eq!(corpus.docs.len(), 100, "expected 100 documents");
+        assert_eq!(corpus.queries.len(), 50, "expected 50 queries");
         assert_eq!(corpus.docs[0].id, "d1");
         assert_eq!(corpus.queries[0].id, "q1");
         assert!(!corpus.queries[0].relevant.is_empty());
@@ -985,9 +985,25 @@ mod tests {
             "trusty bench: R@1={:.2} R@5={:.2} MRR={:.2} latency={:.1}ms",
             m.recall_at_1, m.recall_at_k, m.mrr, m.mean_latency_ms
         );
+        // Per-query diagnostic for any future regression tuning.
+        for (qidx, (results, relevant, _)) in per_query.iter().enumerate() {
+            let qid = &corpus.queries[qidx].id;
+            let top1 = results.first().cloned().unwrap_or_default();
+            let hit = relevant.iter().any(|r| r == &top1);
+            if !hit {
+                eprintln!(
+                    "  miss {qid}: top1={top1:?} expected={relevant:?} got={results:?}"
+                );
+            }
+        }
         assert!(
-            m.recall_at_k >= 0.80,
-            "Recall@5 = {} (expected >= 0.80). Per-query: {:?}",
+            m.recall_at_1 >= 0.95,
+            "Recall@1 = {} (expected >= 0.95) on 100-doc corpus.",
+            m.recall_at_1
+        );
+        assert!(
+            m.recall_at_k >= 0.95,
+            "Recall@5 = {} (expected >= 0.95). Per-query: {:?}",
             m.recall_at_k,
             per_query
         );

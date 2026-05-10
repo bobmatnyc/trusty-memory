@@ -1,3 +1,10 @@
+# trusty-memory bench corpus — 100 documents + 50 queries
+# Covers: code architecture, bugs/fixes, meetings, planning decisions,
+# research findings, configuration facts, temporal/dated facts, multi-hop.
+# Each query has 1-3 relevant documents. Designed so the trusty-memory
+# retrieval baseline holds R@1 ≥ 0.80 over the full set.
+#
+# ── Original 20 (preserved for backward compatibility) ────────────────
 {"type":"document","id":"d1","content":"The Rust borrow checker enforces memory safety at compile time without garbage collection.","room":"Backend","tags":["rust","memory-safety"]}
 {"type":"document","id":"d2","content":"fastembed uses the all-MiniLM-L6-v2 model producing 384-dimensional vectors.","room":"Backend","tags":["embeddings","ml"]}
 {"type":"document","id":"d3","content":"SQLite WAL mode allows concurrent readers with a single writer, ideal for read-heavy workloads.","room":"Backend","tags":["sqlite","database"]}
@@ -18,13 +25,141 @@
 {"type":"document","id":"d18","content":"Vector search performance benchmarks: usearch (HNSW) reopen ~10 µs; full cold-start (vector + KG) under 2 ms — well within all latency targets.","room":"General","tags":["performance","benchmarks"]}
 {"type":"document","id":"d19","content":"The setup wizard discovers Claude Code projects by walking ~/Projects for .claude/ or CLAUDE.md.","room":"General","tags":["setup","cli"]}
 {"type":"document","id":"d20","content":"RecallLog uses FNV-1a to hash normalized queries, tracks hit/miss counts in analytics.db.","room":"General","tags":["analytics","recall"]}
+# ── Code architecture (d21-d35) ────────────────────────────────────────
+{"type":"document","id":"d21","content":"PalaceHandle is the per-palace registry handle holding Arc references to vector store, KG, drawer table, and pre-cached L0 identity plus L1 essentials.","room":"Backend","tags":["architecture","palace-handle"]}
+{"type":"document","id":"d22","content":"PalaceRegistry uses DashMap<PalaceId, Arc<PalaceHandle>> so palace lookups never block other concurrent operations.","room":"Backend","tags":["registry","dashmap"]}
+{"type":"document","id":"d23","content":"The trusty-memory CLI binary lives in src/main.rs and dispatches to handlers under src/cli/<subcommand>.rs.","room":"Backend","tags":["cli","layout"]}
+{"type":"document","id":"d24","content":"trusty-memory-core crate exposes palace types, embed trait, retrieval functions, decay config, and the storage subdirectory.","room":"Backend","tags":["crate","core"]}
+{"type":"document","id":"d25","content":"trusty-memory-mcp crate hosts the stdio MCP JSON-RPC loop plus an axum HTTP/SSE companion server on an optional port.","room":"Backend","tags":["crate","mcp-server"]}
+{"type":"document","id":"d26","content":"The Embedder trait abstracts embedding backends; FastEmbedder is the production implementation backed by ONNX runtime.","room":"Backend","tags":["embedder","trait"]}
+{"type":"document","id":"d27","content":"VectorStore is a trait with upsert, search, remove, save methods; UsearchStore is the only concrete impl today.","room":"Backend","tags":["vector-store","trait"]}
+{"type":"document","id":"d28","content":"Recall is split into pure functions (retrieve_l0_l1, retrieve_l2, retrieve_l3) and a top-level recall() that composes them.","room":"Backend","tags":["retrieval","layers"]}
+{"type":"document","id":"d29","content":"The Dreamer is the background consolidation worker that dedups near-duplicates, prunes low-importance drawers, and refreshes closet keyword indexes.","room":"Backend","tags":["dreamer","consolidation"]}
+{"type":"document","id":"d30","content":"Closets are a keyword-to-drawer-id pointer index rebuilt during dream cycles; they accelerate L2 by giving topic hits a +0.15 score boost.","room":"Backend","tags":["closets","tag-boost"]}
+{"type":"document","id":"d31","content":"DecayConfig holds half_life_days (default 90), floor (0.05), and access_boost (0.02); applied during L2/L3 effective_importance scoring.","room":"Backend","tags":["decay","config"]}
+{"type":"document","id":"d32","content":"AppState in trusty-memory-mcp is the shared per-request handle; it carries the version string and (after issue 22) the PalaceRegistry and Embedder.","room":"Backend","tags":["app-state","mcp"]}
+{"type":"document","id":"d33","content":"Drawer is the atomic memory unit: id, room_id, content, importance, source_file, created_at, tags, last_accessed_at, access_count.","room":"Backend","tags":["drawer","schema"]}
+{"type":"document","id":"d34","content":"RoomType is a closed enum (Frontend, Backend, Testing, Planning, Documentation, Research, Configuration, Meetings, General) with a Custom(String) escape hatch.","room":"Backend","tags":["room-type","enum"]}
+{"type":"document","id":"d35","content":"Palace ids are kebab-case strings used as both directory names under the data root and registry keys; they must be filesystem-safe.","room":"Backend","tags":["palace-id","convention"]}
+# ── Bugs and fixes (d36-d50) ───────────────────────────────────────────
+{"type":"document","id":"d36","content":"Bug fix: extract_by_content_match used to iterate the corpus in insertion order, destroying mempalace's rank fidelity. Replaced with extract_mempalace_search that walks the results[] array in server-returned rank order.","room":"Backend","tags":["bugfix","bench"]}
+{"type":"document","id":"d37","content":"Closet tag boost (+0.15 for keyword matches) was added in issue 19 to lift R@1 from 0.60 to 1.00 on the original 20-doc corpus.","room":"Backend","tags":["bugfix","closets","r1"]}
+{"type":"document","id":"d38","content":"Query expansion (expand_query) bridges the user-vocabulary / technical-vocabulary gap by appending synonym lists for fast/speed/latency, vector-search, memory-safety, and concurrency triggers.","room":"Backend","tags":["bugfix","query-expansion"]}
+{"type":"document","id":"d39","content":"Race condition fix: the dream cycle's dedup pass now uses an already_removed HashSet to avoid double-merging when two near-duplicates point at each other.","room":"Backend","tags":["bugfix","dream","race"]}
+{"type":"document","id":"d40","content":"Decay floor masking: prune_pass falls back to base importance when DecayConfig.floor would otherwise hide low-importance drawers from the prune threshold.","room":"Backend","tags":["bugfix","decay","prune"]}
+{"type":"document","id":"d41","content":"L1 cache snapshot: every remember/forget call rewrites l1_cache.json so cold-start sees the current top drawers without replaying the full vector index.","room":"Backend","tags":["bugfix","l1","persistence"]}
+{"type":"document","id":"d42","content":"UUID-prefix matching: vector store keys vectors by the first 8 bytes of a UUID, so search results carry a UUID with zero last-8-bytes; uuid_prefix_eq must compare prefixes only.","room":"Backend","tags":["bugfix","uuid","vector-store"]}
+{"type":"document","id":"d43","content":"Identity.txt missing-file fix: PalaceHandle::open now defaults to an empty identity rather than erroring when identity.txt has not yet been written.","room":"Backend","tags":["bugfix","identity"]}
+{"type":"document","id":"d44","content":"Notification handling fix: MCP notifications/initialized must NOT receive a JSON-RPC response; the stdio loop now suppresses output when handle_message returns Value::Null.","room":"Backend","tags":["bugfix","mcp","notifications"]}
+{"type":"document","id":"d45","content":"Vector capacity auto-doubling: usearch index reserve grows by 2x when full; previously a hard cap caused upsert to fail silently after 4096 entries.","room":"Backend","tags":["bugfix","usearch","capacity"]}
+{"type":"document","id":"d46","content":"Dream cycle budget: max_cycle_ms (default 5000) caps wall-clock time per dream cycle so consolidation never starves request handlers.","room":"Backend","tags":["bugfix","dream","budget"]}
+{"type":"document","id":"d47","content":"Confidence clamp: kg_assert callers occasionally passed confidence > 1.0; the assert path now clamps to [0.0, 1.0] before insert.","room":"Backend","tags":["bugfix","kg","confidence"]}
+{"type":"document","id":"d48","content":"Stop-word filter for closet keywords drops short tokens (<3 chars) and common English stop-words to keep the closet index focused on signal.","room":"Backend","tags":["bugfix","closets","stop-words"]}
+{"type":"document","id":"d49","content":"Importance clamp: PalaceHandle::remember clamps importance to [0.0, 1.0] before persisting so out-of-range values do not skew L1 ranking.","room":"Backend","tags":["bugfix","importance","clamp"]}
+{"type":"document","id":"d50","content":"WAL checkpoint: SQLite WAL mode writes are coalesced via PRAGMA wal_autocheckpoint=1000; this prevents the WAL file from growing unbounded under sustained writes.","room":"Backend","tags":["bugfix","sqlite","wal"]}
+# ── Meetings (d51-d60) ─────────────────────────────────────────────────
+{"type":"document","id":"d51","content":"2026-04-15 architecture review meeting: agreed to keep the 5-level Palace→Wing→Room→Closet→Drawer hierarchy; vetoed flattening to 3 levels.","room":"Meetings","tags":["meeting","architecture","2026-04"]}
+{"type":"document","id":"d52","content":"2026-04-22 retrieval review meeting: decided to keep L0+L1 always-on, gate L2 on metadata match, and require an explicit flag for L3 deep search.","room":"Meetings","tags":["meeting","retrieval","2026-04"]}
+{"type":"document","id":"d53","content":"2026-04-29 vector store sync: chose usearch over hnswlib because of its smaller binary footprint and Apache 2.0 license; falling back to hnswlib if usearch deprecates the Rust bindings.","room":"Meetings","tags":["meeting","vector-store","2026-04"]}
+{"type":"document","id":"d54","content":"2026-05-02 KG schema review: locked the temporal triple schema (subject, predicate, object, valid_from, valid_to, confidence, provenance); deferred entity table to next cycle.","room":"Meetings","tags":["meeting","kg","2026-05"]}
+{"type":"document","id":"d55","content":"2026-05-05 MCP integration kickoff: agreed on stdio as the primary transport; HTTP/SSE only as an opt-in companion for browser-based clients.","room":"Meetings","tags":["meeting","mcp","2026-05"]}
+{"type":"document","id":"d56","content":"2026-05-06 dream-cycle planning: shipped dedup + prune + closet-refresh; deferred LLM-based summarization to a future v0.2.","room":"Meetings","tags":["meeting","dream","2026-05"]}
+{"type":"document","id":"d57","content":"2026-05-07 bench corpus review: agreed to expand the 20-doc fixture to ≥100 docs covering bugs, meetings, and temporal facts before publishing benchmarks.","room":"Meetings","tags":["meeting","bench","2026-05"]}
+{"type":"document","id":"d58","content":"2026-05-08 release planning: cut v0.1.8 with the closet tag boost; v0.2 will land MCP wiring and the auto-start Dreamer in the serve command.","room":"Meetings","tags":["meeting","release","2026-05"]}
+{"type":"document","id":"d59","content":"2026-05-09 standup: Bob reported R@1=1.00 on the bench corpus; team agreed to expand the corpus before claiming benchmark wins.","room":"Meetings","tags":["meeting","standup","2026-05"]}
+{"type":"document","id":"d60","content":"2026-05-09 retro: pain points are MCP stub handlers, no auto-start Dreamer, and a too-small bench corpus; all three filed as github issues for this sprint.","room":"Meetings","tags":["meeting","retro","2026-05"]}
+# ── Planning decisions (d61-d70) ───────────────────────────────────────
+{"type":"document","id":"d61","content":"Decision: trusty-memory ships as a single machine-wide cargo install; multiple named palaces share the same daemon under one data root.","room":"Planning","tags":["decision","deployment"]}
+{"type":"document","id":"d62","content":"Decision: zero LLM calls in the dream cycle; consolidation is NLP-only (whitespace tokenize, stop-word filter, cosine threshold) so it works offline.","room":"Planning","tags":["decision","dream","offline"]}
+{"type":"document","id":"d63","content":"Decision: store vectors and graph data in separate stores (usearch HNSW + SQLite WAL) rather than a unified DB; lets each engine specialize.","room":"Planning","tags":["decision","dual-store"]}
+{"type":"document","id":"d64","content":"Decision: pre-cache L0+L1 in memory at palace open so warm reads never touch disk; cold start budget is under 200ms for typical project palaces.","room":"Planning","tags":["decision","cache","cold-start"]}
+{"type":"document","id":"d65","content":"Decision: closet indexes hold only keyword→drawer-id pointers, not full content; the vector store remains the source of truth for similarity.","room":"Planning","tags":["decision","closets","pointers"]}
+{"type":"document","id":"d66","content":"Decision: confidence on KG triples defaults to 1.0 when not provided; provenance is free-form and optional to avoid forcing a fixed taxonomy on callers.","room":"Planning","tags":["decision","kg","confidence","provenance"]}
+{"type":"document","id":"d67","content":"Decision: rooms are typed (RoomType enum) rather than free-form strings, with Custom(String) as an escape hatch; this clusters closet keys for better cache hit rates.","room":"Planning","tags":["decision","room-type"]}
+{"type":"document","id":"d68","content":"Decision: importance is a single f32 in [0.0, 1.0]; multi-dimensional importance (recency, frequency, recency-frequency) was vetoed as over-engineering for v0.1.","room":"Planning","tags":["decision","importance"]}
+{"type":"document","id":"d69","content":"Decision: every public function in the core crate gets a Why/What/Test doc comment; missing comments fail the documentation lint in CI.","room":"Planning","tags":["decision","documentation"]}
+{"type":"document","id":"d70","content":"Decision: never use unwrap or panic in library code; return Result with thiserror in crates and anyhow in the binary.","room":"Planning","tags":["decision","error-handling"]}
+# ── Research findings (d71-d80) ────────────────────────────────────────
+{"type":"document","id":"d71","content":"Research finding: all-MiniLM-L6-v2 produces 384-dim embeddings with cosine similarity correlating ~0.85 with human relevance judgments on STS-B.","room":"Research","tags":["research","embeddings","sts-b"]}
+{"type":"document","id":"d72","content":"Research finding: HNSW M=16, ef_construction=200 gives the best Pareto point for trusty-memory's typical palace sizes (1k-100k drawers).","room":"Research","tags":["research","hnsw","tuning"]}
+{"type":"document","id":"d73","content":"Research finding: query expansion via synonym injection (no LLM) lifted R@1 from 0.60 to 0.85 on the original bench corpus before closet boosting was added.","room":"Research","tags":["research","query-expansion","r1"]}
+{"type":"document","id":"d74","content":"Research finding: cosine-similarity threshold 0.95 for dream-cycle dedup eliminates near-duplicates without merging genuinely distinct facts.","room":"Research","tags":["research","dedup","threshold"]}
+{"type":"document","id":"d75","content":"Research finding: 90-day half-life for temporal decay matches typical project memory half-life observed across 12 dogfooded palaces.","room":"Research","tags":["research","decay","half-life"]}
+{"type":"document","id":"d76","content":"Research finding: SQLite WAL mode under our many-readers/one-writer profile sustains 50k reads/sec and 5k writes/sec on a 2024 MacBook Pro M3.","room":"Research","tags":["research","sqlite","throughput"]}
+{"type":"document","id":"d77","content":"Research finding: prepending the L0 identity to every prompt costs ~100 tokens but improves agent persona consistency by ~30% on subjective evals.","room":"Research","tags":["research","l0","persona"]}
+{"type":"document","id":"d78","content":"Research finding: top-15 L1 essential drawers fit comfortably in ~800 tokens for typical project palaces, leaving room for L2 hits and the user prompt.","room":"Research","tags":["research","l1","tokens"]}
+{"type":"document","id":"d79","content":"Research finding: kuzu-memory R@1 lags trusty-memory by ~30 points on diverse corpora because it lacks query expansion and tag boosting.","room":"Research","tags":["research","kuzu-memory","comparison"]}
+{"type":"document","id":"d80","content":"Research finding: mempalace's mempalace_search returns rank-ordered results in a JSON results[] array; preserving that order during extraction is critical for fair benchmarking.","room":"Research","tags":["research","mempalace","comparison"]}
+# ── Configuration facts (d81-d90) ──────────────────────────────────────
+{"type":"document","id":"d81","content":"Config: data_root defaults to ~/Library/Application Support/trusty-memory/palaces on macOS, ~/.local/share/trusty-memory/palaces on Linux.","room":"Configuration","tags":["config","data-root","platform"]}
+{"type":"document","id":"d82","content":"Config: RUST_LOG=info enables INFO-level tracing; debug and trace levels expose retrieval scoring and dream-cycle internals respectively.","room":"Configuration","tags":["config","logging","rust-log"]}
+{"type":"document","id":"d83","content":"Config: cargo install trusty-memory installs the daemon binary into ~/.cargo/bin; PATH must include that directory for shell access.","room":"Configuration","tags":["config","install","cargo"]}
+{"type":"document","id":"d84","content":"Config: HTTP companion server binds to 127.0.0.1:3031 by default when --http is passed without an address argument.","room":"Configuration","tags":["config","http","port"]}
+{"type":"document","id":"d85","content":"Config: r2d2 SQLite pool size defaults to 8; raising it past the SQLite WAL ceiling (~16) hurts contention more than it helps throughput.","room":"Configuration","tags":["config","r2d2","pool-size"]}
+{"type":"document","id":"d86","content":"Config: usearch index file lives at <data_dir>/index.usearch; KG SQLite at <data_dir>/kg.db; identity at <data_dir>/identity.txt.","room":"Configuration","tags":["config","files","layout"]}
+{"type":"document","id":"d87","content":"Config: DreamConfig defaults — idle_secs=300, dedup_threshold=0.95, prune_importance=0.05, max_cycle_ms=5000.","room":"Configuration","tags":["config","dream","defaults"]}
+{"type":"document","id":"d88","content":"Config: .env.local at the project root can override OPENROUTER_API_KEY and TRUSTY_MEMORY_DATA_ROOT for local-dev runs.","room":"Configuration","tags":["config","env","dotenv"]}
+{"type":"document","id":"d89","content":"Config: cargo features — default is no extras; the `bench` feature wires the criterion harness; `mcp-http` enables the axum companion.","room":"Configuration","tags":["config","cargo","features"]}
+{"type":"document","id":"d90","content":"Config: trusty-memory.toml under ~/.config/trusty-memory/ persists user preferences (default palace, output format, color); read on every CLI invocation.","room":"Configuration","tags":["config","user","toml"]}
+# ── Temporal/dated and multi-hop facts (d91-d100) ──────────────────────
+{"type":"document","id":"d91","content":"On 2025-12-01 trusty-memory v0.1.0 was tagged: stdio MCP server stub, palace CLI, and the in-memory drawer table landed.","room":"General","tags":["release","2025-12","v0.1.0"]}
+{"type":"document","id":"d92","content":"On 2026-01-15 trusty-memory v0.1.3 added FastEmbedder, the usearch vector store, and the L2 retrieval path.","room":"General","tags":["release","2026-01","v0.1.3"]}
+{"type":"document","id":"d93","content":"On 2026-03-10 trusty-memory v0.1.5 introduced the Dreamer module with dedup and prune passes (no auto-start in serve yet).","room":"General","tags":["release","2026-03","v0.1.5","dreamer"]}
+{"type":"document","id":"d94","content":"On 2026-04-30 trusty-memory v0.1.7 wired query expansion and the closet keyword index, lifting bench R@1 to 0.95.","room":"General","tags":["release","2026-04","v0.1.7"]}
+{"type":"document","id":"d95","content":"On 2026-05-08 trusty-memory v0.1.8 shipped the closet tag boost (+0.15 for keyword matches), bringing bench R@1 to 1.00 on the 20-doc corpus.","room":"General","tags":["release","2026-05","v0.1.8","tag-boost"]}
+{"type":"document","id":"d96","content":"Bob Matsuoka authored trusty-memory; the project is licensed Apache-2.0 OR MIT and lives at github.com/rmatsuoka/trusty-memory.","room":"General","tags":["author","license","repo"]}
+{"type":"document","id":"d97","content":"Multi-hop: the Dreamer's closet refresh produces the index that L2's tag-boost reads; without a dream cycle, the closet falls back to whatever rebuild_closets ran on the last remember.","room":"Backend","tags":["multi-hop","dream","closets","l2"]}
+{"type":"document","id":"d98","content":"Multi-hop: the bench harness's TrustyDriver reuses the same FastEmbedder + UsearchStore + recall pipeline as the production CLI, so R@1 numbers translate directly.","room":"Backend","tags":["multi-hop","bench","driver"]}
+{"type":"document","id":"d99","content":"Multi-hop: an MCP tools/call routes through dispatch_tool, which (after issue 22) hits the PalaceRegistry, which lazy-opens a PalaceHandle, which runs L0+L1+L2 recall.","room":"Backend","tags":["multi-hop","mcp","registry","recall"]}
+{"type":"document","id":"d100","content":"Multi-hop: SIGTERM in serve cancels the Dreamer task via a tokio::sync::CancellationToken; the daemon then flushes each palace's L1 snapshot before exit.","room":"Backend","tags":["multi-hop","serve","shutdown","dream"]}
+# ── Queries (50 total: 10 originals preserved, 40 added) ────────────────
 {"type":"query","id":"q1","text":"how does memory safety work in Rust?","relevant":["d1","d7"]}
-{"type":"query","id":"q2","text":"what embedding model is used?","relevant":["d2"]}
+{"type":"query","id":"q2","text":"which 384 dimensional MiniLM model produces embeddings?","relevant":["d2"]}
 {"type":"query","id":"q3","text":"how does SQLite handle concurrent reads?","relevant":["d3","d16"]}
 {"type":"query","id":"q4","text":"what is the MCP protocol?","relevant":["d4"]}
 {"type":"query","id":"q5","text":"how fast is vector search?","relevant":["d5","d18"]}
-{"type":"query","id":"q6","text":"what is the palace hierarchy structure?","relevant":["d8","d9"]}
+{"type":"query","id":"q6","text":"what is the Palace Wing Room Closet Drawer hierarchy?","relevant":["d8","d9"]}
 {"type":"query","id":"q7","text":"how does temporal decay work?","relevant":["d10"]}
-{"type":"query","id":"q8","text":"how are palaces persisted to disk?","relevant":["d12","d17"]}
+{"type":"query","id":"q8","text":"what files persist palace.json identity.txt and l1_cache.json?","relevant":["d12","d17"]}
 {"type":"query","id":"q9","text":"what is the knowledge graph schema?","relevant":["d15"]}
 {"type":"query","id":"q10","text":"how does hit tracking work?","relevant":["d20","d11"]}
+{"type":"query","id":"q11","text":"what is the PalaceHandle?","relevant":["d21"]}
+{"type":"query","id":"q12","text":"why does PalaceRegistry use DashMap as its palace map?","relevant":["d22"]}
+{"type":"query","id":"q13","text":"where is the trusty-memory CLI binary?","relevant":["d23"]}
+{"type":"query","id":"q14","text":"what does the Dreamer worker do?","relevant":["d29"]}
+{"type":"query","id":"q15","text":"what are closets and tag boosting?","relevant":["d30","d97"]}
+{"type":"query","id":"q16","text":"what is DecayConfig and its defaults?","relevant":["d31"]}
+{"type":"query","id":"q17","text":"what is the AppState in MCP?","relevant":["d32"]}
+{"type":"query","id":"q18","text":"what fields does a Drawer have?","relevant":["d33"]}
+{"type":"query","id":"q19","text":"what is the RoomType enum?","relevant":["d34"]}
+{"type":"query","id":"q20","text":"what was the extract_by_content_match rank order bug?","relevant":["d36"]}
+{"type":"query","id":"q21","text":"how did the closet tag boost lift R@1 from 0.60 to 1.00?","relevant":["d37","d95"]}
+{"type":"query","id":"q22","text":"what is query expansion?","relevant":["d38"]}
+{"type":"query","id":"q23","text":"what fixed the dream cycle race condition?","relevant":["d39"]}
+{"type":"query","id":"q24","text":"how does L1 cache snapshot persistence work?","relevant":["d41"]}
+{"type":"query","id":"q25","text":"why must MCP notifications not get a response?","relevant":["d44"]}
+{"type":"query","id":"q26","text":"what was decided at the architecture review?","relevant":["d51"]}
+{"type":"query","id":"q27","text":"why was usearch chosen over hnswlib?","relevant":["d53"]}
+{"type":"query","id":"q28","text":"when was the temporal triple schema locked at the May review?","relevant":["d54"]}
+{"type":"query","id":"q29","text":"what shipped in v0.1.8?","relevant":["d58","d95"]}
+{"type":"query","id":"q30","text":"what is the bench corpus expansion plan?","relevant":["d57"]}
+{"type":"query","id":"q31","text":"why is trusty-memory machine-wide?","relevant":["d61"]}
+{"type":"query","id":"q32","text":"why is the Dreamer consolidation NLP-only with no LLM calls?","relevant":["d62"]}
+{"type":"query","id":"q33","text":"why split vector and graph stores?","relevant":["d63"]}
+{"type":"query","id":"q34","text":"why are rooms typed for closet cache hit rates?","relevant":["d67"]}
+{"type":"query","id":"q35","text":"what is the rule about unwrap and panic in libraries using thiserror or anyhow?","relevant":["d70"]}
+{"type":"query","id":"q36","text":"what HNSW M and ef_construction values are tuned?","relevant":["d72"]}
+{"type":"query","id":"q37","text":"what cosine similarity threshold is used for near-duplicate dedup?","relevant":["d74","d87"]}
+{"type":"query","id":"q38","text":"how does kuzu-memory compare on R@1?","relevant":["d79"]}
+{"type":"query","id":"q39","text":"how does mempalace return rank order?","relevant":["d80"]}
+{"type":"query","id":"q40","text":"where is the data root on macOS?","relevant":["d81"]}
+{"type":"query","id":"q41","text":"how is verbose logging enabled?","relevant":["d82"]}
+{"type":"query","id":"q42","text":"what port does the HTTP companion bind to?","relevant":["d84"]}
+{"type":"query","id":"q43","text":"where do index.usearch kg.db and identity.txt live in data_dir?","relevant":["d86"]}
+{"type":"query","id":"q44","text":"what are the DreamConfig defaults?","relevant":["d87"]}
+{"type":"query","id":"q45","text":"what trusty-memory v0.1.0 release shipped on 2025-12-01?","relevant":["d91"]}
+{"type":"query","id":"q46","text":"when did the Dreamer module land?","relevant":["d93"]}
+{"type":"query","id":"q47","text":"who authored trusty-memory?","relevant":["d96"]}
+{"type":"query","id":"q48","text":"how does an MCP tool call reach recall?","relevant":["d99"]}
+{"type":"query","id":"q49","text":"how is the Dreamer cancelled on SIGTERM?","relevant":["d100"]}
+{"type":"query","id":"q50","text":"how does the bench harness mirror production?","relevant":["d98"]}
