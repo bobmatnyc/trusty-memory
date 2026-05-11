@@ -73,6 +73,11 @@ export const api = {
       body: JSON.stringify(body)
     }),
 
+  dreamStatus: () => request('/dream/status'),
+  palaceDreamStatus: (id) =>
+    request(`/palaces/${encodeURIComponent(id)}/dream/status`),
+  runDream: () => request('/dream/run', { method: 'POST' }),
+
   chat: (body) =>
     fetch(BASE + '/chat', {
       method: 'POST',

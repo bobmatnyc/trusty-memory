@@ -6,14 +6,24 @@
   import PalaceDetail from './lib/views/PalaceDetail.svelte';
   import Config from './lib/views/Config.svelte';
   import { getRoute } from './lib/router.svelte.js';
-  import { refreshStatus, refreshPalaces, refreshConfig } from './lib/state.svelte.js';
+  import {
+    refreshStatus,
+    refreshPalaces,
+    refreshConfig,
+    refreshDreamStatus
+  } from './lib/state.svelte.js';
   import { onMount } from 'svelte';
 
   let bootError = $state(null);
 
   onMount(async () => {
     try {
-      await Promise.all([refreshStatus(), refreshPalaces(), refreshConfig()]);
+      await Promise.all([
+        refreshStatus(),
+        refreshPalaces(),
+        refreshConfig(),
+        refreshDreamStatus()
+      ]);
     } catch (e) {
       bootError = e.message || String(e);
     }

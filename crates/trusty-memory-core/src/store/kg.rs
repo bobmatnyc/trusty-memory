@@ -240,6 +240,32 @@ impl KnowledgeGraph {
         Ok(triples)
     }
 
+    /// Count currently active triples (where `valid_to IS NULL`).
+    ///
+    /// Why: The admin dashboard needs a per-palace tally of "live" facts in
+    /// the knowledge graph; querying the partial index keeps this O(active)
+    /// rather than O(history).
+    /// What: Synchronous `SELECT COUNT(*)` against the `triples` table where
+    /// `valid_to IS NULL`. Returns 0 on any error rather than aborting the
+    /// caller — this is a diagnostic counter, not a load-bearing read.
+    /// Test: `count_active_triples_returns_live_only`.
+    pub fn count_active_triples(&self) -> usize {
+        let conn = match self.pool.get() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("count_active_triples: get conn failed: {e:#}");
+                return 0;
+            }
+        };
+        conn.query_row(
+            "SELECT COUNT(*) FROM triples WHERE valid_to IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n.max(0) as usize)
+        .unwrap_or(0)
+    }
+
     /// Persist a drawer's metadata. Called from `PalaceHandle::remember`.
     ///
     /// Why: The HNSW index stores only vectors keyed by UUID prefix — without
@@ -481,6 +507,46 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].content, "updated");
         assert!((loaded[0].importance - 0.95).abs() < 1e-5);
+    }
+
+    /// Why: The dashboard's KG triple count must reflect only live facts
+    /// (`valid_to IS NULL`); closed intervals are history and must not be
+    /// counted.
+    /// What: Assert one triple, then supersede it with a contradicting one.
+    /// The count should be 1 (the new active row), not 2.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn count_active_triples_returns_live_only() {
+        let dir = tempdir().unwrap();
+        let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
+        assert_eq!(kg.count_active_triples(), 0);
+
+        kg.assert(Triple {
+            subject: "alice".into(),
+            predicate: "works_at".into(),
+            object: "Acme".into(),
+            valid_from: Utc::now(),
+            valid_to: None,
+            confidence: 1.0,
+            provenance: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(kg.count_active_triples(), 1);
+
+        // Superseding triple closes the prior interval — count should stay at 1.
+        kg.assert(Triple {
+            subject: "alice".into(),
+            predicate: "works_at".into(),
+            object: "Beta".into(),
+            valid_from: Utc::now(),
+            valid_to: None,
+            confidence: 1.0,
+            provenance: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(kg.count_active_triples(), 1);
     }
 
     #[tokio::test]

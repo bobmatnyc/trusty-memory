@@ -11,6 +11,7 @@ let _activePalace = $state(localStorage.getItem('trusty.activePalace') || '');
 let _status = $state(null);
 let _palaces = $state([]);
 let _config = $state(null);
+let _dreamStatus = $state(null);
 
 export function getActivePalace() {
   return _activePalace;
@@ -51,4 +52,18 @@ export async function refreshPalaces() {
 export async function refreshConfig() {
   _config = await api.config();
   return _config;
+}
+
+export function getDreamStatus() {
+  return _dreamStatus;
+}
+
+export async function refreshDreamStatus() {
+  _dreamStatus = await api.dreamStatus();
+  return _dreamStatus;
+}
+
+export async function runDream() {
+  _dreamStatus = await api.runDream();
+  return _dreamStatus;
 }

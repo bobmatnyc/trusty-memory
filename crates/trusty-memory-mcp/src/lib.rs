@@ -123,7 +123,10 @@ pub async fn handle_message(state: &AppState, msg: Value) -> Value {
 
     match method {
         "initialize" => {
-            let extra = state.default_palace.as_ref().map(|dp| json!({ "default_palace": dp }));
+            let extra = state
+                .default_palace
+                .as_ref()
+                .map(|dp| json!({ "default_palace": dp }));
             let result = initialize_response("trusty-memory", &state.version, extra);
             json!({
                 "jsonrpc": "2.0",
@@ -208,7 +211,10 @@ pub async fn run_stdio(state: AppState) -> Result<()> {
             if let Some(result) = resp_value.get("result").cloned() {
                 Response::ok(id, result)
             } else if let Some(err) = resp_value.get("error") {
-                let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(error_codes::INTERNAL_ERROR as i64) as i32;
+                let code =
+                    err.get("code")
+                        .and_then(|c| c.as_i64())
+                        .unwrap_or(error_codes::INTERNAL_ERROR as i64) as i32;
                 let message = err
                     .get("message")
                     .and_then(|m| m.as_str())
@@ -216,7 +222,11 @@ pub async fn run_stdio(state: AppState) -> Result<()> {
                     .to_string();
                 Response::err(id, code, message)
             } else {
-                Response::err(id, error_codes::INTERNAL_ERROR, "malformed handler response")
+                Response::err(
+                    id,
+                    error_codes::INTERNAL_ERROR,
+                    "malformed handler response",
+                )
             }
         }
     })

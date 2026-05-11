@@ -22,13 +22,15 @@ use axum::{
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use trusty_memory_core::dream::{DreamConfig, Dreamer, PersistedDreamStats};
 use trusty_memory_core::palace::{Palace, PalaceId, RoomType};
 use trusty_memory_core::retrieval::{
     recall_deep_with_default_embedder, recall_with_default_embedder,
 };
 use trusty_memory_core::store::kg::Triple;
-use trusty_memory_core::PalaceRegistry;
+use trusty_memory_core::{PalaceHandle, PalaceRegistry};
 use uuid::Uuid;
 
 /// Embedded UI assets produced by `pnpm build` in `ui/`.
@@ -65,6 +67,9 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/v1/palaces/:id/recall", get(recall_handler))
         .route("/api/v1/palaces/:id/kg", get(kg_query).post(kg_assert))
+        .route("/api/v1/palaces/:id/dream/status", get(palace_dream_status))
+        .route("/api/v1/dream/status", get(dream_status))
+        .route("/api/v1/dream/run", post(dream_run))
         .route("/api/v1/chat", post(chat_handler))
         .route("/health", get(|| async { "ok" }))
         .fallback(static_handler)
@@ -92,9 +97,8 @@ async fn static_handler(req: Request<Body>) -> Response {
 
     serve_embedded(&path).unwrap_or_else(|| {
         // SPA fallback.
-        serve_embedded("index.html").unwrap_or_else(|| {
-            (StatusCode::NOT_FOUND, "ui assets missing").into_response()
-        })
+        serve_embedded("index.html")
+            .unwrap_or_else(|| (StatusCode::NOT_FOUND, "ui assets missing").into_response())
     })
 }
 
@@ -106,7 +110,8 @@ fn serve_embedded(path: &str) -> Option<Response> {
     let mut resp = Response::new(body);
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_str(mime.as_ref()).unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+        HeaderValue::from_str(mime.as_ref())
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
     );
     Some(resp)
 }
@@ -121,17 +126,30 @@ struct StatusPayload {
     palace_count: usize,
     default_palace: Option<String>,
     data_root: String,
+    total_drawers: usize,
+    total_vectors: usize,
+    total_kg_triples: usize,
 }
 
 async fn status(State(state): State<AppState>) -> Json<StatusPayload> {
-    let count = PalaceRegistry::list_palaces(&state.data_root)
-        .map(|v| v.len())
-        .unwrap_or(0);
+    let palaces = PalaceRegistry::list_palaces(&state.data_root).unwrap_or_default();
+    let palace_count = palaces.len();
+    let (mut total_drawers, mut total_vectors, mut total_kg_triples) = (0usize, 0usize, 0usize);
+    for p in &palaces {
+        if let Ok(handle) = state.registry.open_palace(&state.data_root, &p.id) {
+            total_drawers = total_drawers.saturating_add(handle.drawers.read().len());
+            total_vectors = total_vectors.saturating_add(handle.vector_store.index_size());
+            total_kg_triples = total_kg_triples.saturating_add(handle.kg.count_active_triples());
+        }
+    }
     Json(StatusPayload {
         version: state.version.clone(),
-        palace_count: count,
+        palace_count,
         default_palace: state.default_palace.clone(),
         data_root: state.data_root.display().to_string(),
+        total_drawers,
+        total_vectors,
+        total_kg_triples,
     })
 }
 
@@ -206,28 +224,53 @@ struct PalaceInfo {
     name: String,
     description: Option<String>,
     drawer_count: usize,
+    vector_count: usize,
+    kg_triple_count: usize,
+    wing_count: usize,
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
-async fn list_palaces(
-    State(state): State<AppState>,
-) -> Result<Json<Vec<PalaceInfo>>, ApiError> {
+/// Build a `PalaceInfo` from a `Palace` row plus an optional opened handle.
+///
+/// Why: Both `list_palaces` and `get_palace_handler` need the same enriched
+/// shape; centralizing the field-pulling avoids drift.
+/// What: Reads drawer count, vector index size, active KG triple count, and
+/// derives wing_count from the number of distinct `room_id`s in the drawer
+/// table (until a dedicated wings/rooms table exists, distinct rooms-by-drawer
+/// is the closest proxy).
+/// Test: `palace_list_includes_richer_counts`.
+fn palace_info_from(palace: &Palace, handle: Option<&Arc<PalaceHandle>>) -> PalaceInfo {
+    let (drawer_count, vector_count, kg_triple_count, wing_count) = if let Some(h) = handle {
+        let drawers = h.drawers.read();
+        let distinct_rooms: HashSet<Uuid> = drawers.iter().map(|d| d.room_id).collect();
+        (
+            drawers.len(),
+            h.vector_store.index_size(),
+            h.kg.count_active_triples(),
+            distinct_rooms.len(),
+        )
+    } else {
+        (0, 0, 0, 0)
+    };
+    PalaceInfo {
+        id: palace.id.0.clone(),
+        name: palace.name.clone(),
+        description: palace.description.clone(),
+        drawer_count,
+        vector_count,
+        kg_triple_count,
+        wing_count,
+        created_at: palace.created_at,
+    }
+}
+
+async fn list_palaces(State(state): State<AppState>) -> Result<Json<Vec<PalaceInfo>>, ApiError> {
     let palaces = PalaceRegistry::list_palaces(&state.data_root)
         .map_err(|e| ApiError::internal(format!("list palaces: {e:#}")))?;
     let mut out = Vec::with_capacity(palaces.len());
     for p in palaces {
-        let drawer_count = state
-            .registry
-            .open_palace(&state.data_root, &p.id)
-            .map(|h| h.drawers.read().len())
-            .unwrap_or(0);
-        out.push(PalaceInfo {
-            id: p.id.0.clone(),
-            name: p.name,
-            description: p.description,
-            drawer_count,
-            created_at: p.created_at,
-        });
+        let handle = state.registry.open_palace(&state.data_root, &p.id).ok();
+        out.push(palace_info_from(&p, handle.as_ref()));
     }
     Ok(Json(out))
 }
@@ -272,18 +315,11 @@ async fn get_palace_handler(
         .into_iter()
         .find(|p| p.id.0 == id)
         .ok_or_else(|| ApiError::not_found(format!("palace not found: {id}")))?;
-    let drawer_count = state
+    let handle = state
         .registry
         .open_palace(&state.data_root, &palace.id)
-        .map(|h| h.drawers.read().len())
-        .unwrap_or(0);
-    Ok(Json(PalaceInfo {
-        id: palace.id.0,
-        name: palace.name,
-        description: palace.description,
-        drawer_count,
-        created_at: palace.created_at,
-    }))
+        .ok();
+    Ok(Json(palace_info_from(&palace, handle.as_ref())))
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +489,123 @@ async fn kg_assert(
 }
 
 // ---------------------------------------------------------------------------
+// Dream cycle status + on-demand run
+// ---------------------------------------------------------------------------
+
+/// Wire payload for dream status endpoints — `last_run_at` may be null when no
+/// cycle has run yet on this palace (or the aggregate has nothing to report).
+#[derive(Serialize, Default)]
+struct DreamStatusPayload {
+    last_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    merged: usize,
+    pruned: usize,
+    compacted: usize,
+    closets_updated: usize,
+    duration_ms: u64,
+}
+
+impl From<PersistedDreamStats> for DreamStatusPayload {
+    fn from(p: PersistedDreamStats) -> Self {
+        Self {
+            last_run_at: Some(p.last_run_at),
+            merged: p.stats.merged,
+            pruned: p.stats.pruned,
+            compacted: p.stats.compacted,
+            closets_updated: p.stats.closets_updated,
+            duration_ms: p.stats.duration_ms,
+        }
+    }
+}
+
+/// GET /api/v1/dream/status — aggregate latest dream stats across all palaces.
+///
+/// Why: The dashboard wants a single "last dream cycle" panel rather than
+/// per-palace details; we sum the per-palace counters and surface the most
+/// recent `last_run_at` so operators can spot a stalled background loop.
+/// What: Walks every palace, loads its `dream_stats.json` if present, sums
+/// counts, and returns the max `last_run_at` (or null if no palace has run).
+/// Test: `dream_status_aggregates_across_palaces` covers the read path.
+async fn dream_status(State(state): State<AppState>) -> Json<DreamStatusPayload> {
+    let palaces = PalaceRegistry::list_palaces(&state.data_root).unwrap_or_default();
+    let mut out = DreamStatusPayload::default();
+    let mut latest: Option<chrono::DateTime<chrono::Utc>> = None;
+    for p in palaces {
+        let data_dir = state.data_root.join(p.id.as_str());
+        let snap = match PersistedDreamStats::load(&data_dir) {
+            Ok(Some(s)) => s,
+            _ => continue,
+        };
+        out.merged = out.merged.saturating_add(snap.stats.merged);
+        out.pruned = out.pruned.saturating_add(snap.stats.pruned);
+        out.compacted = out.compacted.saturating_add(snap.stats.compacted);
+        out.closets_updated = out
+            .closets_updated
+            .saturating_add(snap.stats.closets_updated);
+        out.duration_ms = out.duration_ms.saturating_add(snap.stats.duration_ms);
+        latest = match latest {
+            Some(t) if t >= snap.last_run_at => Some(t),
+            _ => Some(snap.last_run_at),
+        };
+    }
+    out.last_run_at = latest;
+    Json(out)
+}
+
+/// GET /api/v1/palaces/:id/dream/status — per-palace dream stats snapshot.
+async fn palace_dream_status(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<DreamStatusPayload>, ApiError> {
+    let data_dir = state.data_root.join(&id);
+    if !data_dir.exists() {
+        return Err(ApiError::not_found(format!("palace not found: {id}")));
+    }
+    let payload = match PersistedDreamStats::load(&data_dir) {
+        Ok(Some(s)) => s.into(),
+        Ok(None) => DreamStatusPayload::default(),
+        Err(e) => return Err(ApiError::internal(format!("read dream stats: {e:#}"))),
+    };
+    Ok(Json(payload))
+}
+
+/// POST /api/v1/dream/run — run a dream cycle across all palaces on demand.
+///
+/// Why: The dashboard exposes a "Run now" button so operators can force a
+/// cycle without waiting for the idle clock; useful after a bulk ingest or
+/// when diagnosing the dream loop itself.
+/// What: Opens every persisted palace, runs `Dreamer::dream_cycle` with the
+/// default config, and returns the aggregated stats plus the run timestamp.
+/// Errors on individual palaces are logged but don't abort the sweep.
+/// Test: `dream_run_aggregates_stats` covers the round-trip.
+async fn dream_run(State(state): State<AppState>) -> Result<Json<DreamStatusPayload>, ApiError> {
+    let palaces = PalaceRegistry::list_palaces(&state.data_root)
+        .map_err(|e| ApiError::internal(format!("list palaces: {e:#}")))?;
+    let dreamer = Dreamer::new(DreamConfig::default());
+    let mut out = DreamStatusPayload::default();
+    for p in palaces {
+        let handle = match state.registry.open_palace(&state.data_root, &p.id) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(palace = %p.id, "dream_run: open failed: {e:#}");
+                continue;
+            }
+        };
+        match dreamer.dream_cycle(&handle).await {
+            Ok(stats) => {
+                out.merged = out.merged.saturating_add(stats.merged);
+                out.pruned = out.pruned.saturating_add(stats.pruned);
+                out.compacted = out.compacted.saturating_add(stats.compacted);
+                out.closets_updated = out.closets_updated.saturating_add(stats.closets_updated);
+                out.duration_ms = out.duration_ms.saturating_add(stats.duration_ms);
+            }
+            Err(e) => tracing::warn!(palace = %p.id, "dream_run: cycle failed: {e:#}"),
+        }
+    }
+    out.last_run_at = Some(chrono::Utc::now());
+    Ok(Json(out))
+}
+
+// ---------------------------------------------------------------------------
 // Chat (OpenRouter, SSE-streaming)
 // ---------------------------------------------------------------------------
 
@@ -471,10 +624,7 @@ struct ChatMessage {
     content: String,
 }
 
-async fn chat_handler(
-    State(state): State<AppState>,
-    Json(body): Json<ChatBody>,
-) -> Response {
+async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>) -> Response {
     let cfg = match load_user_config() {
         Some(c) if !c.openrouter_api_key.is_empty() => c,
         _ => {
@@ -752,17 +902,65 @@ mod tests {
         assert!(arr.iter().any(|p| p["id"] == "web-test"));
     }
 
+    /// Why: The enriched status payload backs the dashboard's top-row stats;
+    /// it must always include the new total_* counters, even on an empty data
+    /// root, so the UI can render zeros without special-casing missing fields.
+    /// What: Hit `/api/v1/status` on a fresh state and assert the new fields
+    /// are present and set to 0.
+    /// Test: This test itself.
     #[tokio::test]
-    async fn serves_index_html_fallback() {
+    async fn status_includes_total_counters() {
         let state = test_state();
         let app = router().with_state(state);
         let resp = app
             .oneshot(
                 Request::builder()
-                    .uri("/")
+                    .uri("/api/v1/status")
                     .body(Body::empty())
                     .unwrap(),
             )
+            .await
+            .unwrap();
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["total_drawers"], 0);
+        assert_eq!(v["total_vectors"], 0);
+        assert_eq!(v["total_kg_triples"], 0);
+    }
+
+    /// Why: `/api/v1/dream/status` must return a well-shaped payload even
+    /// when no palace has ever run a dream cycle (so the dashboard's first
+    /// load doesn't error).
+    /// What: Hit the endpoint on a fresh state and assert `last_run_at` is
+    /// null and the counters are zero.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn dream_status_empty_returns_nulls() {
+        let state = test_state();
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/dream/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["last_run_at"].is_null());
+        assert_eq!(v["merged"], 0);
+        assert_eq!(v["pruned"], 0);
+    }
+
+    #[tokio::test]
+    async fn serves_index_html_fallback() {
+        let state = test_state();
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
         // Either OK with embedded HTML, or NOT_FOUND if assets not built.

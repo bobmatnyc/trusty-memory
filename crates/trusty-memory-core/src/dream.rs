@@ -17,7 +17,9 @@ use crate::retrieval::{recall_deep, PalaceHandle};
 use crate::store::vector::VectorStore;
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -53,7 +55,7 @@ impl Default for DreamConfig {
 }
 
 /// Per-cycle dream telemetry.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DreamStats {
     pub merged: usize,
     pub pruned: usize,
@@ -62,6 +64,53 @@ pub struct DreamStats {
     /// drawer row references them (issue #33).
     pub compacted: usize,
     pub duration_ms: u64,
+}
+
+/// Persisted dream stats including the wall-clock timestamp of the run.
+///
+/// Why: The admin dashboard needs to display "last ran X minutes ago" so
+/// operators can detect a stuck dream loop. The per-cycle stats alone don't
+/// carry that signal; we wrap them with the run timestamp and snapshot to disk.
+/// What: `DreamStats` + `last_run_at` (UTC). Persisted as JSON at
+/// `<palace_data_dir>/dream_stats.json` after every cycle.
+/// Test: `dream_stats_persisted_after_cycle`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedDreamStats {
+    pub last_run_at: chrono::DateTime<chrono::Utc>,
+    #[serde(flatten)]
+    pub stats: DreamStats,
+}
+
+impl PersistedDreamStats {
+    /// File name used for the per-palace dream stats snapshot.
+    pub const FILE_NAME: &'static str = "dream_stats.json";
+
+    /// Read the persisted snapshot from `<data_dir>/dream_stats.json`, if any.
+    ///
+    /// Why: The dashboard reads this file directly via the web API; centralizing
+    /// the path + parsing keeps every reader in sync.
+    /// What: Returns `Ok(None)` when the file is missing; surfaces I/O and JSON
+    /// errors as `Err`.
+    /// Test: `dream_stats_persisted_after_cycle` reads back the snapshot.
+    pub fn load(data_dir: &Path) -> Result<Option<Self>> {
+        let path = data_dir.join(Self::FILE_NAME);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let parsed: Self =
+            serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+        Ok(Some(parsed))
+    }
+
+    /// Write the snapshot to `<data_dir>/dream_stats.json`.
+    pub fn save(&self, data_dir: &Path) -> Result<()> {
+        let path = data_dir.join(Self::FILE_NAME);
+        let raw = serde_json::to_string_pretty(self).context("serialize dream stats")?;
+        std::fs::write(&path, raw).with_context(|| format!("write {}", path.display()))?;
+        Ok(())
+    }
 }
 
 /// Background memory consolidator.
@@ -227,13 +276,27 @@ impl Dreamer {
             tracing::warn!("dream flush failed: {e:#}");
         }
 
-        Ok(DreamStats {
+        let stats = DreamStats {
             merged,
             pruned,
             closets_updated,
             compacted,
             duration_ms: started.elapsed().as_millis() as u64,
-        })
+        };
+
+        // Snapshot the run for the admin dashboard. Failures here are
+        // non-fatal — the cycle itself succeeded, we just couldn't record it.
+        if let Some(data_dir) = handle.data_dir.as_ref() {
+            let persisted = PersistedDreamStats {
+                last_run_at: chrono::Utc::now(),
+                stats: stats.clone(),
+            };
+            if let Err(e) = persisted.save(data_dir) {
+                tracing::warn!(palace = %handle.id, "persist dream_stats.json failed: {e:#}");
+            }
+        }
+
+        Ok(stats)
     }
 
     /// Remove orphaned vectors from the HNSW index whose drawer row no longer
@@ -802,6 +865,45 @@ mod tests {
         assert!(
             handle.vector_store.all_ids().contains(&id_keep),
             "compaction must not remove the live drawer's vector"
+        );
+    }
+
+    /// Why: The admin dashboard reads `dream_stats.json` to surface the last
+    /// run's outcome and a "last ran X ago" timestamp; the dream cycle must
+    /// snapshot itself to that file after every run so the file is current.
+    /// What: Run a dream cycle on a palace, then load the persisted snapshot
+    /// from disk and assert the timestamp is recent + stats match.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn dream_stats_persisted_after_cycle() {
+        let handle = open_test_handle("dream-persist").await;
+        // One harmless drawer so the cycle has something to scan.
+        handle
+            .remember(
+                "non-duplicate baseline drawer".into(),
+                RoomType::General,
+                vec![],
+                0.5,
+            )
+            .await
+            .unwrap();
+
+        let dreamer = Dreamer::new(DreamConfig::default());
+        let stats = dreamer.dream_cycle(&handle).await.unwrap();
+
+        let data_dir = handle.data_dir.clone().expect("data_dir set");
+        let loaded = PersistedDreamStats::load(&data_dir)
+            .unwrap()
+            .expect("dream_stats.json should exist after a cycle");
+
+        assert_eq!(
+            loaded.stats, stats,
+            "persisted stats must match cycle output"
+        );
+        let age = chrono::Utc::now().signed_duration_since(loaded.last_run_at);
+        assert!(
+            age.num_seconds().abs() < 5,
+            "last_run_at must be within a few seconds of now; got {age}"
         );
     }
 

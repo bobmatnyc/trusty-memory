@@ -92,21 +92,13 @@ pub fn tool_definitions_with(has_default: bool) -> Value {
     } else {
         vec!["palace", "subject"]
     };
-    let memory_list_required: Vec<&str> = if has_default {
-        vec![]
-    } else {
-        vec!["palace"]
-    };
+    let memory_list_required: Vec<&str> = if has_default { vec![] } else { vec!["palace"] };
     let memory_forget_required: Vec<&str> = if has_default {
         vec!["drawer_id"]
     } else {
         vec!["palace", "drawer_id"]
     };
-    let palace_info_required: Vec<&str> = if has_default {
-        vec![]
-    } else {
-        vec!["palace"]
-    };
+    let palace_info_required: Vec<&str> = if has_default { vec![] } else { vec!["palace"] };
 
     json!({
         "tools": [
