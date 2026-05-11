@@ -52,7 +52,7 @@
           <div class="card-body">
             <p>{bootError}</p>
             <p class="text-muted text-sm">
-              Make sure trusty-memory is running with <code>trusty-memory serve --http 127.0.0.1:3031</code>.
+              Make sure trusty-memory is running with <code>--http</code> enabled.
             </p>
           </div>
         </div>

@@ -6,7 +6,7 @@
    * What: Four top stat cards, a Dream Cycle panel with run-now button, an
    * enhanced palaces table, and a system-info card. All data flows through
    * the centralized `state.svelte.js` store.
-   * Test: Run `pnpm dev` from `ui/`, open http://127.0.0.1:3031, confirm
+   * Test: Run `pnpm dev` from `ui/`, open the printed dev URL, confirm
    * counters render, click "Run now" and watch the panel refresh.
    */
   import {
