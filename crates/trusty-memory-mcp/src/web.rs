@@ -50,37 +50,36 @@ struct WebAssets;
 /// What: All API routes under `/api/v1`, fallback to the SPA shell.
 /// Test: `serves_index_html` and `status_endpoint_returns_payload`.
 pub fn router() -> Router<AppState> {
-    // NOTE: cannot use `trusty_common::server::with_standard_middleware` here
-    // because trusty-memory pins axum 0.7 / tower-http 0.5, whereas trusty-common
-    // is built against axum 0.8 / tower-http 0.6. Bumping the axum stack here
-    // is a separate, larger change (every handler signature is affected).
-    // Keep the local CORS + Trace stack until the axum upgrade lands.
-    use tower_http::cors::CorsLayer;
-    use tower_http::trace::TraceLayer;
-
-    Router::new()
+    // axum 0.8 path syntax uses `{param}` instead of `:param`. The shared
+    // `trusty_common::server::with_standard_middleware` layer brings in CORS,
+    // tracing, and gzip (with SSE excluded) so we don't drift from sibling
+    // trusty-* daemons.
+    let router = Router::new()
         .route("/api/v1/status", get(status))
         .route("/api/v1/config", get(config))
         .route("/api/v1/palaces", get(list_palaces).post(create_palace))
-        .route("/api/v1/palaces/:id", get(get_palace_handler))
+        .route("/api/v1/palaces/{id}", get(get_palace_handler))
         .route(
-            "/api/v1/palaces/:id/drawers",
+            "/api/v1/palaces/{id}/drawers",
             get(list_drawers).post(create_drawer),
         )
         .route(
-            "/api/v1/palaces/:id/drawers/:drawer_id",
+            "/api/v1/palaces/{id}/drawers/{drawer_id}",
             delete(delete_drawer),
         )
-        .route("/api/v1/palaces/:id/recall", get(recall_handler))
-        .route("/api/v1/palaces/:id/kg", get(kg_query).post(kg_assert))
-        .route("/api/v1/palaces/:id/dream/status", get(palace_dream_status))
+        .route("/api/v1/palaces/{id}/recall", get(recall_handler))
+        .route("/api/v1/palaces/{id}/kg", get(kg_query).post(kg_assert))
+        .route(
+            "/api/v1/palaces/{id}/dream/status",
+            get(palace_dream_status),
+        )
         .route("/api/v1/dream/status", get(dream_status))
         .route("/api/v1/dream/run", post(dream_run))
         .route("/api/v1/chat", post(chat_handler))
         .route("/health", get(|| async { "ok" }))
-        .fallback(static_handler)
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
+        .fallback(static_handler);
+
+    trusty_common::server::with_standard_middleware(router)
 }
 
 // ---------------------------------------------------------------------------
