@@ -1,13 +1,18 @@
 <script>
   import { getRoute, navigate } from '../router.svelte.js';
 
+  let { hasChat = false } = $props();
+
   let route = $derived(getRoute());
 
-  const links = [
-    { path: '/', label: 'Dashboard', icon: '◇' },
-    { path: '/palaces', label: 'Palaces', icon: '▣' },
-    { path: '/config', label: 'Config', icon: '⚙' }
-  ];
+  let links = $derived(
+    [
+      { path: '/', label: 'Dashboard', icon: '◇' },
+      { path: '/palaces', label: 'Palaces', icon: '▣' },
+      ...(hasChat ? [{ path: '/chat', label: 'Chat', icon: '💬' }] : []),
+      { path: '/config', label: 'Config', icon: '⚙' }
+    ]
+  );
 
   function isActive(path) {
     if (path === '/') return route.path === '/' || route.path === '';

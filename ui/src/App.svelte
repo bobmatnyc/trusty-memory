@@ -5,6 +5,8 @@
   import Palaces from './lib/views/Palaces.svelte';
   import PalaceDetail from './lib/views/PalaceDetail.svelte';
   import Config from './lib/views/Config.svelte';
+  import Chat from './lib/views/Chat.svelte';
+  import { api } from './lib/api.js';
   import { getRoute } from './lib/router.svelte.js';
   import {
     refreshStatus,
@@ -15,6 +17,7 @@
   import { onMount } from 'svelte';
 
   let bootError = $state(null);
+  let hasChat = $state(false);
 
   onMount(async () => {
     try {
@@ -27,6 +30,13 @@
     } catch (e) {
       bootError = e.message || String(e);
     }
+    // Non-fatal: chat is optional, depending on configured providers.
+    try {
+      const provResp = await api.chatProviders();
+      hasChat = !!provResp?.active;
+    } catch {
+      hasChat = false;
+    }
   });
 
   let route = $derived(getRoute());
@@ -37,12 +47,13 @@
     if (segs[0] === 'palaces' && segs.length === 1) return { kind: 'palaces' };
     if (segs[0] === 'palaces' && segs.length >= 2) return { kind: 'palace-detail', id: segs[1] };
     if (segs[0] === 'config') return { kind: 'config' };
+    if (segs[0] === 'chat') return { kind: 'chat' };
     return { kind: 'dashboard' };
   });
 </script>
 
 <div class="layout">
-  <Sidebar />
+  <Sidebar {hasChat} />
   <div class="main">
     <Topbar />
     <div class="content">
@@ -64,6 +75,8 @@
         <PalaceDetail id={view.id} />
       {:else if view.kind === 'config'}
         <Config />
+      {:else if view.kind === 'chat'}
+        <Chat />
       {/if}
     </div>
   </div>

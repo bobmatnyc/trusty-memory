@@ -83,5 +83,23 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
-    })
+    }),
+
+  chatProviders: () => request('/chat/providers'),
+  listSessions: (palaceId) =>
+    request(`/palaces/${encodeURIComponent(palaceId)}/chat/sessions`),
+  createSession: (palaceId, title) =>
+    request(`/palaces/${encodeURIComponent(palaceId)}/chat/sessions`, {
+      method: 'POST',
+      body: JSON.stringify({ title })
+    }),
+  getSession: (palaceId, sessionId) =>
+    request(
+      `/palaces/${encodeURIComponent(palaceId)}/chat/sessions/${encodeURIComponent(sessionId)}`
+    ),
+  deleteSession: (palaceId, sessionId) =>
+    request(
+      `/palaces/${encodeURIComponent(palaceId)}/chat/sessions/${encodeURIComponent(sessionId)}`,
+      { method: 'DELETE' }
+    )
 };
