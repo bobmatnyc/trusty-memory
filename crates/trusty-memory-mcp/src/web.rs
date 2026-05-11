@@ -739,13 +739,61 @@ async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>)
         (None, body.history.clone())
     };
 
-    // Pull recall context from the named (or default) palace.
+    // Count palaces on this machine for the identity block.
+    let all_palaces = PalaceRegistry::list_palaces(&state.data_root).unwrap_or_default();
+    let palace_count = all_palaces.len();
+
+    // Look up the selected palace's metadata (name/description) and open its
+    // handle for live counts + recall context.
+    let selected_palace_meta = if palace_id.is_empty() {
+        None
+    } else {
+        all_palaces.iter().find(|p| p.id.0 == palace_id).cloned()
+    };
+
+    let mut palace_block = String::new();
     let mut context = String::new();
+    let mut palace_display_name = palace_id.clone();
+
     if !palace_id.is_empty() {
         if let Ok(handle) = state
             .registry
             .open_palace(&state.data_root, &PalaceId::new(&palace_id))
         {
+            // Live counts from the opened handle.
+            let drawer_count = handle.drawers.read().len();
+            let vector_count = handle.vector_store.index_size();
+            let kg_triple_count = handle.kg.count_active_triples();
+
+            // Prefer the on-disk palace.json name/description; fall back to id.
+            let (name, description) = match &selected_palace_meta {
+                Some(p) => (p.name.clone(), p.description.clone()),
+                None => (palace_id.clone(), None),
+            };
+            palace_display_name = name.clone();
+
+            palace_block.push_str(&format!(
+                "Currently selected palace:\n\
+                 - id: {id}\n\
+                 - name: {name}\n",
+                id = palace_id,
+                name = name,
+            ));
+            if let Some(desc) = description.as_deref().filter(|s| !s.is_empty()) {
+                palace_block.push_str(&format!("- description: {desc}\n"));
+            }
+            palace_block.push_str(&format!(
+                "- drawers: {drawer_count}\n\
+                 - vectors: {vector_count}\n\
+                 - kg_triples: {kg_triple_count}\n",
+            ));
+            let identity_trimmed = handle.identity.trim();
+            if !identity_trimmed.is_empty() {
+                palace_block.push_str(&format!(
+                    "- identity:\n{identity_trimmed}\n",
+                ));
+            }
+
             if let Ok(hits) = recall_with_default_embedder(&handle, &body.message, 5).await {
                 for r in hits.iter().take(5) {
                     context.push_str(&format!("- (L{}) {}\n", r.layer, r.drawer.content));
@@ -754,14 +802,41 @@ async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>)
         }
     }
 
-    let system = if context.is_empty() {
-        "You are trusty-memory's assistant.".to_string()
-    } else {
-        format!(
-            "You are trusty-memory's assistant. Use the following palace memory \
-             as context when relevant:\n{context}"
-        )
-    };
+    // Build the grounded system prompt with identity, palace, RAG, and behavior
+    // blocks so the LLM never confuses trusty-memory palaces with real-world
+    // architectural palaces (closes the "How many palaces?" hallucination).
+    let mut system = String::new();
+    system.push_str(&format!(
+        "You are the assistant for trusty-memory, a machine-wide AI memory \
+         service running locally on this user's machine. trusty-memory stores \
+         knowledge in named \"palaces\" — isolated memory namespaces, each with \
+         its own vector index (usearch HNSW) and temporal knowledge graph \
+         (SQLite). Memories are organized as Palace -> Wing -> Room -> Closet \
+         -> Drawer, where a Drawer is an atomic memory unit.\n\
+         There are currently {palace_count} palace(s) on this machine.\n\n",
+    ));
+
+    if !palace_block.is_empty() {
+        system.push_str(&palace_block);
+        system.push('\n');
+    }
+
+    if !context.is_empty() {
+        system.push_str(&format!(
+            "Relevant memories from the '{palace_display_name}' palace \
+             (L0 = identity, L1 = essentials, L2 = topic-filtered, L3 = deep):\n\
+             {context}\n",
+        ));
+    }
+
+    system.push_str(
+        "Answer questions about memories, projects, and knowledge stored in \
+         this palace using the context above. When the user asks about \
+         \"palaces\", they mean trusty-memory palaces (memory namespaces on \
+         this machine), not architectural palaces like Versailles. If the \
+         context does not contain the answer, say so plainly rather than \
+         guessing.",
+    );
 
     // Append the new user message to the in-memory history we'll persist.
     history.push(ChatMessage {
