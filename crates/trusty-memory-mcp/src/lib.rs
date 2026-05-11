@@ -12,7 +12,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::OnceCell;
+use tokio::sync::{broadcast, OnceCell};
 use tracing::info;
 use trusty_common::ChatProvider;
 use trusty_mcp_core::{error_codes, initialize_response, Request, Response};
@@ -24,6 +24,44 @@ pub mod tools;
 pub mod web;
 
 pub use tools::MemoryMcpServer;
+
+/// Live daemon events broadcast to connected SSE subscribers.
+///
+/// Why: The dashboard needs push-driven updates so palace creation, drawer
+/// add/delete, dream cycles, and aggregate status changes are visible without
+/// polling. A single broadcast channel fans out to every connected browser.
+/// What: Tagged enum serialized as `{"type": "...", ...fields}` over SSE.
+/// Test: `web::tests::sse_stream_emits_events` subscribes, triggers a
+/// mutation, and asserts the frame arrives.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DaemonEvent {
+    PalaceCreated {
+        id: String,
+        name: String,
+    },
+    DrawerAdded {
+        palace_id: String,
+        drawer_count: usize,
+    },
+    DrawerDeleted {
+        palace_id: String,
+        drawer_count: usize,
+    },
+    DreamCompleted {
+        palace_id: Option<String>,
+        merged: usize,
+        pruned: usize,
+        compacted: usize,
+        closets_updated: usize,
+        duration_ms: u64,
+    },
+    StatusChanged {
+        total_drawers: usize,
+        total_vectors: usize,
+        total_kg_triples: usize,
+    },
+}
 
 /// Shared application state passed to every request handler.
 ///
@@ -51,6 +89,12 @@ pub struct AppState {
     /// Per-palace chat-session stores, opened lazily so cold-start cost is
     /// paid only when chat-history endpoints are hit.
     pub session_stores: Arc<dashmap::DashMap<String, Arc<ChatSessionStore>>>,
+    /// Broadcast sender for live `DaemonEvent` pushes to SSE subscribers.
+    ///
+    /// Why: Lets mutating handlers emit events that any connected dashboard
+    /// receives instantly. Cap of 128 buffers transient slow readers; if a
+    /// receiver lags it gets `RecvError::Lagged` and we emit a `lag` frame.
+    pub events: Arc<broadcast::Sender<DaemonEvent>>,
 }
 
 impl AppState {
@@ -65,6 +109,7 @@ impl AppState {
     /// Test: `tools::tests::dispatch_palace_create_persists` constructs an
     /// AppState pointed at a tempdir and round-trips a palace through it.
     pub fn new(data_root: PathBuf) -> Self {
+        let (events_tx, _) = broadcast::channel::<DaemonEvent>(128);
         Self {
             version: env!("CARGO_PKG_VERSION").to_string(),
             registry: Arc::new(PalaceRegistry::new()),
@@ -73,7 +118,22 @@ impl AppState {
             default_palace: None,
             chat_provider: Arc::new(OnceCell::new()),
             session_stores: Arc::new(dashmap::DashMap::new()),
+            events: Arc::new(events_tx),
         }
+    }
+
+    /// Send a `DaemonEvent` to all connected SSE subscribers.
+    ///
+    /// Why: Mutating handlers call this after a successful write so the
+    /// dashboard can update without polling. The send is best-effort —
+    /// `broadcast::Sender::send` returns `Err` only when there are no live
+    /// receivers, which is fine (no listeners == no work to do).
+    /// What: Drops the result, so callers don't need to care whether anyone
+    /// is listening.
+    /// Test: `web::tests::sse_stream_receives_palace_created` confirms a
+    /// subscriber observes the emitted event.
+    pub fn emit(&self, event: DaemonEvent) {
+        let _ = self.events.send(event);
     }
 
     /// Open (or return cached) the chat-session store for a palace.
@@ -337,20 +397,49 @@ pub async fn run_http(state: AppState, addr: std::net::SocketAddr) -> Result<()>
     run_http_on(state, listener).await
 }
 
-/// Stub SSE handler returning a single connected event.
+/// Live SSE event stream — pushes `DaemonEvent` frames to dashboard clients.
 ///
-/// Why: Provides a real `text/event-stream` response so clients can validate
-/// the endpoint shape ahead of full streaming support.
-/// What: Returns one `data: {"type":"connected"}` SSE frame.
-/// Test: `curl -N http://.../sse` shows the connected frame (manual).
-async fn sse_handler(
-    axum::extract::State(_state): axum::extract::State<AppState>,
+/// Why: The dashboard subscribes once and reacts to live pushes (palace
+/// created, drawer added/deleted, dream completed, status changed) instead of
+/// polling `/api/v1/*` endpoints.
+/// What: Subscribes to `state.events`, emits an initial `connected` frame,
+/// then forwards every `DaemonEvent` as `data: <json>\n\n`. Lagged
+/// subscribers receive a `lag` frame indicating skipped events; channel
+/// closure ends the stream.
+/// Test: `web::tests::sse_stream_emits_palace_created` (covers subscribe +
+/// emit + receive); manual: `curl -N http://.../sse`.
+pub(crate) async fn sse_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
 ) -> impl axum::response::IntoResponse {
+    use futures::StreamExt;
+    use tokio_stream::wrappers::BroadcastStream;
+
+    let rx = state.events.subscribe();
+    let initial = futures::stream::once(async {
+        Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(
+            "data: {\"type\":\"connected\"}\n\n",
+        ))
+    });
+    let events = BroadcastStream::new(rx).map(|res| {
+        let frame = match res {
+            Ok(event) => match serde_json::to_string(&event) {
+                Ok(json) => format!("data: {json}\n\n"),
+                Err(e) => format!("data: {{\"type\":\"error\",\"message\":\"{e}\"}}\n\n"),
+            },
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                format!("data: {{\"type\":\"lag\",\"skipped\":{n}}}\n\n")
+            }
+        };
+        Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from(frame))
+    });
+    let stream = initial.chain(events);
+
     axum::response::Response::builder()
         .header("Content-Type", "text/event-stream")
         .header("Cache-Control", "no-cache")
-        .body(axum::body::Body::from("data: {\"type\":\"connected\"}\n\n"))
-        .expect("static SSE response builds")
+        .header("X-Accel-Buffering", "no")
+        .body(axum::body::Body::from_stream(stream))
+        .expect("valid SSE response")
 }
 
 #[cfg(test)]

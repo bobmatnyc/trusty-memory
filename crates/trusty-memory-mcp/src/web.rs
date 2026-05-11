@@ -10,7 +10,7 @@
 //! fallback and JSON shape of every read endpoint against an in-memory
 //! palace built on a `tempdir`.
 
-use crate::AppState;
+use crate::{AppState, DaemonEvent};
 use axum::{
     body::Body,
     extract::{Path as AxumPath, Query, State},
@@ -361,6 +361,10 @@ async fn create_palace(
         .registry
         .create_palace(&state.data_root, palace)
         .map_err(|e| ApiError::internal(format!("create palace: {e:#}")))?;
+    state.emit(DaemonEvent::PalaceCreated {
+        id: name.clone(),
+        name: name.clone(),
+    });
     Ok(Json(json!({ "id": name })))
 }
 
@@ -433,6 +437,12 @@ async fn create_drawer(
         .remember(body.content, room, body.tags, importance)
         .await
         .map_err(|e| ApiError::internal(format!("remember: {e:#}")))?;
+    let drawer_count = handle.drawers.read().len();
+    state.emit(DaemonEvent::DrawerAdded {
+        palace_id: id.clone(),
+        drawer_count,
+    });
+    state.emit(aggregate_status_event(&state));
     Ok(Json(json!({ "id": drawer_id })))
 }
 
@@ -447,7 +457,38 @@ async fn delete_drawer(
         .forget(uuid)
         .await
         .map_err(|e| ApiError::internal(format!("forget: {e:#}")))?;
+    let drawer_count = handle.drawers.read().len();
+    state.emit(DaemonEvent::DrawerDeleted {
+        palace_id: id.clone(),
+        drawer_count,
+    });
+    state.emit(aggregate_status_event(&state));
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Compute the current aggregate `StatusChanged` event by walking all palaces.
+///
+/// Why: Several mutating handlers (drawer add/delete, dream run) need to push
+/// a refreshed status snapshot so dashboard stat cards stay in sync without
+/// the SPA having to issue an extra `/api/v1/status` request.
+/// What: Mirrors the math in the `status` handler — sums drawer count,
+/// vector index size, and active KG triples across every persisted palace.
+/// Test: Indirectly via the SSE integration tests that observe the event.
+fn aggregate_status_event(state: &AppState) -> DaemonEvent {
+    let palaces = PalaceRegistry::list_palaces(&state.data_root).unwrap_or_default();
+    let (mut total_drawers, mut total_vectors, mut total_kg_triples) = (0usize, 0usize, 0usize);
+    for p in &palaces {
+        if let Ok(handle) = state.registry.open_palace(&state.data_root, &p.id) {
+            total_drawers = total_drawers.saturating_add(handle.drawers.read().len());
+            total_vectors = total_vectors.saturating_add(handle.vector_store.index_size());
+            total_kg_triples = total_kg_triples.saturating_add(handle.kg.count_active_triples());
+        }
+    }
+    DaemonEvent::StatusChanged {
+        total_drawers,
+        total_vectors,
+        total_kg_triples,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -661,6 +702,15 @@ async fn dream_run(State(state): State<AppState>) -> Result<Json<DreamStatusPayl
         }
     }
     out.last_run_at = Some(chrono::Utc::now());
+    state.emit(DaemonEvent::DreamCompleted {
+        palace_id: None,
+        merged: out.merged,
+        pruned: out.pruned,
+        compacted: out.compacted,
+        closets_updated: out.closets_updated,
+        duration_ms: out.duration_ms,
+    });
+    state.emit(aggregate_status_event(&state));
     Ok(Json(out))
 }
 
@@ -1995,6 +2045,88 @@ mod tests {
                 .unwrap_or("")
                 .contains("palace_id"),
             "expected missing-arg error, got {missing}"
+        );
+    }
+
+    /// Why: The SSE event bus is the dashboard's live-update transport;
+    /// regressing it would silently break the UI. Subscribing before the
+    /// emit guarantees the broadcast channel has a receiver when the
+    /// handler fires, so we can deterministically observe the event.
+    /// What: Subscribes to `state.events`, calls the `create_palace`
+    /// handler through the router, then asserts a `PalaceCreated` event
+    /// (and a follow-up status event from drawer mutation) flow through.
+    /// Test: `cargo test -p trusty-memory-mcp sse_broadcast_emits_palace_created`.
+    #[tokio::test]
+    async fn sse_broadcast_emits_palace_created() {
+        let state = test_state();
+        let mut rx = state.events.subscribe();
+        let app = router().with_state(state.clone());
+        let body = json!({"name": "sse-test"}).to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/palaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The handler should have emitted PalaceCreated before returning.
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("event received within timeout")
+            .expect("event channel still open");
+        match event {
+            DaemonEvent::PalaceCreated { id, name } => {
+                assert_eq!(id, "sse-test");
+                assert_eq!(name, "sse-test");
+            }
+            other => panic!("expected PalaceCreated, got {other:?}"),
+        }
+    }
+
+    /// Why: Confirm the `/sse` endpoint speaks `text/event-stream` and emits
+    /// the initial `connected` frame so dashboard clients can rely on a
+    /// known greeting.
+    /// What: Issues a GET against `/sse`, reads the response body chunk,
+    /// asserts the content-type header and the first SSE frame shape.
+    /// Test: `cargo test -p trusty-memory-mcp sse_endpoint_emits_connected_frame`.
+    #[tokio::test]
+    async fn sse_endpoint_emits_connected_frame() {
+        use axum::routing::get;
+        let state = test_state();
+        let app = router()
+            .route("/sse", get(crate::sse_handler))
+            .with_state(state);
+        let resp = app
+            .oneshot(Request::builder().uri("/sse").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        // Read just the first chunk (the connected frame) — the stream stays
+        // open otherwise, so we use a small read budget plus timeout.
+        let body = resp.into_body();
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            to_bytes(body, 4096),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("\"type\":\"connected\""),
+            "expected connected frame, got: {text}"
         );
     }
 

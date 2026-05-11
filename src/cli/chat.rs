@@ -19,6 +19,7 @@ use crate::cli::palace::data_root;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tiktoken_rs::cl100k_base;
+#[allow(deprecated)]
 use trusty_common::{openrouter_chat, ChatMessage};
 use trusty_memory_core::retrieval::{recall, RecallResult};
 use trusty_memory_core::{embed::FastEmbedder, PalaceId, PalaceRegistry};
@@ -135,6 +136,7 @@ or `trusty-memory setup`."
             tool_calls: None,
         },
     ];
+    #[allow(deprecated)]
     let answer = openrouter_chat(&cfg.openrouter.api_key, &cfg.openrouter.model, messages)
         .await
         .context("openrouter chat completions")?;

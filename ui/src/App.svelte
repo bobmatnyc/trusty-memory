@@ -12,9 +12,12 @@
     refreshStatus,
     refreshPalaces,
     refreshConfig,
-    refreshDreamStatus
+    refreshDreamStatus,
+    initEventStream
   } from './lib/state.svelte.js';
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
+
+  let eventSource = null;
 
   let bootError = $state(null);
   let hasChat = $state(false);
@@ -36,6 +39,15 @@
       hasChat = !!provResp?.active;
     } catch {
       hasChat = false;
+    }
+    // Open the live event stream so the dashboard updates without polling.
+    eventSource = initEventStream();
+  });
+
+  onDestroy(() => {
+    if (eventSource) {
+      eventSource.close();
+      eventSource = null;
     }
   });
 

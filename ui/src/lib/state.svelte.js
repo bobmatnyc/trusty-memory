@@ -67,3 +67,51 @@ export async function runDream() {
   _dreamStatus = await api.runDream();
   return _dreamStatus;
 }
+
+/*
+ * Why: The dashboard subscribes to live `DaemonEvent` pushes from the daemon's
+ * /sse endpoint so palace/drawer/dream changes appear instantly without
+ * polling. EventSource auto-reconnects on transient disconnects.
+ * What: Opens an EventSource, routes each event to the appropriate refresher,
+ * and returns the source so callers can close it on teardown.
+ * Test: Trigger a remember via /api/v1/palaces/.../drawers and observe the
+ * drawer table + total_drawers stat card update without a manual refresh.
+ */
+export function initEventStream() {
+  const es = new EventSource('/sse');
+  es.onmessage = (e) => {
+    let event;
+    try {
+      event = JSON.parse(e.data);
+    } catch {
+      return;
+    }
+    switch (event.type) {
+      case 'palace_created':
+        refreshPalaces();
+        refreshStatus();
+        break;
+      case 'drawer_added':
+      case 'drawer_deleted':
+        refreshPalaces();
+        refreshStatus();
+        break;
+      case 'dream_completed':
+        refreshDreamStatus();
+        refreshStatus();
+        break;
+      case 'status_changed':
+        refreshStatus();
+        break;
+      case 'connected':
+      case 'lag':
+      default:
+        break;
+    }
+  };
+  es.onerror = () => {
+    // EventSource reconnects automatically; just note the blip.
+    console.warn('SSE connection lost, will reconnect...');
+  };
+  return es;
+}

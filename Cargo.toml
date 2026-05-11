@@ -40,7 +40,7 @@ tempfile = "3"
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 mime_guess = "2"
 futures = "0.3"
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 tower = { version = "0.4", features = ["util"] }
 trusty-mcp-core = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-mcp-core-v0.1.0" }
 trusty-embedder = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-embedder-v0.1.0" }
@@ -58,7 +58,7 @@ trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core" }
 
 [package]
 name = "trusty-memory"
-version = "0.1.25"
+version = "0.1.26"
 edition = "2021"
 description = "Machine-wide, blazingly fast AI memory service"
 license-file = "LICENSE"
