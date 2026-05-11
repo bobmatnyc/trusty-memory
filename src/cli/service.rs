@@ -99,7 +99,8 @@ fn install() -> Result<()> {
     println!("Installed trusty-memory service:");
     println!("  plist:   {}", plist_path.display());
     println!("  logs:    {}", log_path.display());
-    println!("  http:    http://127.0.0.1:3031 (default)");
+    println!("  http:    dynamic port — discover via `~/.trusty-memory/http_addr`");
+    println!("           or `trusty-memory service status`");
     println!();
     println!("Run `trusty-memory service status` to verify it is running.");
     Ok(())
@@ -161,6 +162,11 @@ fn status() -> Result<()> {
         if !stdout.ends_with('\n') {
             println!();
         }
+        // Surface the dynamic HTTP address if the running daemon has written
+        // one to its discovery file. Best-effort — silent if absent.
+        if let Some(addr) = read_http_addr() {
+            println!("HTTP: http://{addr}");
+        }
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("Could not find service") || stderr.contains("No such") {
@@ -175,6 +181,23 @@ fn status() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Read the daemon's discovery file at `~/.trusty-memory/http_addr`.
+///
+/// Why: The HTTP port is dynamic, so `status` can't print a static address;
+/// it must read whatever the running daemon recorded on startup.
+/// What: Returns the trimmed file contents (e.g. `"127.0.0.1:54321"`), or
+/// `None` if the file is absent or unreadable.
+/// Test: Manual — start the daemon, run `trusty-memory service status`,
+/// confirm the printed address matches `~/.trusty-memory/http_addr`.
+fn read_http_addr() -> Option<String> {
+    let home = dirs::home_dir()?;
+    let path = home.join(".trusty-memory").join("http_addr");
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(target_os = "macos")]

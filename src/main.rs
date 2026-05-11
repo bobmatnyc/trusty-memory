@@ -8,10 +8,11 @@
 //! Test: `cargo test --test integration_tests` plus `--help` and `status`
 //! integration tests in `tests/integration/cli_test.rs`.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
 use std::io;
+use std::path::PathBuf;
 use trusty_memory::cli;
 use trusty_memory::cli::output::OutputConfig;
 use trusty_memory::cli::palace_resolver::resolve_palace;
@@ -166,6 +167,7 @@ async fn main() -> Result<()> {
                 Err(e) => tracing::warn!("failed to resolve data root for Dreamer: {e:#}"),
             }
 
+            let mut addr_file_path: Option<PathBuf> = None;
             let serve_result = if no_http {
                 // stdio-only — Claude Code hook path, no HTTP listener.
                 tokio::select! {
@@ -177,10 +179,29 @@ async fn main() -> Result<()> {
                 }
             } else {
                 // Default: bind HTTP+SSE *and* serve stdio concurrently.
-                // Port auto-detect: if `http` is taken, walk the next 20
-                // ports and use the first free one. Print the actual bound
-                // address so callers (browsers, scripts) know where it landed.
+                // Port auto-detect: if `http` is taken (or is 0), let the OS
+                // pick / walk forward and discover the actual bound address.
                 let listener = trusty_common::bind_with_auto_port(http, 20).await?;
+                let bound_addr = listener.local_addr()?;
+
+                // Report the actual address prominently to stdout so users
+                // and scripts can see where the daemon landed.
+                println!(
+                    "trusty-memory v{} — HTTP admin panel: http://{}",
+                    env!("CARGO_PKG_VERSION"),
+                    bound_addr
+                );
+                tracing::info!(%bound_addr, "HTTP server bound");
+
+                // Write addr to ~/.trusty-memory/http_addr so other commands
+                // and scripts can discover the running daemon without a fixed
+                // port. Stored separately from the data root because the
+                // discovery file is process-state, not user data.
+                match write_http_addr(&bound_addr) {
+                    Ok(p) => addr_file_path = Some(p),
+                    Err(e) => tracing::warn!("could not write http_addr file: {e:#}"),
+                }
+
                 tokio::select! {
                     r = trusty_memory_mcp::run_stdio(state.clone()) => r,
                     r = trusty_memory_mcp::run_http_on(state, listener) => r,
@@ -196,6 +217,13 @@ async fn main() -> Result<()> {
             for jh in dream_handles {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(2), jh).await;
             }
+
+            // Remove addr file so stale addresses don't mislead callers after
+            // shutdown. Best-effort — not fatal if the file is already gone.
+            if let Some(ref p) = addr_file_path {
+                let _ = std::fs::remove_file(p);
+            }
+
             serve_result?;
         }
 
@@ -287,7 +315,20 @@ async fn main() -> Result<()> {
             println!("data_root: {}", root.display());
             println!("palaces: {}", palaces.len());
             println!("active palace: {palace}");
-            println!("daemon: not running (serve not started)");
+
+            // Discover the running daemon's HTTP address by reading the file
+            // the daemon writes on startup. Absent file == daemon not running
+            // (or no HTTP listener).
+            let addr_file = dirs::home_dir().map(|h| h.join(".trusty-memory").join("http_addr"));
+            let running_addr = addr_file
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            match running_addr {
+                Some(addr) => println!("HTTP: http://{addr}"),
+                None => println!("daemon: not running (serve not started)"),
+            }
         }
 
         Commands::Completions { shell } => {
@@ -298,4 +339,26 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Write the bound HTTP address to `~/.trusty-memory/http_addr` so CLI
+/// commands and scripts can discover a running daemon without a fixed port.
+///
+/// Why: The HTTP port is dynamic (default `127.0.0.1:0` lets the OS pick),
+/// so callers — `trusty-memory status`, browsers, shell scripts — need a
+/// reliable discovery channel. A small file under the user's home directory
+/// is the simplest cross-process handoff that survives stdio-only callers.
+/// What: Creates `~/.trusty-memory/` if missing and writes the bound
+/// `SocketAddr` (e.g. `127.0.0.1:54321`) as plain text. Returns the file
+/// path so `main` can remove it on shutdown.
+/// Test: covered manually via `trusty-memory serve` followed by
+/// `cat ~/.trusty-memory/http_addr`.
+fn write_http_addr(addr: &std::net::SocketAddr) -> Result<PathBuf> {
+    let dir = dirs::home_dir()
+        .context("home dir not found")?
+        .join(".trusty-memory");
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join("http_addr");
+    std::fs::write(&path, addr.to_string()).with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
 }

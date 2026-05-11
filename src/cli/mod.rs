@@ -160,15 +160,19 @@ pub enum Commands {
 
     /// Start the MCP server.
     ///
-    /// By default binds the HTTP+SSE server on 127.0.0.1:3031 *and* serves the
-    /// stdio MCP transport concurrently. Use `--no-http` to disable the HTTP
-    /// listener (e.g. when invoked by a Claude Code stdio hook).
+    /// By default binds the HTTP+SSE server on an OS-chosen free port *and*
+    /// serves the stdio MCP transport concurrently. The bound address is
+    /// printed on startup and written to `~/.trusty-memory/http_addr` so
+    /// other commands and scripts can discover the running daemon without a
+    /// hard-coded port. Use `--no-http` to disable the HTTP listener (e.g.
+    /// when invoked by a Claude Code stdio hook).
     #[command(
-        after_help = "Examples:\n  trusty-memory serve\n  trusty-memory serve --http 127.0.0.1:4000\n  trusty-memory serve --no-http"
+        after_help = "Examples:\n  trusty-memory serve                       # OS picks a free port; address printed and written to ~/.trusty-memory/http_addr\n  trusty-memory serve --http 127.0.0.1:3031 # pin a specific port\n  trusty-memory serve --no-http             # stdio MCP only"
     )]
     Serve {
-        /// HTTP bind address (default: 127.0.0.1:3031). Use --no-http to suppress.
-        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:3031")]
+        /// HTTP bind address. Port 0 = OS picks a free port (default).
+        /// Override with e.g. --http 127.0.0.1:3031
+        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:0")]
         http: SocketAddr,
         /// Disable HTTP server (MCP stdio only, for Claude Code integration).
         #[arg(long)]

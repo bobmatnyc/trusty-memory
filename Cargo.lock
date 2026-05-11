@@ -4023,8 +4023,8 @@ dependencies = [
 
 [[package]]
 name = "trusty-common"
-version = "0.1.1"
-source = "git+https://github.com/bobmatnyc/trusty-common?tag=trusty-common-v0.1.1#57822104dc5f0758d7c844de3a61882c8706c851"
+version = "0.1.2"
+source = "git+https://github.com/bobmatnyc/trusty-common?tag=trusty-common-v0.1.2#716986306ed8d5ce229dc532c11e987a15dbf6d7"
 dependencies = [
  "anyhow",
  "colored",
