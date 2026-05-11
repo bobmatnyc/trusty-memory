@@ -12,6 +12,7 @@
   import { onMount, tick } from 'svelte';
   import { api } from '../api.js';
   import ChatMessage from '../components/ChatMessage.svelte';
+  import ToolEvent from '../components/ToolEvent.svelte';
 
   let palaces = $state([]);
   let provider = $state(null); // { name, model } or null
@@ -19,7 +20,13 @@
   let selectedPalace = $state('');
   let sessions = $state([]);
   let currentSessionId = $state(null);
-  let thread = $state([]); // [{ role, content, streaming? }]
+  // Thread items are heterogeneous:
+  //   { type: 'user' | 'assistant', role, content, streaming? }
+  //   { type: 'tool_call', name, arguments, id }
+  //   { type: 'tool_result', name, content, id }
+  // Only user/assistant items are sent back as history; tool events stay
+  // in the display for transparency.
+  let thread = $state([]);
   let input = $state('');
   let streaming = $state(false);
   let error = $state(null);
@@ -72,7 +79,11 @@
     try {
       const sess = await api.getSession(selectedPalace, id);
       currentSessionId = sess.id;
-      thread = (sess.history ?? []).map((m) => ({ ...m, streaming: false }));
+      thread = (sess.history ?? []).map((m) => ({
+        ...m,
+        type: m.role === 'user' ? 'user' : 'assistant',
+        streaming: false
+      }));
       await scrollToBottom();
     } catch (e) {
       error = e.message || String(e);
@@ -116,7 +127,7 @@
     error = null;
 
     // Optimistically append user message.
-    thread = [...thread, { role: 'user', content: text }];
+    thread = [...thread, { type: 'user', role: 'user', content: text }];
     const userMsg = text;
     input = '';
     streaming = true;
@@ -135,9 +146,15 @@
       }
     }
 
-    // Append empty assistant placeholder.
-    thread = [...thread, { role: 'assistant', content: '', streaming: true }];
-    const idx = thread.length - 1;
+    // Append empty assistant placeholder. We track by id rather than index
+    // because tool_call/tool_result frames may be appended after this point
+    // and shift array positions.
+    const assistantId = Date.now();
+    thread = [
+      ...thread,
+      { type: 'assistant', role: 'assistant', content: '', streaming: true, id: assistantId }
+    ];
+    const findAssistantIdx = () => thread.findIndex((m) => m.id === assistantId);
 
     try {
       const res = await api.chat({
@@ -177,27 +194,65 @@
                 currentSessionId = parsed.session_id;
               }
               if (parsed.delta) {
-                thread[idx].content += parsed.delta;
-                thread = [...thread];
+                const ai = findAssistantIdx();
+                if (ai >= 0) {
+                  thread[ai].content += parsed.delta;
+                  thread = [...thread];
+                  await scrollToBottom();
+                }
+              }
+              if (parsed.tool_call) {
+                thread = [
+                  ...thread,
+                  {
+                    type: 'tool_call',
+                    name: parsed.tool_call.name,
+                    arguments: parsed.tool_call.arguments,
+                    id: Date.now() + Math.random()
+                  }
+                ];
+                await scrollToBottom();
+              }
+              if (parsed.tool_result) {
+                thread = [
+                  ...thread,
+                  {
+                    type: 'tool_result',
+                    name: parsed.tool_result.name,
+                    content: parsed.tool_result.content,
+                    id: Date.now() + Math.random()
+                  }
+                ];
                 await scrollToBottom();
               }
               if (parsed.error) {
                 error = parsed.error;
               }
             } catch {
-              thread[idx].content += data;
-              thread = [...thread];
+              const ai = findAssistantIdx();
+              if (ai >= 0) {
+                thread[ai].content += data;
+                thread = [...thread];
+              }
             }
           }
         }
       }
-      thread[idx].streaming = false;
-      thread = [...thread];
+      {
+        const ai = findAssistantIdx();
+        if (ai >= 0) {
+          thread[ai].streaming = false;
+          thread = [...thread];
+        }
+      }
       await loadSessions();
     } catch (e) {
       error = e.message || String(e);
-      thread[idx].streaming = false;
-      thread = [...thread];
+      const ai = findAssistantIdx();
+      if (ai >= 0) {
+        thread[ai].streaming = false;
+        thread = [...thread];
+      }
     } finally {
       streaming = false;
     }
@@ -300,8 +355,14 @@
             {/if}
           </div>
         {:else}
-          {#each thread as m}
-            <ChatMessage role={m.role} content={m.content} streaming={m.streaming} />
+          {#each thread as m (m.id ?? m)}
+            {#if m.type === 'tool_call'}
+              <ToolEvent type="tool_call" name={m.name} args={m.arguments} />
+            {:else if m.type === 'tool_result'}
+              <ToolEvent type="tool_result" name={m.name} content={m.content} />
+            {:else}
+              <ChatMessage role={m.role} content={m.content} streaming={m.streaming} />
+            {/if}
           {/each}
         {/if}
         {#if error}
