@@ -58,7 +58,7 @@ trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core" }
 
 [package]
 name = "trusty-memory"
-version = "0.1.19"
+version = "0.1.20"
 edition = "2021"
 description = "Machine-wide, blazingly fast AI memory service"
 license-file = "LICENSE"
