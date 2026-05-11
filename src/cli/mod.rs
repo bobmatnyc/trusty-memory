@@ -18,6 +18,7 @@ pub mod bench;
 pub mod chat;
 pub mod config;
 pub mod convert;
+pub mod dashboard;
 pub mod decay;
 pub mod dream;
 pub mod git;
@@ -262,6 +263,12 @@ pub enum Commands {
 
     /// Show daemon health and palace summary.
     Status,
+
+    /// Open the HTTP admin dashboard in your browser.
+    #[command(
+        after_help = "Examples:\n  trusty-memory dashboard\n\nRequires `trusty-memory serve` to be running (reads ~/.trusty-memory/http_addr)."
+    )]
+    Dashboard,
 
     /// Generate shell completions.
     #[command(

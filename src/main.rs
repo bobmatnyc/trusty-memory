@@ -331,6 +331,8 @@ async fn main() -> Result<()> {
             }
         }
 
+        Commands::Dashboard => cli::dashboard::handle(&out).await?,
+
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             let name = cmd.get_name().to_string();
