@@ -1,0 +1,100 @@
+# Publishes all crates in the trusty-memory workspace to crates.io.
+#
+# Triggered by:
+#   - Push of a tag matching v* (e.g. v0.1.20)
+#   - Manual workflow_dispatch (with optional dry-run mode)
+#   - Downstream trigger from trusty-common's publish workflow
+#
+# Cross-repo dependency:
+#   trusty-memory-core depends on trusty-embedder (from trusty-common).
+#   trusty-memory-mcp depends on trusty-mcp-core (from trusty-common).
+#   The root trusty-memory binary depends on trusty-common.
+#   Ensure trusty-common crates are published first before running this
+#   workflow with updated version pins.
+#
+# Publish order (dependency-first within workspace):
+#   1. trusty-memory-core — depends on trusty-embedder (external)
+#   2. trusty-memory-mcp  — depends on trusty-memory-core + trusty-mcp-core
+#   3. trusty-memory (bin)— depends on trusty-memory-core + trusty-memory-mcp
+#
+# Required repository secret:
+#   CARGO_REGISTRY_TOKEN — crates.io API token with publish scope.
+
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (publish --dry-run, skip actual upload)"
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  publish:
+    name: Publish crates to crates.io
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # ── Quality gate ──────────────────────────────────────────────────────
+      - name: Clippy (workspace, all targets)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test (workspace)
+        run: cargo test --workspace
+
+      # ── Publish ───────────────────────────────────────────────────────────
+      # Note: [patch] overrides in Cargo.toml referencing trusty-common via
+      # local paths are ignored by `cargo publish` (by design). The
+      # workspace.dependencies entries reference the git-tagged versions of
+      # trusty-common crates which must already exist on crates.io.
+
+      - name: Publish trusty-memory-core
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish -p trusty-memory-core --dry-run
+          else
+            cargo publish -p trusty-memory-core --no-verify
+          fi
+
+      - name: Wait for index propagation (trusty-memory-core)
+        if: ${{ inputs.dry_run != true }}
+        run: sleep 20
+
+      - name: Publish trusty-memory-mcp
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish -p trusty-memory-mcp --dry-run
+          else
+            cargo publish -p trusty-memory-mcp --no-verify
+          fi
+
+      - name: Wait for index propagation (trusty-memory-mcp)
+        if: ${{ inputs.dry_run != true }}
+        run: sleep 20
+
+      - name: Publish trusty-memory (binary crate)
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            cargo publish -p trusty-memory --dry-run
+          else
+            cargo publish -p trusty-memory --no-verify
+          fi
