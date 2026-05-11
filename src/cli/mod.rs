@@ -30,6 +30,7 @@ pub mod output;
 pub use memory::{handle_forget, handle_list, handle_recall, handle_remember};
 pub mod palace;
 pub mod palace_resolver;
+pub mod service;
 pub mod setup;
 
 #[derive(Parser)]
@@ -158,13 +159,20 @@ pub enum Commands {
     Dream(DreamCommands),
 
     /// Start the MCP server.
+    ///
+    /// By default binds the HTTP+SSE server on 127.0.0.1:3031 *and* serves the
+    /// stdio MCP transport concurrently. Use `--no-http` to disable the HTTP
+    /// listener (e.g. when invoked by a Claude Code stdio hook).
     #[command(
-        after_help = "Examples:\n  trusty-memory serve\n  trusty-memory serve --http 127.0.0.1:3031"
+        after_help = "Examples:\n  trusty-memory serve\n  trusty-memory serve --http 127.0.0.1:4000\n  trusty-memory serve --no-http"
     )]
     Serve {
-        /// Also bind HTTP+SSE server
-        #[arg(long, value_name = "ADDR")]
-        http: Option<SocketAddr>,
+        /// HTTP bind address (default: 127.0.0.1:3031). Use --no-http to suppress.
+        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:3031")]
+        http: SocketAddr,
+        /// Disable HTTP server (MCP stdio only, for Claude Code integration).
+        #[arg(long)]
+        no_http: bool,
         /// stdio MCP mode (used by Claude Code hook)
         #[arg(long)]
         mcp: bool,
@@ -176,6 +184,17 @@ pub enum Commands {
         #[arg(long, value_name = "NAME")]
         palace: Option<String>,
     },
+
+    /// Manage the trusty-memory background service (macOS launchd).
+    ///
+    /// Installs a LaunchAgent plist so `trusty-memory serve` runs at login and
+    /// is restarted on crash. No daemon wrapper — launchd owns the process
+    /// lifecycle directly.
+    #[command(
+        subcommand,
+        after_help = "Examples:\n  trusty-memory service install\n  trusty-memory service status\n  trusty-memory service logs\n  trusty-memory service uninstall"
+    )]
+    Service(ServiceCommands),
 
     /// Chat with an OpenRouter model using palace memory as context.
     #[command(
@@ -356,6 +375,18 @@ pub enum DreamCommands {
     Run,
     /// Show last dream run stats.
     Status,
+}
+
+#[derive(Subcommand)]
+pub enum ServiceCommands {
+    /// Install and start the launchd service (macOS).
+    Install,
+    /// Stop and uninstall the launchd service (macOS).
+    Uninstall,
+    /// Show launchd status (PID, last exit code).
+    Status,
+    /// Print the last 50 lines of the service log.
+    Logs,
 }
 
 #[derive(Subcommand)]

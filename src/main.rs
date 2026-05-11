@@ -73,10 +73,16 @@ async fn main() -> Result<()> {
 
         Commands::Serve {
             http,
+            no_http,
             mcp: _,
             palace: default_palace,
         } => {
-            tracing::info!(?http, ?default_palace, "Starting trusty-memory MCP server");
+            tracing::info!(
+                ?http,
+                no_http,
+                ?default_palace,
+                "Starting trusty-memory MCP server"
+            );
             let data_root_for_state = cli::palace::data_root()?;
 
             // Auto-create the default palace if --palace was supplied and the
@@ -160,22 +166,24 @@ async fn main() -> Result<()> {
                 Err(e) => tracing::warn!("failed to resolve data root for Dreamer: {e:#}"),
             }
 
-            let serve_result = if let Some(addr) = http {
-                // Port auto-detect: if `addr` is taken, walk the next 20
-                // ports and use the first free one. Print the actual bound
-                // address so callers (browsers, scripts) know where it landed.
-                let listener = trusty_common::bind_with_auto_port(addr, 20).await?;
+            let serve_result = if no_http {
+                // stdio-only — Claude Code hook path, no HTTP listener.
                 tokio::select! {
-                    r = trusty_memory_mcp::run_stdio(state.clone()) => r,
-                    r = trusty_memory_mcp::run_http_on(state, listener) => r,
+                    r = trusty_memory_mcp::run_stdio(state) => r,
                     _ = tokio::signal::ctrl_c() => {
                         tracing::info!("ctrl-c received, shutting down");
                         Ok(())
                     }
                 }
             } else {
+                // Default: bind HTTP+SSE *and* serve stdio concurrently.
+                // Port auto-detect: if `http` is taken, walk the next 20
+                // ports and use the first free one. Print the actual bound
+                // address so callers (browsers, scripts) know where it landed.
+                let listener = trusty_common::bind_with_auto_port(http, 20).await?;
                 tokio::select! {
-                    r = trusty_memory_mcp::run_stdio(state) => r,
+                    r = trusty_memory_mcp::run_stdio(state.clone()) => r,
+                    r = trusty_memory_mcp::run_http_on(state, listener) => r,
                     _ = tokio::signal::ctrl_c() => {
                         tracing::info!("ctrl-c received, shutting down");
                         Ok(())
@@ -189,6 +197,10 @@ async fn main() -> Result<()> {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(2), jh).await;
             }
             serve_result?;
+        }
+
+        Commands::Service(sub) => {
+            cli::service::handle(sub)?;
         }
 
         Commands::Setup {
