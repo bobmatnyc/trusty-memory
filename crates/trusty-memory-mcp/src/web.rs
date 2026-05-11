@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
-use trusty_common::ChatMessage;
+use trusty_common::{ChatEvent, ChatMessage, ToolDef};
 use trusty_memory_core::dream::{DreamConfig, Dreamer, PersistedDreamStats};
 use trusty_memory_core::palace::{Palace, PalaceId, RoomType};
 use trusty_memory_core::retrieval::{
@@ -680,6 +680,432 @@ struct ChatBody {
     session_id: Option<String>,
 }
 
+/// Hard cap on the number of `tool -> assistant` round trips per chat turn.
+///
+/// Why: Without a bound, a malicious or confused model could request tools
+/// indefinitely; 10 is generous enough for any realistic plan-and-act loop
+/// while still terminating quickly when the model gets stuck.
+const MAX_TOOL_ROUNDS: usize = 10;
+
+/// Build the complete set of tool definitions the chat assistant can call.
+///
+/// Why: Centralizing the tool surface keeps the wire schema, the dispatcher in
+/// `execute_tool`, and the system prompt in lock-step — adding a new tool means
+/// editing this one function plus a match arm.
+/// What: Returns the 11 read/write tools spanning palace introspection,
+/// memory recall/create, KG read/write, and daemon status.
+/// Test: `all_tools_returns_expected_set` asserts names and required-arg shape.
+fn all_tools() -> Vec<ToolDef> {
+    vec![
+        ToolDef {
+            name: "list_palaces".into(),
+            description: "List all memory palaces on this machine with their metadata (id, name, description, counts).".into(),
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        ToolDef {
+            name: "get_palace".into(),
+            description: "Get details for a specific palace by id.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "palace_id": { "type": "string", "description": "Palace id (kebab-case)" } },
+                "required": ["palace_id"],
+            }),
+        },
+        ToolDef {
+            name: "recall_memories".into(),
+            description: "Semantic search for memories in a palace. Returns the top-k most relevant drawers ranked by similarity to the query.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "palace_id": { "type": "string" },
+                    "query": { "type": "string", "description": "Free-text query" },
+                    "top_k": { "type": "integer", "minimum": 1, "maximum": 50, "default": 5 }
+                },
+                "required": ["palace_id", "query"],
+            }),
+        },
+        ToolDef {
+            name: "list_drawers".into(),
+            description: "List all drawers (memories) in a palace, most recent first.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "palace_id": { "type": "string" } },
+                "required": ["palace_id"],
+            }),
+        },
+        ToolDef {
+            name: "kg_query".into(),
+            description: "Query the temporal knowledge graph for all currently-active triples whose subject matches.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "palace_id": { "type": "string" },
+                    "subject": { "type": "string" }
+                },
+                "required": ["palace_id", "subject"],
+            }),
+        },
+        ToolDef {
+            name: "get_config".into(),
+            description: "Get the trusty-memory daemon's configuration (provider, model, data root). API keys are masked.".into(),
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        ToolDef {
+            name: "get_status".into(),
+            description: "Get daemon health: version, palace count, totals for drawers/vectors/triples.".into(),
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        ToolDef {
+            name: "get_dream_status".into(),
+            description: "Get aggregated dreamer activity across all palaces (merged/pruned/compacted counts, last run timestamp).".into(),
+            parameters: json!({ "type": "object", "properties": {}, "required": [] }),
+        },
+        ToolDef {
+            name: "get_palace_dream_status".into(),
+            description: "Get dreamer activity stats for a specific palace.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "palace_id": { "type": "string" } },
+                "required": ["palace_id"],
+            }),
+        },
+        ToolDef {
+            name: "create_memory".into(),
+            description: "Store a new memory (drawer) in a palace. The content is embedded and inserted into the vector index plus the drawer table.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "palace_id": { "type": "string" },
+                    "content": { "type": "string", "description": "Verbatim memory text" },
+                    "room": { "type": "string", "description": "Room name (Frontend/Backend/Testing/Planning/Documentation/Research/Configuration/Meetings/General or a custom name); defaults to General." },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "importance": { "type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.5 }
+                },
+                "required": ["palace_id", "content"],
+            }),
+        },
+        ToolDef {
+            name: "kg_assert".into(),
+            description: "Assert a knowledge-graph triple. Any prior active triple with the same (subject, predicate) is closed out (valid_to set to now) before the new one is inserted.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "palace_id": { "type": "string" },
+                    "subject": { "type": "string" },
+                    "predicate": { "type": "string" },
+                    "object": { "type": "string" },
+                    "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0, "default": 1.0 }
+                },
+                "required": ["palace_id", "subject", "predicate", "object"],
+            }),
+        },
+    ]
+}
+
+/// Execute a tool call against the live `AppState`.
+///
+/// Why: We want the model's tool invocations to call the same Rust paths the
+/// HTTP handlers use — no extra HTTP round-trip, no JSON re-parsing, and the
+/// results always reflect this daemon's view of the world.
+/// What: Parses `arguments` as JSON, dispatches by tool name, returns a JSON
+/// value that becomes the `role: "tool"` message content. Errors are caught
+/// and returned as `{"error": "..."}` JSON so the model can react.
+/// Test: `execute_tool_dispatches_known_tools` covers the dispatch path and
+/// the unknown-tool error case.
+async fn execute_tool(name: &str, args: &str, state: &AppState) -> Value {
+    let parsed: Value = serde_json::from_str(args).unwrap_or(json!({}));
+    match name {
+        "list_palaces" => execute_list_palaces(state).await,
+        "get_palace" => match parsed.get("palace_id").and_then(|v| v.as_str()) {
+            Some(id) => execute_get_palace(state, id).await,
+            None => json!({ "error": "missing required argument: palace_id" }),
+        },
+        "recall_memories" => {
+            let pid = parsed.get("palace_id").and_then(|v| v.as_str());
+            let q = parsed.get("query").and_then(|v| v.as_str());
+            let top_k = parsed
+                .get("top_k")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5) as usize;
+            match (pid, q) {
+                (Some(p), Some(q)) => execute_recall(state, p, q, top_k).await,
+                _ => json!({ "error": "missing required argument(s): palace_id, query" }),
+            }
+        }
+        "list_drawers" => match parsed.get("palace_id").and_then(|v| v.as_str()) {
+            Some(id) => execute_list_drawers(state, id).await,
+            None => json!({ "error": "missing required argument: palace_id" }),
+        },
+        "kg_query" => {
+            let pid = parsed.get("palace_id").and_then(|v| v.as_str());
+            let subj = parsed.get("subject").and_then(|v| v.as_str());
+            match (pid, subj) {
+                (Some(p), Some(s)) => execute_kg_query(state, p, s).await,
+                _ => json!({ "error": "missing required argument(s): palace_id, subject" }),
+            }
+        }
+        "get_config" => execute_get_config(state),
+        "get_status" => execute_get_status(state).await,
+        "get_dream_status" => execute_get_dream_status(state).await,
+        "get_palace_dream_status" => match parsed.get("palace_id").and_then(|v| v.as_str()) {
+            Some(id) => execute_get_palace_dream_status(state, id).await,
+            None => json!({ "error": "missing required argument: palace_id" }),
+        },
+        "create_memory" => {
+            let pid = parsed.get("palace_id").and_then(|v| v.as_str());
+            let content = parsed.get("content").and_then(|v| v.as_str());
+            let room = parsed.get("room").and_then(|v| v.as_str());
+            let tags: Vec<String> = parsed
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let importance = parsed
+                .get("importance")
+                .and_then(|v| v.as_f64())
+                .map(|f| f as f32)
+                .unwrap_or(0.5);
+            match (pid, content) {
+                (Some(p), Some(c)) => execute_create_memory(state, p, c, room, tags, importance).await,
+                _ => json!({ "error": "missing required argument(s): palace_id, content" }),
+            }
+        }
+        "kg_assert" => {
+            let pid = parsed.get("palace_id").and_then(|v| v.as_str());
+            let subj = parsed.get("subject").and_then(|v| v.as_str());
+            let pred = parsed.get("predicate").and_then(|v| v.as_str());
+            let obj = parsed.get("object").and_then(|v| v.as_str());
+            let conf = parsed
+                .get("confidence")
+                .and_then(|v| v.as_f64())
+                .map(|f| f as f32)
+                .unwrap_or(1.0);
+            match (pid, subj, pred, obj) {
+                (Some(p), Some(s), Some(pr), Some(o)) => {
+                    execute_kg_assert(state, p, s, pr, o, conf).await
+                }
+                _ => json!({
+                    "error": "missing required argument(s): palace_id, subject, predicate, object"
+                }),
+            }
+        }
+        _ => json!({ "error": format!("unknown tool: {name}") }),
+    }
+}
+
+async fn execute_list_palaces(state: &AppState) -> Value {
+    let palaces = match PalaceRegistry::list_palaces(&state.data_root) {
+        Ok(v) => v,
+        Err(e) => return json!({ "error": format!("list palaces: {e:#}") }),
+    };
+    let out: Vec<Value> = palaces
+        .into_iter()
+        .map(|p| {
+            let handle = state.registry.open_palace(&state.data_root, &p.id).ok();
+            let info = palace_info_from(&p, handle.as_ref());
+            serde_json::to_value(info).unwrap_or(json!({}))
+        })
+        .collect();
+    json!(out)
+}
+
+async fn execute_get_palace(state: &AppState, id: &str) -> Value {
+    let palaces = match PalaceRegistry::list_palaces(&state.data_root) {
+        Ok(v) => v,
+        Err(e) => return json!({ "error": format!("list palaces: {e:#}") }),
+    };
+    match palaces.into_iter().find(|p| p.id.0 == id) {
+        Some(p) => {
+            let handle = state.registry.open_palace(&state.data_root, &p.id).ok();
+            serde_json::to_value(palace_info_from(&p, handle.as_ref())).unwrap_or(json!({}))
+        }
+        None => json!({ "error": format!("palace not found: {id}") }),
+    }
+}
+
+async fn execute_recall(state: &AppState, palace_id: &str, query: &str, top_k: usize) -> Value {
+    let handle = match state
+        .registry
+        .open_palace(&state.data_root, &PalaceId::new(palace_id))
+    {
+        Ok(h) => h,
+        Err(e) => return json!({ "error": format!("open palace {palace_id}: {e:#}") }),
+    };
+    match recall_with_default_embedder(&handle, query, top_k).await {
+        Ok(hits) => json!(
+            hits.into_iter()
+                .map(|r| json!({
+                    "drawer_id": r.drawer.id.to_string(),
+                    "content": r.drawer.content,
+                    "importance": r.drawer.importance,
+                    "tags": r.drawer.tags,
+                    "score": r.score,
+                    "layer": r.layer,
+                }))
+                .collect::<Vec<_>>()
+        ),
+        Err(e) => json!({ "error": format!("recall: {e:#}") }),
+    }
+}
+
+async fn execute_list_drawers(state: &AppState, palace_id: &str) -> Value {
+    let handle = match state
+        .registry
+        .open_palace(&state.data_root, &PalaceId::new(palace_id))
+    {
+        Ok(h) => h,
+        Err(e) => return json!({ "error": format!("open palace {palace_id}: {e:#}") }),
+    };
+    let drawers = handle.list_drawers(None, None, 200);
+    serde_json::to_value(drawers).unwrap_or(json!([]))
+}
+
+async fn execute_kg_query(state: &AppState, palace_id: &str, subject: &str) -> Value {
+    let handle = match state
+        .registry
+        .open_palace(&state.data_root, &PalaceId::new(palace_id))
+    {
+        Ok(h) => h,
+        Err(e) => return json!({ "error": format!("open palace {palace_id}: {e:#}") }),
+    };
+    match handle.kg.query_active(subject).await {
+        Ok(triples) => serde_json::to_value(triples).unwrap_or(json!([])),
+        Err(e) => json!({ "error": format!("kg query: {e:#}") }),
+    }
+}
+
+fn execute_get_config(state: &AppState) -> Value {
+    let cfg = load_user_config().unwrap_or_default();
+    json!({
+        "openrouter_configured": !cfg.openrouter_api_key.is_empty(),
+        "openrouter_model": cfg.openrouter_model,
+        "local_model": {
+            "enabled": cfg.local_model.enabled,
+            "base_url": cfg.local_model.base_url,
+            "model": cfg.local_model.model,
+        },
+        "data_root": state.data_root.display().to_string(),
+    })
+}
+
+async fn execute_get_status(state: &AppState) -> Value {
+    let palaces = PalaceRegistry::list_palaces(&state.data_root).unwrap_or_default();
+    let (mut total_drawers, mut total_vectors, mut total_kg_triples) = (0usize, 0usize, 0usize);
+    for p in &palaces {
+        if let Ok(handle) = state.registry.open_palace(&state.data_root, &p.id) {
+            total_drawers = total_drawers.saturating_add(handle.drawers.read().len());
+            total_vectors = total_vectors.saturating_add(handle.vector_store.index_size());
+            total_kg_triples = total_kg_triples.saturating_add(handle.kg.count_active_triples());
+        }
+    }
+    json!({
+        "version": state.version,
+        "palace_count": palaces.len(),
+        "default_palace": state.default_palace,
+        "data_root": state.data_root.display().to_string(),
+        "total_drawers": total_drawers,
+        "total_vectors": total_vectors,
+        "total_kg_triples": total_kg_triples,
+    })
+}
+
+async fn execute_get_dream_status(state: &AppState) -> Value {
+    let palaces = PalaceRegistry::list_palaces(&state.data_root).unwrap_or_default();
+    let mut out = DreamStatusPayload::default();
+    let mut latest: Option<chrono::DateTime<chrono::Utc>> = None;
+    for p in palaces {
+        let data_dir = state.data_root.join(p.id.as_str());
+        let snap = match PersistedDreamStats::load(&data_dir) {
+            Ok(Some(s)) => s,
+            _ => continue,
+        };
+        out.merged = out.merged.saturating_add(snap.stats.merged);
+        out.pruned = out.pruned.saturating_add(snap.stats.pruned);
+        out.compacted = out.compacted.saturating_add(snap.stats.compacted);
+        out.closets_updated = out
+            .closets_updated
+            .saturating_add(snap.stats.closets_updated);
+        out.duration_ms = out.duration_ms.saturating_add(snap.stats.duration_ms);
+        latest = match latest {
+            Some(t) if t >= snap.last_run_at => Some(t),
+            _ => Some(snap.last_run_at),
+        };
+    }
+    out.last_run_at = latest;
+    serde_json::to_value(out).unwrap_or(json!({}))
+}
+
+async fn execute_get_palace_dream_status(state: &AppState, palace_id: &str) -> Value {
+    let data_dir = state.data_root.join(palace_id);
+    if !data_dir.exists() {
+        return json!({ "error": format!("palace not found: {palace_id}") });
+    }
+    match PersistedDreamStats::load(&data_dir) {
+        Ok(Some(s)) => serde_json::to_value(DreamStatusPayload::from(s)).unwrap_or(json!({})),
+        Ok(None) => serde_json::to_value(DreamStatusPayload::default()).unwrap_or(json!({})),
+        Err(e) => json!({ "error": format!("read dream stats: {e:#}") }),
+    }
+}
+
+async fn execute_create_memory(
+    state: &AppState,
+    palace_id: &str,
+    content: &str,
+    room: Option<&str>,
+    tags: Vec<String>,
+    importance: f32,
+) -> Value {
+    let handle = match state
+        .registry
+        .open_palace(&state.data_root, &PalaceId::new(palace_id))
+    {
+        Ok(h) => h,
+        Err(e) => return json!({ "error": format!("open palace {palace_id}: {e:#}") }),
+    };
+    let room = room.map(RoomType::parse).unwrap_or(RoomType::General);
+    match handle
+        .remember(content.to_string(), room, tags, importance)
+        .await
+    {
+        Ok(id) => json!({ "drawer_id": id.to_string(), "status": "stored" }),
+        Err(e) => json!({ "error": format!("remember: {e:#}") }),
+    }
+}
+
+async fn execute_kg_assert(
+    state: &AppState,
+    palace_id: &str,
+    subject: &str,
+    predicate: &str,
+    object: &str,
+    confidence: f32,
+) -> Value {
+    let handle = match state
+        .registry
+        .open_palace(&state.data_root, &PalaceId::new(palace_id))
+    {
+        Ok(h) => h,
+        Err(e) => return json!({ "error": format!("open palace {palace_id}: {e:#}") }),
+    };
+    let triple = Triple {
+        subject: subject.to_string(),
+        predicate: predicate.to_string(),
+        object: object.to_string(),
+        valid_from: chrono::Utc::now(),
+        valid_to: None,
+        confidence,
+        provenance: Some("chat:assistant".to_string()),
+    };
+    match handle.kg.assert(triple).await {
+        Ok(()) => json!({ "status": "asserted" }),
+        Err(e) => json!({ "error": format!("kg assert: {e:#}") }),
+    }
+}
+
 async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>) -> Response {
     // Select the active provider (Ollama auto-detect, else OpenRouter).
     let Some(provider) = state.chat_provider().await else {
@@ -719,6 +1145,8 @@ async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>)
                         .map(|m| ChatMessage {
                             role: m.role,
                             content: m.content,
+                            tool_call_id: None,
+                            tool_calls: None,
                         })
                         .collect(),
                 ),
@@ -739,9 +1167,25 @@ async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>)
         (None, body.history.clone())
     };
 
-    // Count palaces on this machine for the identity block.
+    // Full palace roster for the identity block — names + ids, not just count,
+    // so the model can pick the right one when the user names a palace.
     let all_palaces = PalaceRegistry::list_palaces(&state.data_root).unwrap_or_default();
     let palace_count = all_palaces.len();
+    let palace_roster: String = all_palaces
+        .iter()
+        .map(|p| format!("- {} (id: {})", p.name, p.id.0))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Config + global dream snapshot — give the model an honest view of what's
+    // available so it doesn't invent tools or providers that aren't there.
+    let cfg = load_user_config().unwrap_or_default();
+    let active_provider_name = state
+        .chat_provider()
+        .await
+        .map(|p| p.name().to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let dream_snapshot = execute_get_dream_status(&state).await;
 
     // Look up the selected palace's metadata (name/description) and open its
     // handle for live counts + recall context.
@@ -802,9 +1246,9 @@ async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>)
         }
     }
 
-    // Build the grounded system prompt with identity, palace, RAG, and behavior
-    // blocks so the LLM never confuses trusty-memory palaces with real-world
-    // architectural palaces (closes the "How many palaces?" hallucination).
+    // Build the grounded system prompt with identity, palace, RAG, config,
+    // dream-snapshot, and behavior blocks so the LLM never confuses
+    // trusty-memory palaces with real-world architectural palaces.
     let mut system = String::new();
     system.push_str(&format!(
         "You are the assistant for trusty-memory, a machine-wide AI memory \
@@ -813,7 +1257,31 @@ async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>)
          its own vector index (usearch HNSW) and temporal knowledge graph \
          (SQLite). Memories are organized as Palace -> Wing -> Room -> Closet \
          -> Drawer, where a Drawer is an atomic memory unit.\n\
-         There are currently {palace_count} palace(s) on this machine.\n\n",
+         There are currently {palace_count} palace(s) on this machine.\n",
+    ));
+    if !palace_roster.is_empty() {
+        system.push_str(&format!("Palaces:\n{palace_roster}\n"));
+    }
+    system.push('\n');
+
+    // Config block — what providers/models are wired up right now.
+    system.push_str(&format!(
+        "System configuration:\n\
+         - active chat provider: {active_provider_name}\n\
+         - openrouter model: {or_model}\n\
+         - local model: {local_model} ({local_url}, enabled={local_enabled})\n\
+         - data root: {data_root}\n\n",
+        or_model = cfg.openrouter_model,
+        local_model = cfg.local_model.model,
+        local_url = cfg.local_model.base_url,
+        local_enabled = cfg.local_model.enabled,
+        data_root = state.data_root.display(),
+    ));
+
+    // Dream snapshot — give the model a sense of how stale memory state is.
+    system.push_str(&format!(
+        "Global dream status (background memory maintenance):\n{}\n\n",
+        dream_snapshot,
     ));
 
     if !palace_block.is_empty() {
@@ -830,35 +1298,38 @@ async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>)
     }
 
     system.push_str(
-        "Answer questions about memories, projects, and knowledge stored in \
-         this palace using the context above. When the user asks about \
-         \"palaces\", they mean trusty-memory palaces (memory namespaces on \
-         this machine), not architectural palaces like Versailles. If the \
-         context does not contain the answer, say so plainly rather than \
-         guessing.",
+        "You have a set of tools to introspect and modify this trusty-memory \
+         daemon. Prefer calling a tool over guessing — e.g. call \
+         `list_palaces` rather than relying on the roster above if you need \
+         live counts, and call `recall_memories` to search for facts you \
+         don't have in context. When the user asks about \"palaces\", they \
+         mean trusty-memory palaces (memory namespaces on this machine), not \
+         architectural palaces like Versailles. If a tool returns an error, \
+         report it honestly and don't fabricate results.",
     );
 
     // Append the new user message to the in-memory history we'll persist.
     history.push(ChatMessage {
         role: "user".to_string(),
         content: body.message.clone(),
+        tool_call_id: None,
+        tool_calls: None,
     });
 
     let mut messages: Vec<ChatMessage> = Vec::with_capacity(history.len() + 1);
     messages.push(ChatMessage {
         role: "system".to_string(),
         content: system,
+        tool_call_id: None,
+        tool_calls: None,
     });
     messages.extend(history.iter().cloned());
 
-    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(32);
+    let tools = all_tools();
     let (sse_tx, sse_rx) =
-        tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
+        tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(64);
 
-    // Task A: drive the provider's stream into the delta channel.
-    let stream_task = tokio::spawn(async move { provider.chat_stream(messages, delta_tx).await });
-
-    // Capture session-persistence inputs for Task B.
+    // Capture session-persistence inputs.
     let session_store = if !palace_id.is_empty() && session_id.is_some() {
         state.session_store(&palace_id).ok()
     } else {
@@ -866,13 +1337,15 @@ async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>)
     };
     let persist_session_id = session_id.clone();
 
-    // Task B: emit a leading session_id frame, drain deltas, persist final
-    // history, terminate with `data: [DONE]`.
-    let sse_forward_tx = sse_tx.clone();
+    // Drive the tool-execution loop in a background task so the response can
+    // start streaming immediately.
+    let loop_state = state.clone();
     tokio::spawn(async move {
+        // Emit a leading session_id frame so the SPA can correlate this stream
+        // with a persisted session row.
         if let Some(sid) = persist_session_id.as_deref() {
             let frame = format!("data: {}\n\n", json!({ "session_id": sid }));
-            if sse_forward_tx
+            if sse_tx
                 .send(Ok(axum::body::Bytes::from(frame)))
                 .await
                 .is_err()
@@ -880,26 +1353,133 @@ async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>)
                 return;
             }
         }
-        let mut assistant_buf = String::new();
-        while let Some(delta) = delta_rx.recv().await {
-            assistant_buf.push_str(&delta);
-            let frame = format!("data: {}\n\n", json!({ "delta": delta }));
-            if sse_forward_tx
-                .send(Ok(axum::body::Bytes::from(frame)))
-                .await
-                .is_err()
-            {
-                return;
+
+        let mut final_assistant_text = String::new();
+        let mut stream_err: Option<String> = None;
+
+        for round in 0..MAX_TOOL_ROUNDS {
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ChatEvent>(256);
+            let messages_clone = messages.clone();
+            let tools_clone = tools.clone();
+            let provider_clone = provider.clone();
+            let stream_handle = tokio::spawn(async move {
+                provider_clone
+                    .chat_stream(messages_clone, tools_clone, event_tx)
+                    .await
+            });
+
+            let mut tool_calls_this_round: Vec<trusty_common::ToolCall> = Vec::new();
+            let mut round_assistant_text = String::new();
+
+            while let Some(event) = event_rx.recv().await {
+                match event {
+                    ChatEvent::Delta(text) => {
+                        round_assistant_text.push_str(&text);
+                        let frame = format!("data: {}\n\n", json!({ "delta": text }));
+                        if sse_tx
+                            .send(Ok(axum::body::Bytes::from(frame)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    ChatEvent::ToolCall(tc) => {
+                        let frame = format!(
+                            "data: {}\n\n",
+                            json!({ "tool_call": {
+                                "id": tc.id,
+                                "name": tc.name,
+                                "arguments": tc.arguments,
+                            }})
+                        );
+                        let _ = sse_tx.send(Ok(axum::body::Bytes::from(frame))).await;
+                        tool_calls_this_round.push(tc);
+                    }
+                    ChatEvent::Done => break,
+                    ChatEvent::Error(e) => {
+                        stream_err = Some(e);
+                        break;
+                    }
+                }
+            }
+
+            // Drain the spawned stream task; surface any error.
+            match stream_handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => stream_err = Some(e.to_string()),
+                Err(e) => stream_err = Some(format!("join: {e}")),
+            }
+
+            if stream_err.is_some() {
+                break;
+            }
+
+            final_assistant_text.push_str(&round_assistant_text);
+
+            if tool_calls_this_round.is_empty() {
+                // Model produced a plain answer — we're done.
+                break;
+            }
+
+            // Build the assistant message that requested these tool calls.
+            let assistant_tool_calls_json: Vec<Value> = tool_calls_this_round
+                .iter()
+                .map(|tc| {
+                    json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": { "name": tc.name, "arguments": tc.arguments },
+                    })
+                })
+                .collect();
+            messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: round_assistant_text,
+                tool_call_id: None,
+                tool_calls: Some(assistant_tool_calls_json),
+            });
+
+            // Execute each tool and append its result as a `role: "tool"`
+            // message. The next loop iteration feeds these back to the model.
+            for tc in &tool_calls_this_round {
+                let result = execute_tool(&tc.name, &tc.arguments, &loop_state).await;
+                let result_str = result.to_string();
+                let frame = format!(
+                    "data: {}\n\n",
+                    json!({ "tool_result": {
+                        "id": tc.id,
+                        "name": tc.name,
+                        "content": &result_str,
+                    }})
+                );
+                let _ = sse_tx.send(Ok(axum::body::Bytes::from(frame))).await;
+                messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: result_str,
+                    tool_call_id: Some(tc.id.clone()),
+                    tool_calls: None,
+                });
+            }
+
+            // Safety net: log when we walk off the round limit.
+            if round + 1 == MAX_TOOL_ROUNDS {
+                tracing::warn!(
+                    "chat: hit MAX_TOOL_ROUNDS={} — terminating tool loop",
+                    MAX_TOOL_ROUNDS
+                );
             }
         }
-        let stream_result = stream_task.await;
+
         // Persist the completed conversation regardless of streaming error
         // (partial assistant reply still better than nothing).
         if let (Some(store), Some(sid)) = (session_store, persist_session_id.as_deref()) {
-            if !assistant_buf.is_empty() {
+            if !final_assistant_text.is_empty() {
                 history.push(ChatMessage {
                     role: "assistant".into(),
-                    content: assistant_buf,
+                    content: final_assistant_text,
+                    tool_call_id: None,
+                    tool_calls: None,
                 });
             }
             let core_history: Vec<trusty_memory_core::store::chat_sessions::ChatMessage> = history
@@ -913,19 +1493,16 @@ async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>)
                 tracing::warn!("upsert_session failed: {e:#}");
             }
         }
-        match stream_result {
-            Ok(Ok(())) => {
-                let _ = sse_forward_tx
+
+        match stream_err {
+            None => {
+                let _ = sse_tx
                     .send(Ok(axum::body::Bytes::from("data: [DONE]\n\n")))
                     .await;
             }
-            Ok(Err(e)) => {
-                let out = format!("data: {}\n\n", json!({ "error": e.to_string() }));
-                let _ = sse_forward_tx.send(Ok(axum::body::Bytes::from(out))).await;
-            }
-            Err(e) => {
-                let out = format!("data: {}\n\n", json!({ "error": format!("join: {e}") }));
-                let _ = sse_forward_tx.send(Ok(axum::body::Bytes::from(out))).await;
+            Some(e) => {
+                let out = format!("data: {}\n\n", json!({ "error": e }));
+                let _ = sse_tx.send(Ok(axum::body::Bytes::from(out))).await;
             }
         }
     });
@@ -1352,6 +1929,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Why: The chat assistant's tool surface is part of the public API — any
+    /// drift in tool names or required-argument lists is a breaking change for
+    /// the UI and any external automation. Pin the shape here so a refactor
+    /// has to acknowledge it.
+    /// What: Snapshots the names + every tool's `required` array.
+    /// Test: This test itself.
+    #[test]
+    fn all_tools_returns_expected_set() {
+        let tools = all_tools();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "list_palaces",
+                "get_palace",
+                "recall_memories",
+                "list_drawers",
+                "kg_query",
+                "get_config",
+                "get_status",
+                "get_dream_status",
+                "get_palace_dream_status",
+                "create_memory",
+                "kg_assert",
+            ]
+        );
+        // Every tool's `parameters` must be a JSON Schema object with a
+        // `required` array (possibly empty).
+        for t in &tools {
+            assert_eq!(t.parameters["type"], "object", "tool {} schema type", t.name);
+            assert!(
+                t.parameters["required"].is_array(),
+                "tool {} required not array",
+                t.name
+            );
+        }
+    }
+
+    /// Why: `execute_tool` is the bridge between the model's tool_call
+    /// arguments and the live Rust core. We exercise the happy path
+    /// (`list_palaces` on an empty registry returns `[]`) and the unknown-
+    /// tool path (returns `{"error": "..."}`) to lock down both branches.
+    /// What: Calls execute_tool against a fresh `AppState`.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn execute_tool_dispatches_known_tools() {
+        let state = test_state();
+        let result = execute_tool("list_palaces", "{}", &state).await;
+        assert!(result.is_array(), "list_palaces should be array, got {result}");
+        assert_eq!(result.as_array().unwrap().len(), 0);
+
+        let unknown = execute_tool("not_a_tool", "{}", &state).await;
+        assert!(
+            unknown["error"].as_str().unwrap_or("").contains("unknown tool"),
+            "expected unknown-tool error, got {unknown}"
+        );
+
+        let missing = execute_tool("get_palace", "{}", &state).await;
+        assert!(
+            missing["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("palace_id"),
+            "expected missing-arg error, got {missing}"
+        );
     }
 
     #[tokio::test]

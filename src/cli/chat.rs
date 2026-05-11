@@ -125,10 +125,14 @@ or `trusty-memory setup`."
         ChatMessage {
             role: "system".into(),
             content: system_content,
+            tool_call_id: None,
+            tool_calls: None,
         },
         ChatMessage {
             role: "user".into(),
             content: opts.message.clone(),
+            tool_call_id: None,
+            tool_calls: None,
         },
     ];
     let answer = openrouter_chat(&cfg.openrouter.api_key, &cfg.openrouter.model, messages)
