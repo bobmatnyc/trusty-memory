@@ -8,109 +8,47 @@
 //! default browser (`open` on macOS, `xdg-open` on Linux, `cmd /C start` on
 //! Windows). If the daemon isn't running, prints a clear hint. If the browser
 //! command fails, prints the URL so the user can paste it manually.
-//! Test: Covered manually — start `trusty-memory serve` in one shell, run
-//! `trusty-memory dashboard` in another, verify the admin panel opens.
+//! Test: Covered manually — run `trusty-memory dashboard`, verify the admin
+//! panel opens.
 
 use crate::cli::output::OutputConfig;
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::process::Command;
 
 /// Handle the `dashboard` subcommand.
 ///
 /// Why: Single entry point invoked from `main.rs`, mirroring the per-handler
-/// dispatch pattern used by every other subcommand in this crate.
-/// What: Resolves the running daemon's HTTP address from
-/// `~/.trusty-memory/http_addr`, formats `http://<addr>`, and tries to open it
-/// in the default browser. On any failure mode (missing file, empty file,
-/// browser launch failure) prints actionable text rather than erroring out.
+/// dispatch pattern used by every other subcommand in this crate. Daemon
+/// auto-start is handled globally by `ensure_daemon_running` in `main.rs`, so
+/// this handler only needs to resolve the address and open the browser.
+/// What: Reads `~/.trusty-memory/http_addr`, formats `http://<addr>`, probes
+/// it, and opens the browser. If the daemon is not reachable (true edge case
+/// since `ensure_daemon_running` already ran), prints a hint.
 /// Test: Exercised manually; unit-tested via `addr_file_path()` and
 /// `open_url_command()` helpers below.
 pub async fn handle(_out: &OutputConfig) -> Result<()> {
     let path = addr_file_path().context("resolving http_addr file path")?;
 
-    // Fast path: existing http_addr file with a live daemon.
-    if let Ok(s) = std::fs::read_to_string(&path) {
-        let addr = s.trim().to_string();
-        if !addr.is_empty() && is_daemon_alive(&addr) {
-            let url = format!("http://{addr}");
-            match open_browser(&url) {
-                Ok(()) => println!("Opening dashboard: {url}"),
-                Err(_) => {
-                    println!("Dashboard: {url}");
-                    println!("(Could not open browser automatically — paste the URL above)");
-                }
+    let addr = match std::fs::read_to_string(&path) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => String::new(),
+    };
+
+    if !addr.is_empty() && is_daemon_alive(&addr) {
+        let url = format!("http://{addr}");
+        match open_browser(&url) {
+            Ok(()) => println!("Opening dashboard: {url}"),
+            Err(_) => {
+                println!("Dashboard: {url}");
+                println!("(Could not open browser automatically — paste the URL above)");
             }
-            return Ok(());
         }
+        return Ok(());
     }
 
-    // Daemon not running (missing file or stale address). Auto-start it.
-    println!("Starting trusty-memory daemon...");
-    spawn_daemon().context("spawning trusty-memory serve")?;
-
-    wait_for_daemon_and_open(&path)
-}
-
-/// Spawn `trusty-memory serve` as a detached background process.
-///
-/// Why: The dashboard command should "just work" — users shouldn't need to
-/// start the daemon in a separate terminal first. Spawning with null stdio
-/// detaches the child so it survives this CLI invocation.
-/// What: Resolves the path of the currently running binary via
-/// `std::env::current_exe()` (so we always launch the matching version, even
-/// outside PATH), spawns `<exe> serve` with stdin/stdout/stderr all wired to
-/// `Stdio::null()`, and drops the `Child` handle so we don't wait on it.
-/// Test: Covered manually — run `trusty-memory dashboard` with no daemon
-/// running and verify the daemon starts and the browser opens within 10 s.
-fn spawn_daemon() -> Result<()> {
-    let exe = std::env::current_exe().context("resolve current executable")?;
-    Command::new(&exe)
-        .arg("serve")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("spawn trusty-memory serve")?;
+    println!("Daemon not reachable. Run `trusty-memory serve` to start the daemon.");
     Ok(())
-}
-
-/// Poll for the daemon to become ready, then open the browser.
-///
-/// Why: Spawning the daemon is async w.r.t. its HTTP listener — the
-/// `http_addr` file is written only after axum binds. We need to wait for
-/// both the file to appear and the TCP probe to succeed before launching
-/// the browser, otherwise the user sees a "page can't be found" error.
-/// What: Polls every 200 ms for up to 10 s. On success, prints the admin
-/// panel URL, opens the browser, and returns `Ok(())`. On timeout, prints
-/// an error hint and returns `Ok(())` (non-fatal).
-/// Test: Covered manually — kill any running daemon, run
-/// `trusty-memory dashboard`, verify the readiness message and browser open.
-fn wait_for_daemon_and_open(path: &Path) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let poll_interval = Duration::from_millis(200);
-
-    loop {
-        std::thread::sleep(poll_interval);
-        if let Ok(s) = std::fs::read_to_string(path) {
-            let addr = s.trim().to_string();
-            if !addr.is_empty() && is_daemon_alive(&addr) {
-                let url = format!("http://{addr}");
-                println!("trusty-memory — HTTP admin panel: {url}");
-                if open_browser(&url).is_err() {
-                    println!("(Could not open browser automatically — paste the URL above)");
-                }
-                return Ok(());
-            }
-        }
-        if Instant::now() >= deadline {
-            println!(
-                "Daemon did not start within 10 s. Try running `trusty-memory serve` manually."
-            );
-            return Ok(());
-        }
-    }
 }
 
 /// Resolve the path to the daemon's address-discovery file.

@@ -355,6 +355,7 @@ async fn main() -> Result<()> {
 /// path so `main` can remove it on shutdown.
 /// Test: covered manually via `trusty-memory serve` followed by
 /// `cat ~/.trusty-memory/http_addr`.
+
 fn write_http_addr(addr: &std::net::SocketAddr) -> Result<PathBuf> {
     let dir = dirs::home_dir()
         .context("home dir not found")?
