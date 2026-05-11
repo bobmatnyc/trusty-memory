@@ -4,6 +4,8 @@ Machine-wide, blazingly fast AI memory service built in Rust using the Memory
 Palace (mempalace) architecture. Single install per machine, multiple named
 palaces, MCP integration for Claude Code.
 
+> **Coordination:** Shared library patterns, consistent conventions, and CI/CD configuration for this project are managed by [trusty-common](../trusty-common). See that repo's CLAUDE.md for cross-project guidelines.
+
 ## Project Goals
 
 - **Single install per machine.** `cargo install trusty-memory` once;
