@@ -13,8 +13,9 @@
 
 use crate::cli::output::OutputConfig;
 use anyhow::{Context, Result};
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// Handle the `dashboard` subcommand.
 ///
@@ -29,45 +30,87 @@ use std::process::Command;
 pub async fn handle(_out: &OutputConfig) -> Result<()> {
     let path = addr_file_path().context("resolving http_addr file path")?;
 
-    let addr = match std::fs::read_to_string(&path) {
-        Ok(s) => s.trim().to_string(),
-        Err(_) => {
-            print_not_running();
+    // Fast path: existing http_addr file with a live daemon.
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        let addr = s.trim().to_string();
+        if !addr.is_empty() && is_daemon_alive(&addr) {
+            let url = format!("http://{addr}");
+            match open_browser(&url) {
+                Ok(()) => println!("Opening dashboard: {url}"),
+                Err(_) => {
+                    println!("Dashboard: {url}");
+                    println!("(Could not open browser automatically — paste the URL above)");
+                }
+            }
             return Ok(());
         }
-    };
-
-    if addr.is_empty() {
-        print_not_running();
-        return Ok(());
     }
 
-    // Verify the daemon is actually responding before opening the browser.
-    // A stale http_addr file (from a previous run) would otherwise open
-    // a "page can't be found" error in the browser.
-    if !is_daemon_alive(&addr) {
-        println!("trusty-memory was last running at {addr} but is not responding now.");
-        println!("Restart it with:");
-        println!("  trusty-memory serve");
-        println!("Then run `trusty-memory dashboard` again.");
-        // Clean up the stale addr file.
-        let _ = std::fs::remove_file(&path);
-        return Ok(());
-    }
+    // Daemon not running (missing file or stale address). Auto-start it.
+    println!("Starting trusty-memory daemon...");
+    spawn_daemon().context("spawning trusty-memory serve")?;
 
-    let url = format!("http://{addr}");
+    wait_for_daemon_and_open(&path)
+}
 
-    match open_browser(&url) {
-        Ok(()) => {
-            println!("Opening dashboard: {url}");
-        }
-        Err(_) => {
-            println!("Dashboard: {url}");
-            println!("(Could not open browser automatically — paste the URL above)");
-        }
-    }
-
+/// Spawn `trusty-memory serve` as a detached background process.
+///
+/// Why: The dashboard command should "just work" — users shouldn't need to
+/// start the daemon in a separate terminal first. Spawning with null stdio
+/// detaches the child so it survives this CLI invocation.
+/// What: Resolves the path of the currently running binary via
+/// `std::env::current_exe()` (so we always launch the matching version, even
+/// outside PATH), spawns `<exe> serve` with stdin/stdout/stderr all wired to
+/// `Stdio::null()`, and drops the `Child` handle so we don't wait on it.
+/// Test: Covered manually — run `trusty-memory dashboard` with no daemon
+/// running and verify the daemon starts and the browser opens within 10 s.
+fn spawn_daemon() -> Result<()> {
+    let exe = std::env::current_exe().context("resolve current executable")?;
+    Command::new(&exe)
+        .arg("serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawn trusty-memory serve")?;
     Ok(())
+}
+
+/// Poll for the daemon to become ready, then open the browser.
+///
+/// Why: Spawning the daemon is async w.r.t. its HTTP listener — the
+/// `http_addr` file is written only after axum binds. We need to wait for
+/// both the file to appear and the TCP probe to succeed before launching
+/// the browser, otherwise the user sees a "page can't be found" error.
+/// What: Polls every 200 ms for up to 10 s. On success, prints the admin
+/// panel URL, opens the browser, and returns `Ok(())`. On timeout, prints
+/// an error hint and returns `Ok(())` (non-fatal).
+/// Test: Covered manually — kill any running daemon, run
+/// `trusty-memory dashboard`, verify the readiness message and browser open.
+fn wait_for_daemon_and_open(path: &Path) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let poll_interval = Duration::from_millis(200);
+
+    loop {
+        std::thread::sleep(poll_interval);
+        if let Ok(s) = std::fs::read_to_string(path) {
+            let addr = s.trim().to_string();
+            if !addr.is_empty() && is_daemon_alive(&addr) {
+                let url = format!("http://{addr}");
+                println!("trusty-memory — HTTP admin panel: {url}");
+                if open_browser(&url).is_err() {
+                    println!("(Could not open browser automatically — paste the URL above)");
+                }
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            println!(
+                "Daemon did not start within 10 s. Try running `trusty-memory serve` manually."
+            );
+            return Ok(());
+        }
+    }
 }
 
 /// Resolve the path to the daemon's address-discovery file.
@@ -83,19 +126,6 @@ fn addr_file_path() -> Result<PathBuf> {
         .context("home dir not found")?
         .join(".trusty-memory")
         .join("http_addr"))
-}
-
-/// Print the "daemon not running" hint exactly as specified.
-///
-/// Why: Keeping this in one place ensures the message stays consistent and
-/// easy to grep for if the wording ever needs to change.
-/// What: Prints a multi-line message instructing the user to start the daemon
-/// with `trusty-memory serve`.
-/// Test: Visual / manual — output is fixed copy.
-fn print_not_running() {
-    println!("trusty-memory is not running. Start it with:");
-    println!("  trusty-memory serve");
-    println!("Then run `trusty-memory dashboard` again.");
 }
 
 /// Spawn the platform-appropriate browser-open command for `url`.
