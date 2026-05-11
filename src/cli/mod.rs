@@ -171,9 +171,9 @@ pub enum Commands {
         after_help = "Examples:\n  trusty-memory serve                       # OS picks a free port; address printed and written to ~/.trusty-memory/http_addr\n  trusty-memory serve --http 127.0.0.1:3031 # pin a specific port\n  trusty-memory serve --no-http             # stdio MCP only"
     )]
     Serve {
-        /// HTTP bind address. Port 0 = OS picks a free port (default).
-        /// Override with e.g. --http 127.0.0.1:3031
-        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:0")]
+        /// HTTP bind address. Prefers 3031; auto-increments on conflict (up to +20).
+        /// Use --no-http to suppress HTTP entirely.
+        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:3031")]
         http: SocketAddr,
         /// Disable HTTP server (MCP stdio only, for Claude Code integration).
         #[arg(long)]

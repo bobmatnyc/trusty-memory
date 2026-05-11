@@ -42,6 +42,19 @@ pub async fn handle(_out: &OutputConfig) -> Result<()> {
         return Ok(());
     }
 
+    // Verify the daemon is actually responding before opening the browser.
+    // A stale http_addr file (from a previous run) would otherwise open
+    // a "page can't be found" error in the browser.
+    if !is_daemon_alive(&addr) {
+        println!("trusty-memory was last running at {addr} but is not responding now.");
+        println!("Restart it with:");
+        println!("  trusty-memory serve");
+        println!("Then run `trusty-memory dashboard` again.");
+        // Clean up the stale addr file.
+        let _ = std::fs::remove_file(&path);
+        return Ok(());
+    }
+
     let url = format!("http://{addr}");
 
     match open_browser(&url) {
@@ -102,6 +115,24 @@ fn open_browser(url: &str) -> Result<()> {
         anyhow::bail!("browser-open command exited with status {status}");
     }
     Ok(())
+}
+
+/// Returns true if a TCP connection to `addr` succeeds within 500 ms.
+///
+/// Why: `http_addr` is a best-effort file; a stale entry from a previous
+/// daemon run would open a "page can't be found" error in the browser.
+/// A quick TCP probe lets us detect and report this gracefully.
+/// What: Parses `addr` as a `SocketAddr`, calls `TcpStream::connect_timeout`
+/// with a 500 ms budget, returns true on success.
+/// Test: Covered indirectly — if the daemon isn't running, `handle()` prints
+/// the restart hint instead of opening a dead URL.
+fn is_daemon_alive(addr: &str) -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+    addr.parse::<SocketAddr>()
+        .ok()
+        .and_then(|sa| TcpStream::connect_timeout(&sa, Duration::from_millis(500)).ok())
+        .is_some()
 }
 
 /// Build (but don't execute) the platform-specific browser-open `Command`.
