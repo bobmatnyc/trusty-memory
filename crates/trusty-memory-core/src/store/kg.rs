@@ -266,6 +266,23 @@ impl KnowledgeGraph {
         .unwrap_or(0)
     }
 
+    /// Run a passive WAL checkpoint.
+    ///
+    /// Why: SQLite WAL grows unbounded unless checkpointed; PASSIVE mode is
+    ///      non-blocking — it checkpoints whatever pages aren't actively read.
+    /// What: Executes `PRAGMA wal_checkpoint(PASSIVE)` and returns the
+    ///       (wal_pages, checkpointed_pages) tuple for logging.
+    /// Test: `wal_checkpoint_returns_pages`.
+    pub fn checkpoint(&self) -> Result<(i64, i64)> {
+        let conn = self.pool.get().context("failed to get sqlite connection")?;
+        let (wal, checkpointed) = conn
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+            })
+            .context("failed to execute wal_checkpoint(PASSIVE)")?;
+        Ok((wal, checkpointed))
+    }
+
     /// Persist a drawer's metadata. Called from `PalaceHandle::remember`.
     ///
     /// Why: The HNSW index stores only vectors keyed by UUID prefix — without
@@ -547,6 +564,32 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(kg.count_active_triples(), 1);
+    }
+
+    /// Why: The Dreamer cycle calls `checkpoint()` to keep the WAL bounded;
+    /// the method must return a `(wal_pages, checkpointed_pages)` tuple without
+    /// erroring on a freshly-opened database.
+    /// What: Open a KG, write a triple to populate the WAL, then run a passive
+    /// checkpoint. Both returned values must be non-negative.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn wal_checkpoint_returns_pages() {
+        let dir = tempdir().unwrap();
+        let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
+        kg.assert(Triple {
+            subject: "s".into(),
+            predicate: "p".into(),
+            object: "o".into(),
+            valid_from: Utc::now(),
+            valid_to: None,
+            confidence: 1.0,
+            provenance: None,
+        })
+        .await
+        .unwrap();
+        let (wal, done) = kg.checkpoint().expect("checkpoint should succeed");
+        assert!(wal >= 0, "wal_pages must be non-negative, got {wal}");
+        assert!(done >= 0, "checkpointed_pages must be non-negative, got {done}");
     }
 
     #[tokio::test]

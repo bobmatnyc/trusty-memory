@@ -284,6 +284,27 @@ impl Dreamer {
             duration_ms: started.elapsed().as_millis() as u64,
         };
 
+        // WAL checkpoint — PASSIVE mode is non-blocking. Issue #36: without
+        // periodic checkpointing the SQLite WAL grows unbounded over a
+        // long-running daemon's lifetime.
+        match handle.kg.checkpoint() {
+            Ok((wal, done)) => {
+                tracing::debug!(
+                    palace = %handle.id,
+                    wal_pages = wal,
+                    checkpointed = done,
+                    "WAL checkpoint complete"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    palace = %handle.id,
+                    error = %e,
+                    "WAL checkpoint failed (non-fatal)"
+                );
+            }
+        }
+
         // Snapshot the run for the admin dashboard. Failures here are
         // non-fatal — the cycle itself succeeded, we just couldn't record it.
         if let Some(data_dir) = handle.data_dir.as_ref() {
