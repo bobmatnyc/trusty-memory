@@ -128,53 +128,30 @@ async fn main() -> Result<()> {
             let state = trusty_memory_mcp::AppState::new(data_root_for_state)
                 .with_default_palace(default_palace);
 
-            // Auto-start the Dreamer for every persisted palace so background
-            // consolidation runs while the daemon is alive.
-            //
-            // Why: Issue #21 — operators expect background dedup/prune/closet
-            // refresh without having to invoke a separate command. We discover
-            // every palace under data_root, open it, and spawn a per-palace
-            // dream loop with a shared shutdown signal so all loops terminate
-            // cleanly when the daemon stops.
-            // What: A `tokio::sync::watch::Sender<bool>` fans out shutdown to
-            // every spawned dream task; the join handles are kept so we can
-            // await them on exit (best-effort).
-            // Test: `dreamer_shutdown_terminates_loop` covers cancellation;
-            // discovery is exercised manually via `trusty-memory serve`.
+            // Shutdown fan-out for the Dreamer tasks. We create the channel
+            // up-front so we can hand the `shutdown_rx` to the background
+            // initializer (palaces are opened lazily after HTTP is up).
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-            let mut dream_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-            match cli::palace::data_root() {
-                Ok(root) => match trusty_memory_core::PalaceRegistry::list_palaces(&root) {
-                    Ok(palaces) => {
-                        let registry = trusty_memory_core::PalaceRegistry::new();
-                        for p in palaces {
-                            match registry.open_palace(&root, &p.id) {
-                                Ok(handle) => {
-                                    let dreamer = std::sync::Arc::new(
-                                        trusty_memory_core::dream::Dreamer::new(
-                                            trusty_memory_core::dream::DreamConfig::default(),
-                                        ),
-                                    );
-                                    dream_handles.push(
-                                        dreamer.start_with_shutdown(handle, shutdown_rx.clone()),
-                                    );
-                                }
-                                Err(e) => tracing::warn!(
-                                    palace = %p.id,
-                                    "failed to open palace for dreamer: {e:#}"
-                                ),
-                            }
-                        }
-                        tracing::info!(
-                            count = dream_handles.len(),
-                            "Dreamer started — background consolidation active"
-                        );
-                    }
-                    Err(e) => tracing::warn!("failed to enumerate palaces for Dreamer: {e:#}"),
-                },
-                Err(e) => tracing::warn!("failed to resolve data root for Dreamer: {e:#}"),
-            }
+            let dream_handles: std::sync::Arc<
+                tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+            > = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
+            // Spawn Dreamer initialization in the background AFTER the HTTP
+            // server binds (below). This avoids blocking startup on opening
+            // every palace's SQLite pool — with many (e.g. 71+) palaces the
+            // synchronous init pattern exhausts FDs or pool timeouts and
+            // crashes the daemon before HTTP can bind (issue #43).
+            //
+            // Why: Issue #43 — daemon crash-looped under launchd with 71
+            // palaces because every palace was opened sequentially before
+            // axum bound its socket. The HTTP server must come up first;
+            // background consolidation can warm up progressively.
+            // What: After HTTP binds, a single background task iterates
+            // palaces and yields between opens (50ms sleep) to stagger the
+            // SQLite pool creation. Each successfully opened palace spawns
+            // its dream loop immediately so consolidation begins ASAP.
+            // Test: `cargo test --workspace`; manual smoke via `make deploy`
+            // + `curl /health` immediately after launchctl start.
             let mut addr_written = false;
             let serve_result = if no_http {
                 // stdio-only — Claude Code hook path, no HTTP listener.
@@ -210,6 +187,63 @@ async fn main() -> Result<()> {
                     Err(e) => tracing::warn!("could not write daemon addr file: {e:#}"),
                 }
 
+                // Spawn Dreamer initialization *after* HTTP binds so the
+                // daemon is immediately healthy. Open palaces one-at-a-time
+                // with a small sleep between each to spread SQLite pool
+                // creation and avoid FD exhaustion on hosts with many
+                // palaces (issue #43).
+                let dream_handles_bg = dream_handles.clone();
+                let shutdown_rx_bg = shutdown_rx.clone();
+                tokio::spawn(async move {
+                    let root = match cli::palace::data_root() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(
+                                "failed to resolve data root for Dreamer: {e:#}"
+                            );
+                            return;
+                        }
+                    };
+                    let palaces = match trusty_memory_core::PalaceRegistry::list_palaces(&root) {
+                        Ok(ps) => ps,
+                        Err(e) => {
+                            tracing::warn!("failed to enumerate palaces for Dreamer: {e:#}");
+                            return;
+                        }
+                    };
+                    let total = palaces.len();
+                    tracing::info!(count = total, "Dreamer background init starting");
+                    let registry = trusty_memory_core::PalaceRegistry::new();
+                    let mut opened = 0usize;
+                    for p in palaces {
+                        match registry.open_palace(&root, &p.id) {
+                            Ok(handle) => {
+                                let dreamer = std::sync::Arc::new(
+                                    trusty_memory_core::dream::Dreamer::new(
+                                        trusty_memory_core::dream::DreamConfig::default(),
+                                    ),
+                                );
+                                let jh = dreamer
+                                    .start_with_shutdown(handle, shutdown_rx_bg.clone());
+                                dream_handles_bg.lock().await.push(jh);
+                                opened += 1;
+                            }
+                            Err(e) => tracing::warn!(
+                                palace = %p.id,
+                                "failed to open palace for dreamer: {e:#}"
+                            ),
+                        }
+                        // Stagger SQLite pool creation to avoid FD pressure.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        tokio::task::yield_now().await;
+                    }
+                    tracing::info!(
+                        opened,
+                        total,
+                        "Dreamer background init complete — consolidation active"
+                    );
+                });
+
                 tokio::select! {
                     r = trusty_memory_mcp::run_stdio(state.clone()) => r,
                     r = trusty_memory_mcp::run_http_on(state, listener) => r,
@@ -222,7 +256,11 @@ async fn main() -> Result<()> {
 
             // Signal every dream task to exit and wait briefly for cleanup.
             let _ = shutdown_tx.send(true);
-            for jh in dream_handles {
+            let handles = {
+                let mut guard = dream_handles.lock().await;
+                std::mem::take(&mut *guard)
+            };
+            for jh in handles {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(2), jh).await;
             }
 

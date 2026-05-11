@@ -878,10 +878,13 @@ async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>)
 /// Test: `providers_endpoint_returns_payload`.
 async fn list_providers(State(state): State<AppState>) -> Json<Value> {
     let cfg = load_user_config().unwrap_or_default();
-    let ollama_available =
-        trusty_common::auto_detect_local_provider(&cfg.local_model)
+    let ollama_available = if cfg.local_model.enabled {
+        trusty_common::auto_detect_local_provider(&cfg.local_model.base_url)
             .await
-            .is_some();
+            .is_some()
+    } else {
+        false
+    };
     let openrouter_available = !cfg.openrouter_api_key.is_empty();
     let active = state.chat_provider().await.map(|p| p.name().to_string());
     Json(json!({
