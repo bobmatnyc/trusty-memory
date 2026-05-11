@@ -20,6 +20,7 @@ pub mod config;
 pub mod convert;
 pub mod dashboard;
 pub mod decay;
+pub mod doctor;
 pub mod dream;
 pub mod git;
 pub mod hooks;
@@ -27,6 +28,8 @@ pub mod kg;
 pub mod kuzu;
 pub mod memory;
 pub mod output;
+pub mod start;
+pub mod stop;
 
 pub use memory::{handle_forget, handle_list, handle_recall, handle_remember};
 pub mod palace;
@@ -266,9 +269,40 @@ pub enum Commands {
 
     /// Open the HTTP admin dashboard in your browser.
     #[command(
-        after_help = "Examples:\n  trusty-memory dashboard\n\nRequires `trusty-memory serve` to be running (reads trusty-memory's data-dir discovery file)."
+        alias = "dash",
+        after_help = "Examples:\n  trusty-memory dashboard\n  trusty-memory dash\n\nRequires `trusty-memory serve` to be running (reads trusty-memory's data-dir discovery file)."
     )]
     Dashboard,
+
+    /// Start the daemon in the background (detached process).
+    ///
+    /// If the daemon is already running, exits silently with status 0. Spawns
+    /// `trusty-memory serve` with detached stdio, then polls the discovery file
+    /// until the daemon reports its bound address (up to 5 s).
+    #[command(
+        after_help = "Examples:\n  trusty-memory start\n  trusty-memory start --http 127.0.0.1:3031"
+    )]
+    Start {
+        /// HTTP bind address (forwarded to `serve`). Prefers 3031; auto-increments
+        /// on conflict (up to +20).
+        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:3031")]
+        http: SocketAddr,
+    },
+
+    /// Stop the running background daemon.
+    ///
+    /// Reads the PID file written by `serve`, sends SIGTERM, then waits up to
+    /// 5 s for the discovery file to disappear as a signal of clean shutdown.
+    #[command(after_help = "Examples:\n  trusty-memory stop")]
+    Stop,
+
+    /// Diagnose daemon health, configuration, and palace registry.
+    ///
+    /// Runs a set of independent checks and prints ✓ / ⚠ / ✗ for each.
+    /// Exit code 0 when all checks pass or only warnings; exit code 1 when
+    /// any error is found.
+    #[command(after_help = "Examples:\n  trusty-memory doctor")]
+    Doctor,
 
     /// Generate shell completions.
     #[command(

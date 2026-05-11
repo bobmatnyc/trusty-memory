@@ -44,7 +44,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tower = { version = "0.4", features = ["util"] }
 trusty-mcp-core = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-mcp-core-v0.1.0" }
 trusty-embedder = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-embedder-v0.1.0" }
-trusty-common = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-common-v0.1.2", features = ["axum-server"] }
+trusty-common = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-common-v0.3.2", features = ["axum-server"] }
 
 # Local-development override: point the trusty-common workspace at the
 # sibling checkout so unreleased changes (e.g. `server::with_standard_middleware`,

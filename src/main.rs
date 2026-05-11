@@ -187,6 +187,14 @@ async fn main() -> Result<()> {
                     Err(e) => tracing::warn!("could not write daemon addr file: {e:#}"),
                 }
 
+                // Write a PID file alongside the addr file so `trusty-memory stop`
+                // can find this process. Best-effort; failure is logged but
+                // does not abort the daemon (a missing PID file just means
+                // `stop` will print a friendly "no daemon running" message).
+                if let Err(e) = cli::stop::write_pid_file(std::process::id()) {
+                    tracing::warn!("could not write daemon pid file: {e:#}");
+                }
+
                 // Spawn Dreamer initialization *after* HTTP binds so the
                 // daemon is immediately healthy. Open palaces one-at-a-time
                 // with a small sleep between each to spread SQLite pool
@@ -264,13 +272,14 @@ async fn main() -> Result<()> {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(2), jh).await;
             }
 
-            // Remove addr file so stale addresses don't mislead callers after
-            // shutdown. Best-effort — not fatal if the file is already gone.
+            // Remove addr + pid files so stale state doesn't mislead callers
+            // after shutdown. Best-effort — not fatal if files are already gone.
             if addr_written {
                 if let Ok(dir) = trusty_common::resolve_data_dir("trusty-memory") {
                     let _ = std::fs::remove_file(dir.join("http_addr"));
                 }
             }
+            let _ = cli::stop::remove_pid_file();
 
             serve_result?;
         }
@@ -378,6 +387,12 @@ async fn main() -> Result<()> {
         }
 
         Commands::Dashboard => cli::dashboard::handle(&out).await?,
+
+        Commands::Start { http } => cli::start::handle(http, &out).await?,
+
+        Commands::Stop => cli::stop::handle(&out).await?,
+
+        Commands::Doctor => cli::doctor::handle(&out).await?,
 
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
