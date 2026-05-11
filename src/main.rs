@@ -36,6 +36,15 @@ async fn main() -> Result<()> {
         no_color: cli.no_color,
     };
 
+    // For all commands except server lifecycle commands, ensure the daemon
+    // is running so the web admin panel and dream cycle are always active.
+    if !matches!(
+        &cli.command,
+        Commands::Serve { .. } | Commands::Service(_) | Commands::Setup { .. }
+    ) {
+        ensure_daemon().await;
+    }
+
     match cli.command {
         Commands::Remember {
             text,
@@ -355,7 +364,6 @@ async fn main() -> Result<()> {
 /// path so `main` can remove it on shutdown.
 /// Test: covered manually via `trusty-memory serve` followed by
 /// `cat ~/.trusty-memory/http_addr`.
-
 fn write_http_addr(addr: &std::net::SocketAddr) -> Result<PathBuf> {
     let dir = dirs::home_dir()
         .context("home dir not found")?
@@ -364,4 +372,58 @@ fn write_http_addr(addr: &std::net::SocketAddr) -> Result<PathBuf> {
     let path = dir.join("http_addr");
     std::fs::write(&path, addr.to_string()).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
+}
+
+/// Ensure the HTTP daemon is running. Spawns it detached if not, waits up to
+/// 5 s. Silent on success; prints one warning line on timeout.
+///
+/// Why: trusty-memory is a server-based system — the daemon (web UI, dream
+/// cycle, MCP HTTP) should always be running whenever any CLI command is used.
+/// What: Probes `~/.trusty-memory/http_addr`; if the daemon is absent, spawns
+/// `trusty-memory serve` with null stdio so it runs independently of the
+/// calling terminal, then polls every 200 ms until ready or 5 s elapsed.
+/// Test: Covered by manual smoke; unit-testing a background spawn requires
+/// process isolation that is out of scope for a unit suite.
+async fn ensure_daemon() {
+    if daemon_alive() {
+        return;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = std::process::Command::new(&exe)
+            .arg("serve")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if daemon_alive() {
+            return;
+        }
+    }
+    eprintln!("[warn] daemon did not start within 5 s; proceeding without HTTP server");
+}
+
+/// Returns true if `~/.trusty-memory/http_addr` contains an address that
+/// accepts a TCP connection within 300 ms.
+fn daemon_alive() -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    let path = home.join(".trusty-memory").join("http_addr");
+    let Ok(s) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let addr = s.trim().to_string();
+    if addr.is_empty() {
+        return false;
+    }
+    addr.parse::<std::net::SocketAddr>()
+        .ok()
+        .and_then(|sa| {
+            std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(300)).ok()
+        })
+        .is_some()
 }
