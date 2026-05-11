@@ -14,8 +14,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tracing::info;
+use trusty_common::ChatProvider;
 use trusty_mcp_core::{error_codes, initialize_response, Request, Response};
 use trusty_memory_core::embed::FastEmbedder;
+use trusty_memory_core::store::ChatSessionStore;
 use trusty_memory_core::PalaceRegistry;
 
 pub mod tools;
@@ -42,6 +44,13 @@ pub struct AppState {
     /// Optional default palace applied to MCP tool calls when the caller
     /// omits the `palace` argument. Set via `trusty-memory serve --palace`.
     pub default_palace: Option<String>,
+    /// Active chat provider selected at startup. `None` means no upstream is
+    /// configured (no Ollama detected and no OpenRouter key) — callers must
+    /// degrade gracefully (chat endpoint returns 412).
+    pub chat_provider: Arc<OnceCell<Option<Arc<dyn ChatProvider>>>>,
+    /// Per-palace chat-session stores, opened lazily so cold-start cost is
+    /// paid only when chat-history endpoints are hit.
+    pub session_stores: Arc<dashmap::DashMap<String, Arc<ChatSessionStore>>>,
 }
 
 impl AppState {
@@ -62,7 +71,32 @@ impl AppState {
             data_root,
             embedder: Arc::new(OnceCell::new()),
             default_palace: None,
+            chat_provider: Arc::new(OnceCell::new()),
+            session_stores: Arc::new(dashmap::DashMap::new()),
         }
+    }
+
+    /// Open (or return cached) the chat-session store for a palace.
+    ///
+    /// Why: Chat session persistence lives in a dedicated SQLite file under
+    /// the palace's data dir (`chat_sessions.db`) so it doesn't intermingle
+    /// with the KG's transactional load. The store is cheap to clone via
+    /// `Arc` but the underlying r2d2 pool should be reused, so cache by id.
+    /// What: Creates the palace data dir if missing, opens (or reuses) a
+    /// `ChatSessionStore` and stashes an `Arc` in the DashMap.
+    /// Test: Indirectly via the session HTTP handlers in `web::tests`.
+    pub fn session_store(&self, palace_id: &str) -> Result<Arc<ChatSessionStore>> {
+        if let Some(entry) = self.session_stores.get(palace_id) {
+            return Ok(entry.clone());
+        }
+        let dir = self.data_root.join(palace_id);
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            anyhow::anyhow!("create palace dir {}: {e}", dir.display())
+        })?;
+        let store = Arc::new(ChatSessionStore::open(&dir.join("chat_sessions.db"))?);
+        self.session_stores
+            .insert(palace_id.to_string(), store.clone());
+        Ok(store)
     }
 
     /// Builder-style setter for the default palace name.
@@ -86,6 +120,39 @@ impl AppState {
     /// What: Returns `Arc<FastEmbedder>` on success. Errors propagate from the
     /// underlying ONNX load.
     /// Test: Indirectly via `dispatch_remember_then_recall`.
+    /// Resolve the active chat provider, auto-detecting on first call.
+    ///
+    /// Why: Provider selection depends on filesystem-loaded config plus a
+    /// network probe (Ollama liveness), so it must be lazily initialised at
+    /// runtime. Caching the choice in a `OnceCell` keeps it stable across
+    /// concurrent requests without re-probing on every chat call.
+    /// What: On first use loads `~/.trusty-memory/config.toml`, prefers an
+    /// auto-detected Ollama instance (when `local_model.enabled`), and falls
+    /// back to OpenRouter when an API key is set. Returns `Ok(None)` when
+    /// neither is available so the caller can emit a 412.
+    /// Test: `web::tests::providers_endpoint_returns_payload` covers the
+    /// detection path indirectly through `/api/v1/chat/providers`.
+    pub async fn chat_provider(&self) -> Option<Arc<dyn ChatProvider>> {
+        self.chat_provider
+            .get_or_init(|| async {
+                let cfg = crate::web::load_user_config().unwrap_or_default();
+                if let Some(p) =
+                    trusty_common::auto_detect_local_provider(&cfg.local_model).await
+                {
+                    return Some(Arc::new(p) as Arc<dyn ChatProvider>);
+                }
+                if !cfg.openrouter_api_key.is_empty() {
+                    return Some(Arc::new(trusty_common::OpenRouterProvider::new(
+                        cfg.openrouter_api_key,
+                        cfg.openrouter_model,
+                    )) as Arc<dyn ChatProvider>);
+                }
+                None
+            })
+            .await
+            .clone()
+    }
+
     pub async fn embedder(&self) -> Result<Arc<FastEmbedder>> {
         let cell = self.embedder.clone();
         let embedder = cell

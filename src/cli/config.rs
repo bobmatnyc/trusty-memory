@@ -12,6 +12,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use trusty_common::LocalModelConfig;
 
 /// Default OpenRouter model used when the user hasn't picked one.
 pub const DEFAULT_OPENROUTER_MODEL: &str = "anthropic/claude-3-5-sonnet";
@@ -59,11 +60,25 @@ impl Default for OpenRouterConfig {
 }
 
 /// Top-level user config persisted at `~/.trusty-memory/config.toml`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UserConfig {
     #[serde(default)]
     pub openrouter: OpenRouterConfig,
+    /// `[local_model]` table — Ollama / LM Studio / llama.cpp server config.
+    #[serde(default)]
+    pub local_model: LocalModelConfig,
 }
+
+impl PartialEq for UserConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.openrouter == other.openrouter
+            && self.local_model.enabled == other.local_model.enabled
+            && self.local_model.base_url == other.local_model.base_url
+            && self.local_model.model == other.local_model.model
+    }
+}
+
+impl Eq for UserConfig {}
 
 impl UserConfig {
     /// Load from the default path.
@@ -121,6 +136,13 @@ impl UserConfig {
                     .with_context(|| format!("parse usize for {key}"))?;
             }
             "openrouter.system_prompt" => self.openrouter.system_prompt = value.to_string(),
+            "local_model.enabled" => {
+                self.local_model.enabled = value
+                    .parse()
+                    .with_context(|| format!("parse bool for {key}"))?;
+            }
+            "local_model.base_url" => self.local_model.base_url = value.to_string(),
+            "local_model.model" => self.local_model.model = value.to_string(),
             other => anyhow::bail!("unknown config key: {other}"),
         }
         Ok(())

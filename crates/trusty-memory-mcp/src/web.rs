@@ -76,6 +76,15 @@ pub fn router() -> Router<AppState> {
         .route("/api/v1/dream/status", get(dream_status))
         .route("/api/v1/dream/run", post(dream_run))
         .route("/api/v1/chat", post(chat_handler))
+        .route("/api/v1/chat/providers", get(list_providers))
+        .route(
+            "/api/v1/palaces/{id}/chat/sessions",
+            get(list_chat_sessions).post(create_chat_session),
+        )
+        .route(
+            "/api/v1/palaces/{id}/chat/sessions/{session_id}",
+            get(get_chat_session).delete(delete_chat_session),
+        )
         .route("/health", get(|| async { "ok" }))
         .fallback(static_handler);
 
@@ -180,6 +189,8 @@ async fn config(State(state): State<AppState>) -> Json<ConfigPayload> {
 struct UserConfigMin {
     #[serde(default)]
     openrouter: OpenRouterMin,
+    #[serde(default)]
+    local_model: LocalModelMin,
     // Carry forward unknown sections by ignoring them on parse.
 }
 
@@ -191,20 +202,58 @@ struct OpenRouterMin {
     model: String,
 }
 
-#[derive(Default, Clone)]
-struct LoadedUserConfig {
-    openrouter_api_key: String,
-    openrouter_model: String,
+#[derive(Deserialize, Clone)]
+struct LocalModelMin {
+    #[serde(default = "default_local_enabled")]
+    enabled: bool,
+    #[serde(default = "default_local_base_url")]
+    base_url: String,
+    #[serde(default = "default_local_model")]
+    model: String,
 }
 
-fn load_user_config() -> Option<LoadedUserConfig> {
+fn default_local_enabled() -> bool {
+    true
+}
+fn default_local_base_url() -> String {
+    "http://localhost:11434".to_string()
+}
+fn default_local_model() -> String {
+    "llama3.2".to_string()
+}
+
+impl Default for LocalModelMin {
+    fn default() -> Self {
+        Self {
+            enabled: default_local_enabled(),
+            base_url: default_local_base_url(),
+            model: default_local_model(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct LoadedUserConfig {
+    pub(crate) openrouter_api_key: String,
+    pub(crate) openrouter_model: String,
+    pub(crate) local_model: trusty_common::LocalModelConfig,
+}
+
+impl Default for LoadedUserConfig {
+    fn default() -> Self {
+        Self {
+            openrouter_api_key: String::new(),
+            openrouter_model: "anthropic/claude-3-5-sonnet".to_string(),
+            local_model: trusty_common::LocalModelConfig::default(),
+        }
+    }
+}
+
+pub(crate) fn load_user_config() -> Option<LoadedUserConfig> {
     let home = dirs::home_dir()?;
     let path = home.join(".trusty-memory").join("config.toml");
     if !path.exists() {
-        return Some(LoadedUserConfig {
-            openrouter_api_key: String::new(),
-            openrouter_model: "anthropic/claude-3-5-sonnet".to_string(),
-        });
+        return Some(LoadedUserConfig::default());
     }
     let raw = std::fs::read_to_string(&path).ok()?;
     let parsed: UserConfigMin = toml::from_str(&raw).unwrap_or_default();
@@ -216,6 +265,11 @@ fn load_user_config() -> Option<LoadedUserConfig> {
     Some(LoadedUserConfig {
         openrouter_api_key: parsed.openrouter.api_key,
         openrouter_model: model,
+        local_model: trusty_common::LocalModelConfig {
+            enabled: parsed.local_model.enabled,
+            base_url: parsed.local_model.base_url,
+            model: parsed.local_model.model,
+        },
     })
 }
 
@@ -621,26 +675,71 @@ struct ChatBody {
     message: String,
     #[serde(default)]
     history: Vec<ChatMessage>,
+    /// Optional existing chat-session id; when provided we load+append+save.
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>) -> Response {
-    let cfg = match load_user_config() {
-        Some(c) if !c.openrouter_api_key.is_empty() => c,
-        _ => {
-            return (
-                StatusCode::PRECONDITION_FAILED,
-                "OpenRouter API key not configured",
-            )
-                .into_response();
-        }
+    // Select the active provider (Ollama auto-detect, else OpenRouter).
+    let Some(provider) = state.chat_provider().await else {
+        return (
+            StatusCode::PRECONDITION_FAILED,
+            "No chat provider configured (no local Ollama detected and no OpenRouter key set)",
+        )
+            .into_response();
     };
 
-    // Pull recall context from the named (or default) palace.
+    // Resolve palace id (explicit > default).
     let palace_id = body
         .palace_id
+        .clone()
         .or_else(|| state.default_palace.clone())
         .unwrap_or_default();
 
+    // Resolve / create chat session when a palace is bound.
+    let (session_id, mut history): (Option<String>, Vec<ChatMessage>) = if !palace_id.is_empty() {
+        let store = match state.session_store(&palace_id) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(palace = %palace_id, "session_store open failed: {e:#}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("session store: {e:#}"),
+                )
+                    .into_response();
+            }
+        };
+        match body.session_id.clone() {
+            Some(sid) => match store.get_session(&sid) {
+                Ok(Some(s)) => (
+                    Some(sid),
+                    s.history
+                        .into_iter()
+                        .map(|m| ChatMessage {
+                            role: m.role,
+                            content: m.content,
+                        })
+                        .collect(),
+                ),
+                _ => (Some(sid), body.history.clone()),
+            },
+            None => {
+                let new_id = store.create_session(None).unwrap_or_else(|e| {
+                    tracing::warn!("create_session failed: {e:#}");
+                    String::new()
+                });
+                (
+                    if new_id.is_empty() { None } else { Some(new_id) },
+                    body.history.clone(),
+                )
+            }
+        }
+    } else {
+        (None, body.history.clone())
+    };
+
+    // Pull recall context from the named (or default) palace.
     let mut context = String::new();
     if !palace_id.is_empty() {
         if let Ok(handle) = state
@@ -664,38 +763,51 @@ async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>)
         )
     };
 
-    let mut messages: Vec<ChatMessage> = Vec::with_capacity(body.history.len() + 2);
-    messages.push(ChatMessage {
-        role: "system".to_string(),
-        content: system,
-    });
-    messages.extend(body.history.iter().cloned());
-    messages.push(ChatMessage {
+    // Append the new user message to the in-memory history we'll persist.
+    history.push(ChatMessage {
         role: "user".to_string(),
         content: body.message.clone(),
     });
 
-    // Bridge trusty-common's plain-delta stream into the SSE wire format the
-    // browser client expects: `data: {"delta": "..."}\n\n` per token, plus a
-    // terminating `data: [DONE]\n\n`. The shared helper owns the upstream
-    // OpenRouter request, retry-friendly timeouts, and SSE frame parsing — we
-    // only re-wrap the deltas for our public endpoint contract.
+    let mut messages: Vec<ChatMessage> = Vec::with_capacity(history.len() + 1);
+    messages.push(ChatMessage {
+        role: "system".to_string(),
+        content: system,
+    });
+    messages.extend(history.iter().cloned());
+
     let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(32);
     let (sse_tx, sse_rx) =
         tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
 
-    let api_key = cfg.openrouter_api_key.clone();
-    let model = cfg.openrouter_model.clone();
+    // Task A: drive the provider's stream into the delta channel.
+    let stream_task = tokio::spawn(async move { provider.chat_stream(messages, delta_tx).await });
 
-    // Task A: run the OpenRouter stream into the delta channel.
-    let stream_task = tokio::spawn(async move {
-        trusty_common::openrouter_chat_stream(&api_key, &model, messages, delta_tx).await
-    });
+    // Capture session-persistence inputs for Task B.
+    let session_store = if !palace_id.is_empty() && session_id.is_some() {
+        state.session_store(&palace_id).ok()
+    } else {
+        None
+    };
+    let persist_session_id = session_id.clone();
 
-    // Task B: drain deltas, re-emit SSE frames, then signal [DONE].
+    // Task B: emit a leading session_id frame, drain deltas, persist final
+    // history, terminate with `data: [DONE]`.
     let sse_forward_tx = sse_tx.clone();
     tokio::spawn(async move {
+        if let Some(sid) = persist_session_id.as_deref() {
+            let frame = format!("data: {}\n\n", json!({ "session_id": sid }));
+            if sse_forward_tx
+                .send(Ok(axum::body::Bytes::from(frame)))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        let mut assistant_buf = String::new();
         while let Some(delta) = delta_rx.recv().await {
+            assistant_buf.push_str(&delta);
             let frame = format!("data: {}\n\n", json!({ "delta": delta }));
             if sse_forward_tx
                 .send(Ok(axum::body::Bytes::from(frame)))
@@ -705,7 +817,28 @@ async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>)
                 return;
             }
         }
-        match stream_task.await {
+        let stream_result = stream_task.await;
+        // Persist the completed conversation regardless of streaming error
+        // (partial assistant reply still better than nothing).
+        if let (Some(store), Some(sid)) = (session_store, persist_session_id.as_deref()) {
+            if !assistant_buf.is_empty() {
+                history.push(ChatMessage {
+                    role: "assistant".into(),
+                    content: assistant_buf,
+                });
+            }
+            let core_history: Vec<trusty_memory_core::store::chat_sessions::ChatMessage> = history
+                .iter()
+                .map(|m| trusty_memory_core::store::chat_sessions::ChatMessage {
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                })
+                .collect();
+            if let Err(e) = store.upsert_session(sid, &core_history) {
+                tracing::warn!("upsert_session failed: {e:#}");
+            }
+        }
+        match stream_result {
             Ok(Ok(())) => {
                 let _ = sse_forward_tx
                     .send(Ok(axum::body::Bytes::from("data: [DONE]\n\n")))
@@ -729,6 +862,104 @@ async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>)
         .header("Cache-Control", "no-cache")
         .body(Body::from_stream(stream))
         .expect("static SSE response builds")
+}
+
+// ---------------------------------------------------------------------------
+// Providers + sessions
+// ---------------------------------------------------------------------------
+
+/// GET /api/v1/chat/providers — report provider availability + active choice.
+///
+/// Why: The UI's chat panel surfaces whether the user has a local model
+/// running or is hitting OpenRouter. Probing both upstreams here keeps that
+/// logic on the server so the SPA stays dumb.
+/// What: Calls `auto_detect_local_provider` (1s timeout) for Ollama and checks
+/// for a non-empty OpenRouter key. Returns shape `{providers:[...], active}`.
+/// Test: `providers_endpoint_returns_payload`.
+async fn list_providers(State(state): State<AppState>) -> Json<Value> {
+    let cfg = load_user_config().unwrap_or_default();
+    let ollama_available =
+        trusty_common::auto_detect_local_provider(&cfg.local_model)
+            .await
+            .is_some();
+    let openrouter_available = !cfg.openrouter_api_key.is_empty();
+    let active = state.chat_provider().await.map(|p| p.name().to_string());
+    Json(json!({
+        "providers": [
+            {
+                "name": "ollama",
+                "model": cfg.local_model.model,
+                "available": ollama_available,
+            },
+            {
+                "name": "openrouter",
+                "model": cfg.openrouter_model,
+                "available": openrouter_available,
+            }
+        ],
+        "active": active,
+    }))
+}
+
+#[derive(Deserialize, Default)]
+struct CreateSessionBody {
+    #[serde(default)]
+    title: Option<String>,
+}
+
+async fn create_chat_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    body: Option<Json<CreateSessionBody>>,
+) -> Result<Json<Value>, ApiError> {
+    let store = state
+        .session_store(&id)
+        .map_err(|e| ApiError::internal(format!("session store: {e:#}")))?;
+    let title = body.and_then(|b| b.0.title);
+    let sid = store
+        .create_session(title)
+        .map_err(|e| ApiError::internal(format!("create session: {e:#}")))?;
+    Ok(Json(json!({ "id": sid })))
+}
+
+async fn list_chat_sessions(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let store = state
+        .session_store(&id)
+        .map_err(|e| ApiError::internal(format!("session store: {e:#}")))?;
+    let metas = store
+        .list_sessions()
+        .map_err(|e| ApiError::internal(format!("list sessions: {e:#}")))?;
+    Ok(Json(serde_json::to_value(metas).unwrap_or(json!([]))))
+}
+
+async fn get_chat_session(
+    State(state): State<AppState>,
+    AxumPath((id, session_id)): AxumPath<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let store = state
+        .session_store(&id)
+        .map_err(|e| ApiError::internal(format!("session store: {e:#}")))?;
+    let s = store
+        .get_session(&session_id)
+        .map_err(|e| ApiError::internal(format!("get session: {e:#}")))?
+        .ok_or_else(|| ApiError::not_found(format!("session not found: {session_id}")))?;
+    Ok(Json(serde_json::to_value(s).unwrap_or(json!({}))))
+}
+
+async fn delete_chat_session(
+    State(state): State<AppState>,
+    AxumPath((id, session_id)): AxumPath<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let store = state
+        .session_store(&id)
+        .map_err(|e| ApiError::internal(format!("session store: {e:#}")))?;
+    store
+        .delete_session(&session_id)
+        .map_err(|e| ApiError::internal(format!("delete session: {e:#}")))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------------------
@@ -914,6 +1145,135 @@ mod tests {
         assert!(v["last_run_at"].is_null());
         assert_eq!(v["merged"], 0);
         assert_eq!(v["pruned"], 0);
+    }
+
+    /// Why: `/api/v1/chat/providers` must return a well-shaped payload even
+    /// when no provider is available, so the SPA can render disabled states
+    /// without special-casing missing fields.
+    /// What: Hit the endpoint on a fresh state; assert it returns `providers`
+    /// (an array of length 2) and an `active` field (possibly null).
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn providers_endpoint_returns_payload() {
+        let state = test_state();
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/chat/providers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let arr = v["providers"].as_array().expect("providers array");
+        assert_eq!(arr.len(), 2);
+        let names: Vec<&str> = arr.iter().filter_map(|p| p["name"].as_str()).collect();
+        assert!(names.contains(&"ollama"));
+        assert!(names.contains(&"openrouter"));
+        // `active` may be null when no provider is configured/reachable.
+        assert!(v.get("active").is_some());
+    }
+
+    /// Why: Chat-session CRUD must round-trip end-to-end through the HTTP
+    /// surface — create returns an id, list shows it, get returns the
+    /// (empty) history, delete removes it.
+    /// What: Create a palace, then exercise the four session endpoints
+    /// sequentially, asserting JSON shapes at each step.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn chat_session_crud_round_trip() {
+        let state = test_state();
+        // Pre-create a palace dir so session store has a place to live.
+        let palace = trusty_memory_core::Palace {
+            id: PalaceId::new("sess-test"),
+            name: "sess-test".to_string(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            data_dir: state.data_root.join("sess-test"),
+        };
+        state
+            .registry
+            .create_palace(&state.data_root, palace)
+            .expect("create_palace");
+        let app = router().with_state(state);
+
+        // Create
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/palaces/sess-test/chat/sessions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"title":"first chat"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let sid = v["id"].as_str().expect("session id").to_string();
+
+        // List
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/palaces/sess-test/chat/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let arr = v.as_array().expect("array");
+        assert!(arr.iter().any(|s| s["id"] == sid));
+
+        // Get
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/palaces/sess-test/chat/sessions/{sid}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Delete
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/v1/palaces/sess-test/chat/sessions/{sid}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Get after delete -> 404
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/palaces/sess-test/chat/sessions/{sid}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

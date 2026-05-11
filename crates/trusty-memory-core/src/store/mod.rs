@@ -6,12 +6,14 @@
 //! What: Re-exports `VectorStore` trait and `KnowledgeGraph` type.
 //! Test: See submodule tests.
 
+pub mod chat_sessions;
 pub mod kg;
 pub mod kuzu;
 pub mod l1_cache;
 pub mod palace_store;
 pub mod vector;
 
+pub use chat_sessions::{ChatSession, ChatSessionMeta, ChatSessionStore};
 pub use kg::{KnowledgeGraph, Triple};
 pub use l1_cache::{L1Cache, L1CacheError};
 pub use palace_store::{PalaceStore, PalaceStoreError};
