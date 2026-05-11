@@ -46,6 +46,16 @@ trusty-mcp-core = { git = "https://github.com/bobmatnyc/trusty-common", tag = "t
 trusty-embedder = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-embedder-v0.1.0" }
 trusty-common = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-common-v0.1.2" }
 
+# Local-development override: point the trusty-common workspace at the
+# sibling checkout so unreleased changes (e.g. `server::with_standard_middleware`,
+# `write_daemon_addr`) can be consumed without publishing/tagging. The git
+# dependency declarations above remain authoritative for downstream releases —
+# [patch] only takes effect when this workspace is built directly.
+[patch."https://github.com/bobmatnyc/trusty-common"]
+trusty-common = { path = "../trusty-common/crates/trusty-common" }
+trusty-embedder = { path = "../trusty-common/crates/trusty-embedder" }
+trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core" }
+
 [package]
 name = "trusty-memory"
 version = "0.1.19"

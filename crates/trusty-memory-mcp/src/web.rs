@@ -22,8 +22,9 @@ use axum::{
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
+use trusty_common::ChatMessage;
 use trusty_memory_core::dream::{DreamConfig, Dreamer, PersistedDreamStats};
 use trusty_memory_core::palace::{Palace, PalaceId, RoomType};
 use trusty_memory_core::retrieval::{
@@ -49,6 +50,11 @@ struct WebAssets;
 /// What: All API routes under `/api/v1`, fallback to the SPA shell.
 /// Test: `serves_index_html` and `status_endpoint_returns_payload`.
 pub fn router() -> Router<AppState> {
+    // NOTE: cannot use `trusty_common::server::with_standard_middleware` here
+    // because trusty-memory pins axum 0.7 / tower-http 0.5, whereas trusty-common
+    // is built against axum 0.8 / tower-http 0.6. Bumping the axum stack here
+    // is a separate, larger change (every handler signature is affected).
+    // Keep the local CORS + Trace stack until the axum upgrade lands.
     use tower_http::cors::CorsLayer;
     use tower_http::trace::TraceLayer;
 
@@ -618,12 +624,6 @@ struct ChatBody {
     history: Vec<ChatMessage>,
 }
 
-#[derive(Deserialize, Serialize, Clone)]
-struct ChatMessage {
-    role: String,
-    content: String,
-}
-
 async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>) -> Response {
     let cfg = match load_user_config() {
         Some(c) if !c.openrouter_api_key.is_empty() => c,
@@ -656,7 +656,6 @@ async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>)
         }
     }
 
-    let mut messages: Vec<HashMap<&str, String>> = Vec::new();
     let system = if context.is_empty() {
         "You are trusty-memory's assistant.".to_string()
     } else {
@@ -665,103 +664,66 @@ async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>)
              as context when relevant:\n{context}"
         )
     };
-    messages.push(HashMap::from([
-        ("role", "system".to_string()),
-        ("content", system),
-    ]));
-    for m in &body.history {
-        messages.push(HashMap::from([
-            ("role", m.role.clone()),
-            ("content", m.content.clone()),
-        ]));
-    }
-    messages.push(HashMap::from([
-        ("role", "user".to_string()),
-        ("content", body.message.clone()),
-    ]));
 
-    let payload = json!({
-        "model": cfg.openrouter_model,
-        "messages": messages,
-        "stream": true,
+    let mut messages: Vec<ChatMessage> = Vec::with_capacity(body.history.len() + 2);
+    messages.push(ChatMessage {
+        role: "system".to_string(),
+        content: system,
+    });
+    messages.extend(body.history.iter().cloned());
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: body.message.clone(),
     });
 
-    let client = reqwest::Client::new();
-    let or_resp = match client
-        .post("https://openrouter.ai/api/v1/chat/completions")
-        .bearer_auth(&cfg.openrouter_api_key)
-        .header("HTTP-Referer", "https://github.com/bobmatnyc/trusty-memory")
-        .header("X-Title", "trusty-memory")
-        .json(&payload)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                format!("openrouter request failed: {e}"),
-            )
-                .into_response();
-        }
-    };
+    // Bridge trusty-common's plain-delta stream into the SSE wire format the
+    // browser client expects: `data: {"delta": "..."}\n\n` per token, plus a
+    // terminating `data: [DONE]\n\n`. The shared helper owns the upstream
+    // OpenRouter request, retry-friendly timeouts, and SSE frame parsing — we
+    // only re-wrap the deltas for our public endpoint contract.
+    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(32);
+    let (sse_tx, sse_rx) =
+        tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
 
-    if !or_resp.status().is_success() {
-        let status = or_resp.status();
-        let body_text = or_resp.text().await.unwrap_or_default();
-        return (StatusCode::BAD_GATEWAY, format!("{status}: {body_text}")).into_response();
-    }
+    let api_key = cfg.openrouter_api_key.clone();
+    let model = cfg.openrouter_model.clone();
 
-    // Bridge OpenRouter's SSE -> our SSE through a channel. Spawning a task
-    // keeps the HTTP handler simple and avoids pulling in `async-stream`.
-    use futures::stream::StreamExt;
-    let mut upstream = or_resp.bytes_stream();
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(32);
+    // Task A: run the OpenRouter stream into the delta channel.
+    let stream_task = tokio::spawn(async move {
+        trusty_common::openrouter_chat_stream(&api_key, &model, messages, delta_tx).await
+    });
 
+    // Task B: drain deltas, re-emit SSE frames, then signal [DONE].
+    let sse_forward_tx = sse_tx.clone();
     tokio::spawn(async move {
-        let mut buffer = String::new();
-        while let Some(chunk) = upstream.next().await {
-            match chunk {
-                Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
-                    while let Some(idx) = buffer.find("\n\n") {
-                        let frame: String = buffer.drain(..idx + 2).collect();
-                        for line in frame.lines() {
-                            let Some(data) = line.strip_prefix("data:") else {
-                                continue;
-                            };
-                            let data = data.trim();
-                            if data == "[DONE]" {
-                                let _ = tx
-                                    .send(Ok(axum::body::Bytes::from("data: [DONE]\n\n")))
-                                    .await;
-                                continue;
-                            }
-                            if let Ok(parsed) = serde_json::from_str::<Value>(data) {
-                                if let Some(delta) = parsed
-                                    .get("choices")
-                                    .and_then(|c| c.get(0))
-                                    .and_then(|c| c.get("delta"))
-                                    .and_then(|d| d.get("content"))
-                                    .and_then(|s| s.as_str())
-                                {
-                                    let out = format!("data: {}\n\n", json!({ "delta": delta }));
-                                    let _ = tx.send(Ok(axum::body::Bytes::from(out))).await;
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    let out = format!("data: {}\n\n", json!({ "error": e.to_string() }));
-                    let _ = tx.send(Ok(axum::body::Bytes::from(out))).await;
-                    break;
-                }
+        while let Some(delta) = delta_rx.recv().await {
+            let frame = format!("data: {}\n\n", json!({ "delta": delta }));
+            if sse_forward_tx
+                .send(Ok(axum::body::Bytes::from(frame)))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        match stream_task.await {
+            Ok(Ok(())) => {
+                let _ = sse_forward_tx
+                    .send(Ok(axum::body::Bytes::from("data: [DONE]\n\n")))
+                    .await;
+            }
+            Ok(Err(e)) => {
+                let out = format!("data: {}\n\n", json!({ "error": e.to_string() }));
+                let _ = sse_forward_tx.send(Ok(axum::body::Bytes::from(out))).await;
+            }
+            Err(e) => {
+                let out = format!("data: {}\n\n", json!({ "error": format!("join: {e}") }));
+                let _ = sse_forward_tx.send(Ok(axum::body::Bytes::from(out))).await;
             }
         }
     });
 
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let stream = tokio_stream::wrappers::ReceiverStream::new(sse_rx);
 
     Response::builder()
         .header("Content-Type", "text/event-stream")

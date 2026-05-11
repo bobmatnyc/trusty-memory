@@ -163,12 +163,12 @@ pub enum Commands {
     ///
     /// By default binds the HTTP+SSE server on an OS-chosen free port *and*
     /// serves the stdio MCP transport concurrently. The bound address is
-    /// printed on startup and written to `~/.trusty-memory/http_addr` so
+    /// printed on startup and written to `trusty-memory's data-dir discovery file` so
     /// other commands and scripts can discover the running daemon without a
     /// hard-coded port. Use `--no-http` to disable the HTTP listener (e.g.
     /// when invoked by a Claude Code stdio hook).
     #[command(
-        after_help = "Examples:\n  trusty-memory serve                       # OS picks a free port; address printed and written to ~/.trusty-memory/http_addr\n  trusty-memory serve --http 127.0.0.1:3031 # pin a specific port\n  trusty-memory serve --no-http             # stdio MCP only"
+        after_help = "Examples:\n  trusty-memory serve                       # OS picks a free port; address printed and written to trusty-memory's data-dir discovery file\n  trusty-memory serve --http 127.0.0.1:3031 # pin a specific port\n  trusty-memory serve --no-http             # stdio MCP only"
     )]
     Serve {
         /// HTTP bind address. Prefers 3031; auto-increments on conflict (up to +20).
@@ -266,7 +266,7 @@ pub enum Commands {
 
     /// Open the HTTP admin dashboard in your browser.
     #[command(
-        after_help = "Examples:\n  trusty-memory dashboard\n\nRequires `trusty-memory serve` to be running (reads ~/.trusty-memory/http_addr)."
+        after_help = "Examples:\n  trusty-memory dashboard\n\nRequires `trusty-memory serve` to be running (reads trusty-memory's data-dir discovery file)."
     )]
     Dashboard,
 

@@ -4024,7 +4024,6 @@ dependencies = [
 [[package]]
 name = "trusty-common"
 version = "0.1.2"
-source = "git+https://github.com/bobmatnyc/trusty-common?tag=trusty-common-v0.1.2#716986306ed8d5ce229dc532c11e987a15dbf6d7"
 dependencies = [
  "anyhow",
  "colored",
@@ -4041,7 +4040,6 @@ dependencies = [
 [[package]]
 name = "trusty-embedder"
 version = "0.1.0"
-source = "git+https://github.com/bobmatnyc/trusty-common?tag=trusty-embedder-v0.1.0#b419d36ef0d378402f5c45ebb78e46fe9794d352"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4055,7 +4053,6 @@ dependencies = [
 [[package]]
 name = "trusty-mcp-core"
 version = "0.1.0"
-source = "git+https://github.com/bobmatnyc/trusty-common?tag=trusty-mcp-core-v0.1.0#b419d36ef0d378402f5c45ebb78e46fe9794d352"
 dependencies = [
  "anyhow",
  "serde",
@@ -4145,6 +4142,7 @@ dependencies = [
  "tower 0.4.13",
  "tower-http 0.5.2",
  "tracing",
+ "trusty-common",
  "trusty-mcp-core",
  "trusty-memory-core",
  "uuid",
