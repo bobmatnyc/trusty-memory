@@ -116,6 +116,38 @@ impl PalaceRegistry {
         PalaceStore::list_palaces(data_root)
             .with_context(|| format!("list palaces under {}", data_root.display()))
     }
+
+    /// Open a registry rooted at `data_root` and pre-hydrate every persisted
+    /// palace into the in-memory map.
+    ///
+    /// Why: Issue #52 — production hosts (open-mpm) want a single call that
+    /// brings up the full registry on daemon startup so that recall paths
+    /// don't pay a lazy-open latency on the first request after a restart.
+    /// Existing call sites continue to use `new()` + `open_palace()`; this is
+    /// the convenience for hosts that prefer an eager warmup.
+    /// What: Creates `data_root` if missing, calls `PalaceStore::list_palaces`,
+    /// and for each persisted palace builds a `PalaceHandle` via
+    /// `PalaceHandle::open` and registers it. Errors hydrating a single palace
+    /// are logged and skipped so one corrupt palace doesn't take the whole
+    /// registry down — matches the resiliency choice in `PalaceStore::list_palaces`.
+    /// Test: `open_hydrates_persisted_palaces` exercises restart by writing,
+    /// dropping, and reopening.
+    pub fn open(data_root: &Path) -> Result<Self> {
+        std::fs::create_dir_all(data_root)
+            .with_context(|| format!("create registry root {}", data_root.display()))?;
+        let registry = Self::new();
+        let palaces = PalaceStore::list_palaces(data_root)
+            .with_context(|| format!("list palaces under {}", data_root.display()))?;
+        for palace in palaces {
+            match PalaceHandle::open(&palace) {
+                Ok(handle) => registry.register_arc(handle),
+                Err(e) => {
+                    tracing::warn!(palace = %palace.id, "skipping palace during registry open: {e:#}");
+                }
+            }
+        }
+        Ok(registry)
+    }
 }
 
 #[cfg(test)]
@@ -184,6 +216,63 @@ mod tests {
         let palaces = PalaceRegistry::list_palaces(data_root).unwrap();
         assert_eq!(palaces.len(), 1);
         assert_eq!(palaces[0].name, "Alpha");
+    }
+
+    /// Why: Issue #52 — payloads (drawer content) must survive a process
+    /// restart. Open a registry, write a drawer with a known content string,
+    /// drop everything, reopen via `PalaceRegistry::open(path)`, and assert the
+    /// drawer content is still recoverable from the registered handle.
+    /// What: Uses `PalaceHandle::remember` (the canonical write path) so the
+    /// full persistence chain (kg drawer row + usearch vector + L1 snapshot)
+    /// is exercised, not just metadata.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn palace_payloads_survive_registry_restart() {
+        use crate::palace::{Palace, RoomType};
+        use chrono::Utc;
+
+        let dir = tempdir().unwrap();
+        let data_root = dir.path();
+
+        // Phase 1: create palace + write a payload, then drop everything.
+        {
+            let registry = PalaceRegistry::open(data_root).unwrap();
+            let palace = Palace {
+                id: PalaceId::new("restart-test"),
+                name: "Restart".to_string(),
+                description: None,
+                created_at: Utc::now(),
+                data_dir: data_root.join("restart-test"),
+            };
+            let handle = registry.create_palace(data_root, palace).unwrap();
+            handle
+                .remember(
+                    "the quokka is a small marsupial native to Western Australia".to_string(),
+                    RoomType::Research,
+                    vec!["wildlife".to_string()],
+                    0.7,
+                )
+                .await
+                .expect("remember persists the drawer");
+        }
+
+        // Phase 2: reopen from disk, assert the payload is still there.
+        let registry = PalaceRegistry::open(data_root).unwrap();
+        assert_eq!(
+            registry.len(),
+            1,
+            "registry should have hydrated the persisted palace"
+        );
+        let handle = registry
+            .get(&PalaceId::new("restart-test"))
+            .expect("palace should be registered after open()");
+        let drawers = handle.drawers.read().clone();
+        assert!(
+            drawers
+                .iter()
+                .any(|d| d.content.contains("quokka") && d.tags.contains(&"wildlife".to_string())),
+            "persisted drawer content must survive restart; got {drawers:?}"
+        );
     }
 
     #[test]
