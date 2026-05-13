@@ -99,6 +99,7 @@ pub fn tool_definitions_with(has_default: bool) -> Value {
         vec!["palace", "drawer_id"]
     };
     let palace_info_required: Vec<&str> = if has_default { vec![] } else { vec!["palace"] };
+    let palace_compact_required: Vec<&str> = if has_default { vec![] } else { vec!["palace"] };
 
     json!({
         "tools": [
@@ -222,6 +223,17 @@ pub fn tool_definitions_with(has_default: bool) -> Value {
                         "palace": {"type": "string"}
                     },
                     "required": palace_info_required,
+                }
+            },
+            {
+                "name": "palace_compact",
+                "description": "Remove orphaned vector index entries (vectors with no matching drawer row). See issue #49.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "palace": {"type": "string"}
+                    },
+                    "required": palace_compact_required,
                 }
             }
         ]
@@ -509,6 +521,26 @@ pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<
                 "data_dir": data_dir,
             }))
         }
+        "palace_compact" => {
+            let palace = resolve_palace(state, &args, "palace_compact")?;
+            let handle = open_palace_handle(state, &palace)?;
+            // Use the live drawer table (sourced from SQLite at palace open) as
+            // the authoritative valid-id set, then run the vector store's
+            // synchronous compaction on a blocking thread.
+            let valid_ids: std::collections::HashSet<Uuid> =
+                handle.drawers.read().iter().map(|d| d.id).collect();
+            let vector_store = handle.vector_store.clone();
+            let res = tokio::task::spawn_blocking(move || vector_store.compact_orphans(&valid_ids))
+                .await
+                .context("join palace_compact")??;
+            Ok(json!({
+                "palace": palace,
+                "total_checked": res.total_checked,
+                "orphans_removed": res.orphans_removed,
+                "index_size_before": res.index_size_before,
+                "index_size_after": res.index_size_after,
+            }))
+        }
         other => anyhow::bail!("unknown tool: {other}"),
     }
 }
@@ -566,6 +598,7 @@ mod tests {
             ("memory_list", true),
             ("memory_forget", true),
             ("palace_info", true),
+            ("palace_compact", true),
             ("kg_assert", true),
             ("kg_query", true),
         ] {
@@ -595,7 +628,7 @@ mod tests {
             .get("tools")
             .and_then(|t| t.as_array())
             .expect("tools array");
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
@@ -609,6 +642,7 @@ mod tests {
             "palace_create",
             "palace_list",
             "palace_info",
+            "palace_compact",
             "kg_assert",
             "kg_query",
         ] {

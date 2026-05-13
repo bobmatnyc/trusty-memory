@@ -340,6 +340,39 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    /// Load just the set of drawer IDs currently in the table.
+    ///
+    /// Why: Issue #49 compaction only needs to know "is this UUID a live
+    /// drawer?", which is a fraction of the work of `load_drawers` (no JSON
+    /// parsing, no RFC3339 parsing, no Vec<Drawer> allocation). The CLI
+    /// `palace compact` path can be standalone (no PalaceHandle) and uses
+    /// this to build the valid-id set in one SQL pass.
+    /// What: `SELECT id FROM drawers`, parsing each into a `Uuid`. Rows with
+    /// malformed IDs are skipped with a warning rather than aborting.
+    /// Test: `load_drawer_ids_matches_load_drawers`.
+    pub fn load_drawer_ids(&self) -> Result<std::collections::HashSet<Uuid>> {
+        let conn = self.pool.get().context("failed to get sqlite connection")?;
+        let mut stmt = conn
+            .prepare("SELECT id FROM drawers")
+            .context("failed to prepare load_drawer_ids statement")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .context("failed to query drawer ids")?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            let id_s = row.context("failed to read drawer id row")?;
+            match Uuid::parse_str(&id_s) {
+                Ok(u) => {
+                    out.insert(u);
+                }
+                Err(e) => {
+                    tracing::warn!(id = %id_s, "skip drawer with invalid id: {e}");
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Load all drawer metadata. Called from `PalaceHandle::open`.
     ///
     /// Why: Cold-start retrieval needs the full drawer table to map every
@@ -500,6 +533,28 @@ mod tests {
         assert_eq!(loaded[0].source_file, Some(PathBuf::from("/tmp/source.md")));
     }
 
+    /// Why: Issue #49 — compaction needs a cheap "is this UUID a live drawer?"
+    /// check; `load_drawer_ids` returns the set of all stored IDs without the
+    /// overhead of materializing full `Drawer` rows.
+    /// What: Insert two drawers, call `load_drawer_ids`, and assert the
+    /// returned set matches the inserted IDs.
+    /// Test: This test itself is the verification.
+    #[test]
+    fn load_drawer_ids_matches_load_drawers() {
+        let dir = tempdir().unwrap();
+        let kg = KnowledgeGraph::open(&dir.path().join("kg.db")).unwrap();
+        let room = Uuid::new_v4();
+        let d1 = Drawer::new(room, "one");
+        let d2 = Drawer::new(room, "two");
+        kg.upsert_drawer(&d1).unwrap();
+        kg.upsert_drawer(&d2).unwrap();
+
+        let ids = kg.load_drawer_ids().unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&d1.id));
+        assert!(ids.contains(&d2.id));
+    }
+
     #[test]
     fn delete_drawer_removes_row() {
         let dir = tempdir().unwrap();
@@ -589,7 +644,10 @@ mod tests {
         .unwrap();
         let (wal, done) = kg.checkpoint().expect("checkpoint should succeed");
         assert!(wal >= 0, "wal_pages must be non-negative, got {wal}");
-        assert!(done >= 0, "checkpointed_pages must be non-negative, got {done}");
+        assert!(
+            done >= 0,
+            "checkpointed_pages must be non-negative, got {done}"
+        );
     }
 
     #[tokio::test]

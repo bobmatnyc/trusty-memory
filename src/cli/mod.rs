@@ -334,6 +334,13 @@ pub enum PalaceCommands {
     Delete { name: String },
     /// Rename a palace.
     Rename { old: String, new: String },
+    /// Remove orphaned vectors (vectors in the HNSW index with no
+    /// corresponding drawer row) from a palace's index. See issue #49.
+    Compact {
+        /// Palace id to compact. If omitted, uses the active palace passed
+        /// via `--palace`.
+        name: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]

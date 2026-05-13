@@ -12,6 +12,8 @@ use crate::cli::PalaceCommands;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::PathBuf;
+use trusty_memory_core::store::kg::KnowledgeGraph;
+use trusty_memory_core::store::vector::UsearchStore;
 use trusty_memory_core::{Palace, PalaceId, PalaceRegistry};
 
 /// Resolve the machine-wide data root: `<dirs::data_dir>/trusty-memory/palaces/`.
@@ -102,6 +104,60 @@ pub async fn handle(cmd: PalaceCommands, _palace: &str, out: &OutputConfig) -> R
             std::fs::remove_dir_all(&palace_dir)
                 .with_context(|| format!("remove palace dir {}", palace_dir.display()))?;
             out.print_success(&format!("deleted palace '{name}'"));
+        }
+        PalaceCommands::Compact { name } => {
+            let root = data_root()?;
+            let target = name.unwrap_or_else(|| _palace.to_string());
+            let palace_dir = root.join(&target);
+            if !palace_dir.exists() {
+                out.print_error(&format!("palace '{target}' not found"));
+                return Ok(());
+            }
+            let vector_path = palace_dir.join("index.usearch");
+            let kg_path = palace_dir.join("kg.db");
+            if !vector_path.exists() || !kg_path.exists() {
+                out.print_error(&format!(
+                    "palace '{target}' is missing index.usearch or kg.db"
+                ));
+                return Ok(());
+            }
+
+            println!("Compacting palace '{target}'...");
+            // Run on a blocking thread — both usearch and SQLite are sync C/C++.
+            let stats = tokio::task::spawn_blocking(move || -> Result<_> {
+                let store =
+                    UsearchStore::new(vector_path, 384).context("open vector store for compact")?;
+                let kg = KnowledgeGraph::open(&kg_path).context("open KG for compact")?;
+                let valid = kg.load_drawer_ids().context("load_drawer_ids")?;
+                let res = store.compact_orphans(&valid).context("compact_orphans")?;
+                Ok(res)
+            })
+            .await
+            .context("join compact task")??;
+
+            let pct = if stats.total_checked > 0 {
+                (stats.orphans_removed as f64 * 100.0 / stats.total_checked as f64).round() as u64
+            } else {
+                0
+            };
+            println!(
+                "  checked {} vectors, removed {} orphans ({pct}%)",
+                stats.total_checked, stats.orphans_removed
+            );
+            if stats.index_size_before != stats.total_checked {
+                println!(
+                    "  note: HNSW index reports {} entries; only {} are tracked by this session's key_map",
+                    stats.index_size_before, stats.total_checked
+                );
+                println!(
+                    "  (cold-reload limitation — rerun after some writes, or use the dream loop's rebuild path)"
+                );
+            }
+            println!(
+                "  index size: {} -> {}",
+                stats.index_size_before, stats.index_size_after
+            );
+            out.print_success("compacted");
         }
         PalaceCommands::Rename { old, new } => {
             let root = data_root()?;

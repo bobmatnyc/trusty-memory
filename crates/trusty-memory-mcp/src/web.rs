@@ -873,10 +873,7 @@ async fn execute_tool(name: &str, args: &str, state: &AppState) -> Value {
         "recall_memories" => {
             let pid = parsed.get("palace_id").and_then(|v| v.as_str());
             let q = parsed.get("query").and_then(|v| v.as_str());
-            let top_k = parsed
-                .get("top_k")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(5) as usize;
+            let top_k = parsed.get("top_k").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
             match (pid, q) {
                 (Some(p), Some(q)) => execute_recall(state, p, q, top_k).await,
                 _ => json!({ "error": "missing required argument(s): palace_id, query" }),
@@ -920,7 +917,9 @@ async fn execute_tool(name: &str, args: &str, state: &AppState) -> Value {
                 .map(|f| f as f32)
                 .unwrap_or(0.5);
             match (pid, content) {
-                (Some(p), Some(c)) => execute_create_memory(state, p, c, room, tags, importance).await,
+                (Some(p), Some(c)) => {
+                    execute_create_memory(state, p, c, room, tags, importance).await
+                }
                 _ => json!({ "error": "missing required argument(s): palace_id, content" }),
             }
         }
@@ -986,18 +985,17 @@ async fn execute_recall(state: &AppState, palace_id: &str, query: &str, top_k: u
         Err(e) => return json!({ "error": format!("open palace {palace_id}: {e:#}") }),
     };
     match recall_with_default_embedder(&handle, query, top_k).await {
-        Ok(hits) => json!(
-            hits.into_iter()
-                .map(|r| json!({
-                    "drawer_id": r.drawer.id.to_string(),
-                    "content": r.drawer.content,
-                    "importance": r.drawer.importance,
-                    "tags": r.drawer.tags,
-                    "score": r.score,
-                    "layer": r.layer,
-                }))
-                .collect::<Vec<_>>()
-        ),
+        Ok(hits) => json!(hits
+            .into_iter()
+            .map(|r| json!({
+                "drawer_id": r.drawer.id.to_string(),
+                "content": r.drawer.content,
+                "importance": r.drawer.importance,
+                "tags": r.drawer.tags,
+                "score": r.score,
+                "layer": r.layer,
+            }))
+            .collect::<Vec<_>>()),
         Err(e) => json!({ "error": format!("recall: {e:#}") }),
     }
 }
@@ -1208,7 +1206,11 @@ async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>)
                     String::new()
                 });
                 (
-                    if new_id.is_empty() { None } else { Some(new_id) },
+                    if new_id.is_empty() {
+                        None
+                    } else {
+                        Some(new_id)
+                    },
                     body.history.clone(),
                 )
             }
@@ -1283,9 +1285,7 @@ async fn chat_handler(State(state): State<AppState>, Json(body): Json<ChatBody>)
             ));
             let identity_trimmed = handle.identity.trim();
             if !identity_trimmed.is_empty() {
-                palace_block.push_str(&format!(
-                    "- identity:\n{identity_trimmed}\n",
-                ));
+                palace_block.push_str(&format!("- identity:\n{identity_trimmed}\n",));
             }
 
             if let Ok(hits) = recall_with_default_embedder(&handle, &body.message, 5).await {
@@ -2010,7 +2010,11 @@ mod tests {
         // Every tool's `parameters` must be a JSON Schema object with a
         // `required` array (possibly empty).
         for t in &tools {
-            assert_eq!(t.parameters["type"], "object", "tool {} schema type", t.name);
+            assert_eq!(
+                t.parameters["type"], "object",
+                "tool {} schema type",
+                t.name
+            );
             assert!(
                 t.parameters["required"].is_array(),
                 "tool {} required not array",
@@ -2029,12 +2033,18 @@ mod tests {
     async fn execute_tool_dispatches_known_tools() {
         let state = test_state();
         let result = execute_tool("list_palaces", "{}", &state).await;
-        assert!(result.is_array(), "list_palaces should be array, got {result}");
+        assert!(
+            result.is_array(),
+            "list_palaces should be array, got {result}"
+        );
         assert_eq!(result.as_array().unwrap().len(), 0);
 
         let unknown = execute_tool("not_a_tool", "{}", &state).await;
         assert!(
-            unknown["error"].as_str().unwrap_or("").contains("unknown tool"),
+            unknown["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("unknown tool"),
             "expected unknown-tool error, got {unknown}"
         );
 
@@ -2115,14 +2125,12 @@ mod tests {
         // Read just the first chunk (the connected frame) — the stream stays
         // open otherwise, so we use a small read budget plus timeout.
         let body = resp.into_body();
-        let bytes = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            to_bytes(body, 4096),
-        )
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .unwrap_or_default();
+        let bytes =
+            tokio::time::timeout(std::time::Duration::from_millis(500), to_bytes(body, 4096))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
         let text = String::from_utf8_lossy(&bytes);
         assert!(
             text.contains("\"type\":\"connected\""),

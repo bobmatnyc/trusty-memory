@@ -150,9 +150,8 @@ impl AppState {
             return Ok(entry.clone());
         }
         let dir = self.data_root.join(palace_id);
-        std::fs::create_dir_all(&dir).map_err(|e| {
-            anyhow::anyhow!("create palace dir {}: {e}", dir.display())
-        })?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| anyhow::anyhow!("create palace dir {}: {e}", dir.display()))?;
         let store = Arc::new(ChatSessionStore::open(&dir.join("chat_sessions.db"))?);
         self.session_stores
             .insert(palace_id.to_string(), store.clone());
@@ -493,7 +492,7 @@ mod tests {
         let req = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
         let resp = handle_message(&state, req).await;
         let tools = resp["result"]["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
     }
 
     #[tokio::test]

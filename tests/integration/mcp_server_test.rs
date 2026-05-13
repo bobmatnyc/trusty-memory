@@ -1,6 +1,6 @@
 //! Why: Lock the MCP tool surface so accidental schema drift breaks CI before
 //! a Claude Code client sees it.
-//! What: Verifies all 10 tools are advertised and the JSON-RPC handshake +
+//! What: Verifies all 11 tools are advertised and the JSON-RPC handshake +
 //! tools/call round-trip return the expected envelope shapes.
 //! Test: `cargo test --test mcp_server_test`.
 
@@ -14,7 +14,7 @@ fn all_tools_are_advertised() {
         .get("tools")
         .and_then(|t| t.as_array())
         .expect("tools array");
-    assert_eq!(tools.len(), 10, "expected exactly 10 MCP tools");
+    assert_eq!(tools.len(), 11, "expected exactly 11 MCP tools");
 
     let names: Vec<&str> = tools
         .iter()
@@ -32,6 +32,7 @@ fn all_tools_are_advertised() {
         "palace_info",
         "kg_assert",
         "kg_query",
+        "palace_compact",
     ] {
         assert!(
             names.contains(&expected),
@@ -77,7 +78,7 @@ async fn initialize_then_list_then_call_handshake() {
         json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
     )
     .await;
-    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 10);
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 11);
 
     // 4) palace_create — the real registry needs the palace on disk before
     //    memory_remember can target it.

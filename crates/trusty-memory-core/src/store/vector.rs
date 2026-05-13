@@ -9,7 +9,7 @@
 //! longer returns the removed id; reopening the store from the same path
 //! retrieves previously inserted vectors.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -23,6 +23,23 @@ use uuid::Uuid;
 pub struct VectorHit {
     pub drawer_id: Uuid,
     pub score: f32,
+}
+
+/// Result summary returned by `UsearchStore::compact_orphans`.
+///
+/// Why: CLI / MCP callers need a structured report (not just a count) so they
+/// can render progress like "checked 644 vectors, removed 541 orphans (84%)"
+/// without re-deriving totals from the store.
+/// What: Plain data: total tracked vector ids inspected, count removed as
+/// orphans, and the index size before/after compaction (for divergence
+/// reporting when the session key_map is incomplete after a cold reload).
+/// Test: `compact_orphans_removes_only_missing_ids` exercises the values.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompactionResult {
+    pub total_checked: usize,
+    pub orphans_removed: usize,
+    pub index_size_before: usize,
+    pub index_size_after: usize,
 }
 
 #[async_trait]
@@ -263,6 +280,72 @@ impl UsearchStore {
     pub fn all_ids(&self) -> Vec<Uuid> {
         self.key_map.read().values().copied().collect()
     }
+
+    /// Remove vector entries whose drawer IDs are not in `valid_ids`.
+    ///
+    /// Why: Issue #49 — over a palace's lifetime, vectors get orphaned by
+    /// partial writes, schema migrations, or older bugs that dropped drawer
+    /// rows without removing the corresponding HNSW entry. The dream loop has
+    /// a compaction pass, but operators need an on-demand fix that runs
+    /// without the full async dream machinery (and can be triggered from the
+    /// CLI against a palace data dir directly).
+    /// What: Snapshots the session `key_map` (the authoritative "what's in
+    /// the index" view), removes any key whose drawer UUID is not in
+    /// `valid_ids`, and persists the index + sidecar after the batch. Returns
+    /// a `CompactionResult` with the inspected count, the orphan count, and
+    /// the index size before/after.
+    /// Test: `compact_orphans_removes_only_missing_ids`.
+    pub fn compact_orphans(&self, valid_ids: &HashSet<Uuid>) -> Result<CompactionResult> {
+        let index_size_before = self.index.read().size();
+
+        // Snapshot the (key, uuid) pairs we know about, then drop the read
+        // lock before acquiring the write lock below.
+        let pairs: Vec<(u64, Uuid)> = {
+            let map = self.key_map.read();
+            map.iter().map(|(k, v)| (*k, *v)).collect()
+        };
+        let total_checked = pairs.len();
+
+        let mut orphans_removed: usize = 0;
+        {
+            let index_guard = self.index.write();
+            let mut map_guard = self.key_map.write();
+            for (key, drawer_id) in &pairs {
+                if valid_ids.contains(drawer_id) {
+                    continue;
+                }
+                match index_guard.remove(*key) {
+                    Ok(_) => {
+                        map_guard.remove(key);
+                        orphans_removed += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(?drawer_id, "compact_orphans: usearch remove failed: {e}");
+                    }
+                }
+            }
+
+            // Persist once at the end so we don't pay a save per removal.
+            if orphans_removed > 0 {
+                let path_str = self
+                    .path
+                    .to_str()
+                    .with_context(|| format!("usearch path is not valid UTF-8: {:?}", self.path))?;
+                index_guard
+                    .save(path_str)
+                    .map_err(|e| anyhow::anyhow!("failed to save usearch index: {e}"))?;
+                save_key_map_sidecar(&self.path, &map_guard);
+            }
+        }
+
+        let index_size_after = self.index.read().size();
+        Ok(CompactionResult {
+            total_checked,
+            orphans_removed,
+            index_size_before,
+            index_size_after,
+        })
+    }
 }
 
 #[async_trait]
@@ -467,6 +550,42 @@ mod tests {
     /// What: Upsert a vector under a fresh `Uuid::new_v4`, search for it, and
     /// assert the returned `drawer_id` matches the input bit-for-bit.
     /// Test: This test itself is the verification.
+    /// Why: Issue #49 — `compact_orphans` must remove only the vectors whose
+    /// drawer UUIDs are absent from the supplied valid set, and must persist
+    /// the change so a subsequent reload doesn't resurrect the orphans.
+    /// What: Insert three vectors, mark one as valid, run compaction, then
+    /// assert (a) total_checked counts all three, (b) two were removed, and
+    /// (c) reopening the store from disk shows only the kept vector.
+    /// Test: This test itself is the verification.
+    #[tokio::test]
+    async fn compact_orphans_removes_only_missing_ids() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.usearch");
+        let store = UsearchStore::new(path.clone(), 384).unwrap();
+
+        let keep = Uuid::new_v4();
+        let drop_a = Uuid::new_v4();
+        let drop_b = Uuid::new_v4();
+        store.upsert(keep, unit_vec(384, 1)).await.unwrap();
+        store.upsert(drop_a, unit_vec(384, 2)).await.unwrap();
+        store.upsert(drop_b, unit_vec(384, 3)).await.unwrap();
+
+        let mut valid = HashSet::new();
+        valid.insert(keep);
+        let res = store.compact_orphans(&valid).unwrap();
+        assert_eq!(res.total_checked, 3);
+        assert_eq!(res.orphans_removed, 2);
+        assert_eq!(res.index_size_before, 3);
+        assert_eq!(res.index_size_after, 1);
+
+        // Reopen from disk — the compacted state must survive.
+        drop(store);
+        let reopened = UsearchStore::new(path, 384).unwrap();
+        let ids = reopened.all_ids();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], keep);
+    }
+
     #[tokio::test]
     async fn upsert_then_l1_l2_no_duplicate() {
         let dir = tempdir().unwrap();
