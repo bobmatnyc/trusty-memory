@@ -18,6 +18,7 @@ pub mod bench;
 pub mod chat;
 pub mod config;
 pub mod convert;
+pub mod daemon_probe;
 pub mod dashboard;
 pub mod decay;
 pub mod doctor;

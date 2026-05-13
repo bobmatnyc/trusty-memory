@@ -206,9 +206,7 @@ async fn main() -> Result<()> {
                     let root = match cli::palace::data_root() {
                         Ok(r) => r,
                         Err(e) => {
-                            tracing::warn!(
-                                "failed to resolve data root for Dreamer: {e:#}"
-                            );
+                            tracing::warn!("failed to resolve data root for Dreamer: {e:#}");
                             return;
                         }
                     };
@@ -226,13 +224,12 @@ async fn main() -> Result<()> {
                     for p in palaces {
                         match registry.open_palace(&root, &p.id) {
                             Ok(handle) => {
-                                let dreamer = std::sync::Arc::new(
-                                    trusty_memory_core::dream::Dreamer::new(
+                                let dreamer =
+                                    std::sync::Arc::new(trusty_memory_core::dream::Dreamer::new(
                                         trusty_memory_core::dream::DreamConfig::default(),
-                                    ),
-                                );
-                                let jh = dreamer
-                                    .start_with_shutdown(handle, shutdown_rx_bg.clone());
+                                    ));
+                                let jh =
+                                    dreamer.start_with_shutdown(handle, shutdown_rx_bg.clone());
                                 dream_handles_bg.lock().await.push(jh);
                                 opened += 1;
                             }
@@ -373,15 +370,25 @@ async fn main() -> Result<()> {
             println!("palaces: {}", palaces.len());
             println!("active palace: {palace}");
 
-            // Discover the running daemon's HTTP address by reading the file
-            // the daemon writes on startup. Absent file == daemon not running
-            // (or no HTTP listener). Uses the shared trusty-* discovery helper.
-            let running_addr = trusty_common::read_daemon_addr("trusty-memory")
-                .ok()
-                .flatten()
-                .filter(|s| !s.is_empty());
-            match running_addr {
-                Some(addr) => println!("HTTP: http://{addr}"),
+            // Discover the running daemon's HTTP address. Issue #50 — relying
+            // solely on the discovery file produced false "not running"
+            // reports when the file was missing (e.g. launchd-managed daemons
+            // with a different `HOME`). `daemon_probe::probe_daemon` tries
+            // the env var, the discovery file, and a candidate port range
+            // before giving up.
+            match cli::daemon_probe::probe_daemon() {
+                Some(found) => {
+                    let tag = match found.source {
+                        cli::daemon_probe::AddrSource::EnvVar => {
+                            format!(" [via ${}]", cli::daemon_probe::HTTP_PORT_ENV)
+                        }
+                        cli::daemon_probe::AddrSource::DiscoveryFile => String::new(),
+                        cli::daemon_probe::AddrSource::CandidatePort => {
+                            " [discovery file missing/stale — found via port scan]".to_string()
+                        }
+                    };
+                    println!("HTTP: http://{}{tag}", found.addr);
+                }
                 None => println!("daemon: not running (serve not started)"),
             }
         }
@@ -436,20 +443,18 @@ async fn ensure_daemon() {
     eprintln!("[warn] daemon did not start within 5 s; proceeding without HTTP server");
 }
 
-/// Returns true if the daemon's recorded address accepts a TCP connection
-/// within 300 ms. Reads via `trusty_common::read_daemon_addr` so the
-/// discovery path stays in sync with the writer in `serve`.
+/// Returns true if a trusty-memory daemon is reachable on any known address.
+///
+/// Why: `ensure_daemon` uses this to decide whether to spawn a fresh `serve`
+/// child. Before the issue #50 fix this read only the discovery file, which
+/// meant a launchd-managed daemon (different `HOME`, no discovery file in
+/// this user's data dir) was treated as dead — causing `ensure_daemon` to
+/// spawn a duplicate that fought for the same port.
+/// What: Delegates to `cli::daemon_probe::probe_daemon`, which tries the
+/// `TRUSTY_MEMORY_HTTP_PORT` env var, then the shared discovery file, then a
+/// candidate port range (3031..=3050) on `127.0.0.1`.
+/// Test: Exercised by the `status` / `doctor` integration smoke and the
+/// `daemon_probe` unit tests.
 fn daemon_alive() -> bool {
-    let Ok(Some(addr)) = trusty_common::read_daemon_addr("trusty-memory") else {
-        return false;
-    };
-    if addr.is_empty() {
-        return false;
-    }
-    addr.parse::<std::net::SocketAddr>()
-        .ok()
-        .and_then(|sa| {
-            std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(300)).ok()
-        })
-        .is_some()
+    cli::daemon_probe::probe_daemon().is_some()
 }

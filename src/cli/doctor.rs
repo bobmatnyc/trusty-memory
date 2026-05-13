@@ -9,11 +9,11 @@
 //! Test: `cargo test -p trusty-memory doctor::` covers the formatting helpers;
 //! the end-to-end probe is exercised manually via `trusty-memory doctor`.
 
+use crate::cli::daemon_probe::{self, AddrSource, HTTP_PORT_ENV};
 use crate::cli::output::OutputConfig;
 use crate::cli::palace;
 use crate::cli::stop;
 use anyhow::Result;
-use std::net::SocketAddr;
 
 /// Outcome of a single diagnostic check.
 ///
@@ -150,35 +150,38 @@ async fn check_palace_registry() -> CheckResult {
 ///
 /// Why: The MCP HTTP server, web admin panel, and dream cycle all depend on
 /// the daemon. A dead daemon is the most common cause of "trusty-memory feels
-/// broken" reports.
-/// What: Reads `trusty_common::read_daemon_addr`. If absent → warn (not error,
-/// since the user may not have started it yet). If present, attempts a 500 ms
-/// TCP connect; success → OK, failure → error (stale discovery file).
-/// Test: Covered by the start/stop round-trip integration smoke.
+/// broken" reports. Issue #50 — historically this check probed only the
+/// discovery file, which produced false "not running" reports when the file
+/// was missing (e.g. launchd-managed daemons with a different `HOME`).
+/// What: Delegates to `daemon_probe::probe_daemon`, which tries the
+/// `TRUSTY_MEMORY_HTTP_PORT` env var, then the discovery file, then a
+/// candidate port range (3031..=3050) before declaring the daemon dead.
+/// Reports the actual bound address and the discovery source so users can
+/// see when the addr file is out of sync.
+/// Test: Covered by the start/stop round-trip integration smoke; daemon_probe
+/// has its own unit tests.
 fn check_daemon_running() -> CheckResult {
     let label = "daemon".to_string();
-    let addr = trusty_common::read_daemon_addr("trusty-memory")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    if addr.is_empty() {
-        return CheckResult::Warn(
-            label,
-            "not running — start it with `trusty-memory start`".to_string(),
-        );
-    }
-    match addr.parse::<SocketAddr>() {
-        Ok(sa) => {
-            match std::net::TcpStream::connect_timeout(&sa, std::time::Duration::from_millis(500))
-            {
-                Ok(_) => CheckResult::Ok(format!("daemon (running at http://{addr})")),
-                Err(e) => CheckResult::Error(
-                    label,
-                    format!("addr file says {addr} but TCP connect failed: {e}"),
-                ),
-            }
+    match daemon_probe::probe_daemon() {
+        Some(found) => {
+            let suffix = match found.source {
+                AddrSource::EnvVar => format!(" [via ${HTTP_PORT_ENV}]"),
+                AddrSource::DiscoveryFile => String::new(),
+                AddrSource::CandidatePort => {
+                    " [discovery file missing/stale — found via port scan]".to_string()
+                }
+            };
+            CheckResult::Ok(format!(
+                "daemon (running at http://{}){suffix}",
+                found.addr
+            ))
         }
-        Err(e) => CheckResult::Error(label, format!("addr file unparseable ({addr}): {e}")),
+        None => CheckResult::Warn(
+            label,
+            format!(
+                "not running on any known address (checked ${HTTP_PORT_ENV}, discovery file, and ports 3031..=3050) — start it with `trusty-memory start`"
+            ),
+        ),
     }
 }
 
@@ -196,16 +199,31 @@ fn check_discovery_files() -> CheckResult {
         .ok()
         .flatten()
         .filter(|s| !s.is_empty());
-    match (pid, addr) {
-        (None, None) => CheckResult::Ok("discovery files (none; daemon not running)".to_string()),
-        (Some(_), Some(_)) => CheckResult::Ok("discovery files (PID + addr present)".to_string()),
-        (Some(pid), None) => CheckResult::Warn(
+    // If the daemon is reachable on a candidate port but neither PID nor
+    // addr file is present, surface that as a warning so the user knows
+    // `stop` won't work and `start` could spawn a duplicate.
+    let probe = daemon_probe::probe_daemon();
+    match (pid, addr, probe) {
+        (None, None, None) => {
+            CheckResult::Ok("discovery files (none; daemon not running)".to_string())
+        }
+        (Some(_), Some(_), _) => {
+            CheckResult::Ok("discovery files (PID + addr present)".to_string())
+        }
+        (Some(pid), None, _) => CheckResult::Warn(
             label,
             format!("stale PID file (pid {pid}) without addr file — daemon likely crashed"),
         ),
-        (None, Some(addr)) => CheckResult::Warn(
+        (None, Some(addr), _) => CheckResult::Warn(
             label,
             format!("addr file ({addr}) without PID file — `stop` will not find the daemon"),
+        ),
+        (None, None, Some(found)) => CheckResult::Warn(
+            label,
+            format!(
+                "daemon answering at {} but no PID/addr file — likely launched outside this CLI; `stop` will not find it",
+                found.addr
+            ),
         ),
     }
 }
