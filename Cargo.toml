@@ -42,16 +42,15 @@ mime_guess = "2"
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower = { version = "0.4", features = ["util"] }
-trusty-mcp-core = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-mcp-core-v0.1.0" }
-trusty-embedder = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-embedder-v0.1.0" }
-trusty-common = { git = "https://github.com/bobmatnyc/trusty-common", tag = "trusty-common-v0.3.2", features = ["axum-server"] }
+trusty-mcp-core = "0.1.0"
+trusty-embedder = "0.1.3"
+trusty-common = { version = "0.3.2", features = ["axum-server"] }
 
-# Local-development override: point the trusty-common workspace at the
-# sibling checkout so unreleased changes (e.g. `server::with_standard_middleware`,
-# `write_daemon_addr`) can be consumed without publishing/tagging. The git
-# dependency declarations above remain authoritative for downstream releases —
-# [patch] only takes effect when this workspace is built directly.
-[patch."https://github.com/bobmatnyc/trusty-common"]
+# Local-development override: redirect crates.io resolution to the sibling
+# trusty-common checkout so unreleased changes are available without publishing.
+# Remove this section (or comment it out) before cutting a release — the
+# version declarations above remain the authoritative crates.io coordinates.
+[patch.crates-io]
 trusty-common = { path = "../trusty-common/crates/trusty-common" }
 trusty-embedder = { path = "../trusty-common/crates/trusty-embedder" }
 trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core" }
