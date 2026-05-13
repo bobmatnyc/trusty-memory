@@ -20,6 +20,7 @@ use trusty_memory_core::embed::FastEmbedder;
 use trusty_memory_core::store::ChatSessionStore;
 use trusty_memory_core::PalaceRegistry;
 
+pub mod openrpc;
 pub mod tools;
 pub mod web;
 
@@ -271,6 +272,18 @@ pub async fn handle_message(state: &AppState, msg: Value) -> Value {
             "jsonrpc": "2.0",
             "id": id,
             "result": tools::tool_definitions_with(state.default_palace.is_some())
+        }),
+        // OpenRPC 1.3.2 discovery — see `openrpc.rs`. Returns the full
+        // service description so orchestrators (open-mpm, etc.) can
+        // introspect every tool and its required `memory.read`/`memory.write`
+        // scope without bespoke per-server adapters.
+        "rpc.discover" => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": openrpc::build_discover_response(
+                &state.version,
+                state.default_palace.is_some(),
+            ),
         }),
         "tools/call" => {
             let params = msg.get("params").cloned().unwrap_or_default();
