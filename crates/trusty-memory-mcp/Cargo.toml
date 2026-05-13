@@ -5,6 +5,14 @@ edition = "2021"
 description = "MCP server (stdio + HTTP/SSE) for trusty-memory"
 license = "MIT"
 
+[lib]
+# Why: Explicit `rlib` keeps the crate linkable as a Rust library from
+#      host processes (open-mpm) that want to register `MemoryMcpService`
+#      directly via the shared `ServiceDescriptor` trait, rather than
+#      spawning a separate MCP stdio child. Matches the rest of the
+#      trusty-* ecosystem (see trusty-mcp-core) for consistency.
+crate-type = ["rlib"]
+
 [dependencies]
 trusty-memory-core = { path = "../trusty-memory-core" }
 trusty-mcp-core = { workspace = true }

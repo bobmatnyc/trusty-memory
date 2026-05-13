@@ -5,6 +5,14 @@ edition = "2021"
 description = "Core types, storage, and retrieval for trusty-memory"
 license = "MIT"
 
+[lib]
+# Why: Explicit `rlib` keeps the crate linkable as a Rust library from
+#      host processes (open-mpm) that want to embed it directly rather
+#      than spawn it over MCP/stdio. Matches the rest of the trusty-*
+#      ecosystem (see trusty-mcp-core) and prevents future drift if a
+#      `cdylib` or other crate-type is ever added.
+crate-type = ["rlib"]
+
 [dependencies]
 # workspace
 tokio = { workspace = true }

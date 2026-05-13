@@ -21,9 +21,11 @@ use trusty_memory_core::store::ChatSessionStore;
 use trusty_memory_core::PalaceRegistry;
 
 pub mod openrpc;
+pub mod service;
 pub mod tools;
 pub mod web;
 
+pub use service::MemoryMcpService;
 pub use tools::MemoryMcpServer;
 
 /// Live daemon events broadcast to connected SSE subscribers.
