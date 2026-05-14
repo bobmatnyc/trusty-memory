@@ -41,18 +41,18 @@ deploy: ## Install binary and restart the daemon
 	cargo install --path . --locked
 	$(MAKE) restart
 
-restart: ## Restart via launchd (preferred) or direct background process
-	@echo "Stopping trusty-memory daemon..."
-	@launchctl bootout gui/$$(id -u)/com.bobmatnyc.trusty-memory 2>/dev/null || \
-	 launchctl bootout gui/$$(id -u)/com.trusty.trusty-memory 2>/dev/null || \
-	 pkill -f "trusty-memory serve" 2>/dev/null || true
+restart: ## Restart the daemon via launchd (install service first with: trusty-memory service install)
+	@echo "Restarting trusty-memory daemon via launchd..."
+	@launchctl bootout gui/$$(id -u)/com.bobmatnyc.trusty-memory 2>/dev/null || true
+	@launchctl bootout gui/$$(id -u)/com.trusty.trusty-memory 2>/dev/null || true
 	@sleep 2
 	@if [ -f "$(HOME)/Library/LaunchAgents/com.bobmatnyc.trusty-memory.plist" ]; then \
 	    launchctl bootstrap gui/$$(id -u) $(HOME)/Library/LaunchAgents/com.bobmatnyc.trusty-memory.plist; \
 	elif [ -f "$(HOME)/Library/LaunchAgents/com.trusty.trusty-memory.plist" ]; then \
 	    launchctl bootstrap gui/$$(id -u) $(HOME)/Library/LaunchAgents/com.trusty.trusty-memory.plist; \
 	else \
-	    trusty-memory serve > /tmp/trusty-memory.log 2>&1 < /dev/null & \
+	    echo "ERROR: No launchd plist found. Install with: trusty-memory service install" >&2; \
+	    exit 1; \
 	fi
 	@sleep 3
 	@trusty-memory status
