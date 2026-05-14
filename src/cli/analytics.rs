@@ -15,8 +15,8 @@ pub async fn handle(cmd: AnalyticsCommands, palace: &str, out: &OutputConfig) ->
     let handle = open_or_create_handle(palace).await?;
     let Some(log) = handle.recall_log.clone() else {
         out.print_header(palace, "analytics");
-        println!("Analytics not configured for this palace.");
-        println!("(Recall log wiring required — palaces must be opened with `with_recall_log`.)");
+        println!("Analytics not available for this palace.");
+        println!("(Recall log could not be opened — check warnings in daemon logs.)");
         return Ok(());
     };
 

@@ -11,6 +11,7 @@
 //! and L2 vector retrieval end-to-end.
 
 use crate::analytics::{query_hash, RecallEvent, RecallLog};
+const RECALL_LOG_FILENAME: &str = "recall.db";
 use crate::decay::DecayConfig;
 use crate::dream::extract_keywords;
 use crate::embed::{Embedder, FastEmbedder};
@@ -203,6 +204,23 @@ impl PalaceHandle {
 
         let drawers = Arc::new(RwLock::new(all_drawers));
 
+        // Attach a per-palace RecallLog at <data_dir>/recall.db so every disk-
+        // backed palace records hit/miss telemetry by default. A failure to
+        // open the log is non-fatal — log a warning and proceed without
+        // analytics so the palace remains usable.
+        //
+        // Why: Issue #53 — the MCP daemon (and CLI) previously opened palaces
+        // without a recall log, leaving `analytics show` permanently reporting
+        // "not configured". Wiring the log at open-time ensures every consumer
+        // of `PalaceRegistry::open_palace` gets logging for free.
+        let recall_log = match RecallLog::open(&data_dir.join(RECALL_LOG_FILENAME)) {
+            Ok(log) => Some(Arc::new(log)),
+            Err(e) => {
+                tracing::warn!(palace = %palace.id, "open recall log failed, analytics disabled: {e:#}");
+                None
+            }
+        };
+
         let handle = PalaceHandle {
             id: palace.id.clone(),
             identity,
@@ -212,7 +230,7 @@ impl PalaceHandle {
             drawers,
             data_dir: Some(data_dir.clone()),
             decay_config: DecayConfig::default(),
-            recall_log: None,
+            recall_log,
             closets: Arc::new(RwLock::new(HashMap::new())),
         };
         Ok(Arc::new(handle))
@@ -1109,6 +1127,67 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         assert!(hits >= 1, "expected at least one logged hit, got {hits}");
+    }
+
+    /// Why: Issue #53 — `PalaceHandle::open` (the production palace-load path
+    /// used by `PalaceRegistry::open_palace`) must auto-attach a recall log so
+    /// the MCP daemon and CLI both get analytics for free without having to
+    /// call `with_recall_log` manually.
+    /// What: Open a palace from disk and assert `handle.recall_log` is `Some`,
+    /// and that a recall fires a logged event end-to-end.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn open_attaches_recall_log_automatically() {
+        use crate::palace::Palace;
+        let dir = tempdir().unwrap();
+        let palace = Palace {
+            id: PalaceId::new("analytics-auto"),
+            name: "AnalyticsAuto".into(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            data_dir: dir.path().join("analytics-auto"),
+        };
+        std::fs::create_dir_all(&palace.data_dir).unwrap();
+        let handle = PalaceHandle::open(&palace).unwrap();
+
+        assert!(
+            handle.recall_log.is_some(),
+            "PalaceHandle::open must auto-attach a RecallLog (issue #53)"
+        );
+        assert!(
+            palace.data_dir.join("recall.db").exists(),
+            "recall.db must exist on disk after open"
+        );
+
+        // End-to-end: remember + recall should produce at least one logged hit.
+        let drawer_id = handle
+            .remember(
+                "the platypus is a monotreme native to eastern Australia".into(),
+                RoomType::Research,
+                vec!["wildlife".into()],
+                0.7,
+            )
+            .await
+            .unwrap();
+
+        let embedder = crate::embed::FastEmbedder::new().await.unwrap();
+        let _ = recall(&handle, &embedder, "platypus monotreme", 5)
+            .await
+            .unwrap();
+
+        let log = handle.recall_log.as_ref().unwrap().clone();
+        let mut hits = 0u64;
+        for _ in 0..20 {
+            hits = log.hit_count(drawer_id).await.unwrap();
+            if hits >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            hits >= 1,
+            "auto-attached recall log must record events; got {hits}"
+        );
     }
 
     /// Why: After `remember`, L2 tag-boosting depends on the closet index being
