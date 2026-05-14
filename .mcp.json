@@ -1,0 +1,21 @@
+{
+    "mcpServers": {
+        "trusty-memory": {
+            "type": "stdio",
+            "command": "trusty-memory",
+            "args": [
+                "serve",
+                "--no-http",
+                "--palace",
+                "trusty-memory"
+            ]
+        },
+        "trusty-search": {
+            "type": "stdio",
+            "command": "trusty-search",
+            "args": [
+                "serve"
+            ]
+        }
+    }
+}

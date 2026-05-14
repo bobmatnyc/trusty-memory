@@ -40,7 +40,7 @@ async fn main() -> Result<()> {
     // is running so the web admin panel and dream cycle are always active.
     if !matches!(
         &cli.command,
-        Commands::Serve { .. } | Commands::Service(_) | Commands::Setup { .. }
+        Commands::Serve { .. } | Commands::Service(_) | Commands::Setup { .. } | Commands::Hooks(_)
     ) {
         ensure_daemon().await;
     }
