@@ -41,13 +41,22 @@ deploy: ## Install binary and restart the daemon
 	cargo install --path . --locked
 	$(MAKE) restart
 
-restart: ## Restart the trusty-memory daemon (stop, start in background, verify)
-	@pkill trusty-memory 2>/dev/null || true
-	@sleep 1
-	@trusty-memory serve > /tmp/trusty-memory.log 2>&1 &
+restart: ## Restart via launchd (preferred) or direct background process
+	@echo "Stopping trusty-memory daemon..."
+	@launchctl bootout gui/$$(id -u)/com.bobmatnyc.trusty-memory 2>/dev/null || \
+	 launchctl bootout gui/$$(id -u)/com.trusty.trusty-memory 2>/dev/null || \
+	 pkill -f "trusty-memory serve" 2>/dev/null || true
+	@sleep 2
+	@if [ -f "$(HOME)/Library/LaunchAgents/com.bobmatnyc.trusty-memory.plist" ]; then \
+	    launchctl bootstrap gui/$$(id -u) $(HOME)/Library/LaunchAgents/com.bobmatnyc.trusty-memory.plist; \
+	elif [ -f "$(HOME)/Library/LaunchAgents/com.trusty.trusty-memory.plist" ]; then \
+	    launchctl bootstrap gui/$$(id -u) $(HOME)/Library/LaunchAgents/com.trusty.trusty-memory.plist; \
+	else \
+	    trusty-memory serve > /tmp/trusty-memory.log 2>&1 < /dev/null & \
+	fi
 	@sleep 3
 	@trusty-memory status
-	@echo "trusty-memory daemon restarted (PID: $$(pgrep trusty-memory))"
+	@echo "trusty-memory daemon restarted"
 
 smoke: ## Run smoke test (tests/smoke-test.sh)
 	bash tests/smoke-test.sh

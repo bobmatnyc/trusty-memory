@@ -265,6 +265,8 @@ fn render_plist(binary: &str, log_path: &str) -> String {
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>StandardInPath</key>
+  <string>/dev/null</string>
   <key>StandardOutPath</key>
   <string>{log_path}</string>
   <key>StandardErrorPath</key>
@@ -342,6 +344,10 @@ mod tests {
         assert!(plist.contains(SERVICE_LABEL));
         assert!(plist.contains("<key>RunAtLoad</key>"));
         assert!(plist.contains("<key>KeepAlive</key>"));
+        // StandardInPath=/dev/null prevents launchd-managed instances from
+        // exiting due to stdin EOF in the stdio MCP loop.
+        assert!(plist.contains("<key>StandardInPath</key>"));
+        assert!(plist.contains("<string>/dev/null</string>"));
     }
 
     #[test]

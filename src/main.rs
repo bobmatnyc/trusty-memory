@@ -347,8 +347,11 @@ async fn main() -> Result<()> {
                     );
                 });
 
+                // In HTTP mode, stdio is best-effort: spawn it detached so that
+                // stdin EOF (e.g., terminal session ending, launchd's /dev/null) does
+                // not terminate the daemon. The HTTP server owns daemon lifecycle.
+                tokio::spawn(trusty_memory_mcp::run_stdio(state.clone()));
                 tokio::select! {
-                    r = trusty_memory_mcp::run_stdio(state.clone()) => r,
                     r = trusty_memory_mcp::run_http_on(state, listener) => r,
                     _ = tokio::signal::ctrl_c() => {
                         tracing::info!("ctrl-c received, shutting down");
