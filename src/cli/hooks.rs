@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+use trusty_memory_core::retrieval::{recall_with_default_embedder, RecallResult};
 use trusty_memory_core::RoomType;
 
 /// Top-level args for the `hooks` subcommand.
@@ -203,6 +204,14 @@ fn trusty_hook_entries() -> Value {
                         {"type": "command", "command": "trusty-memory hooks fire claude.post-tool-use"}
                     ]
                 }
+            ],
+            "UserPromptSubmit": [
+                {
+                    "matcher": "",
+                    "hooks": [
+                        {"type": "command", "command": "trusty-memory hooks fire claude.user-prompt"}
+                    ]
+                }
             ]
         }
     })
@@ -371,8 +380,9 @@ async fn handle_fire(opts: HooksFireArgs, palace_arg: &str) -> Result<()> {
         "git.post-commit" => fire_git_post_commit(&palace_name).await,
         "claude.stop" => fire_claude_stop(&palace_name).await,
         "claude.post-tool-use" => fire_claude_post_tool_use(&palace_name).await,
+        "claude.user-prompt" => fire_claude_user_prompt(&palace_name).await,
         other => Err(anyhow!(
-            "unknown hook event: {other} (expected git.post-commit | claude.stop | claude.post-tool-use)"
+            "unknown hook event: {other} (expected git.post-commit | claude.stop | claude.post-tool-use | claude.user-prompt)"
         )),
     }
 }
@@ -653,13 +663,15 @@ async fn fire_claude_post_tool_use(palace: &str) -> Result<()> {
 
     let handle = open_or_create_handle(palace).await?;
 
-    // Aggressive dedup: skip if another drawer with the same tool tag was
-    // stored within the last 60s. This fires constantly during active sessions.
+    // Dedup: skip if another drawer with the same tool tag was stored within
+    // the last 10s. Tight window prevents bursts (rapid successive Edits on
+    // the same file) without silently dropping the majority of tool events
+    // during an active session.
     let recent = handle.list_drawers(None, Some(tag_tool), 5);
     let now = chrono::Utc::now();
     let too_recent = recent
         .iter()
-        .any(|d| (now - d.created_at).num_seconds() < 60);
+        .any(|d| (now - d.created_at).num_seconds() < 10);
     if too_recent {
         return Ok(());
     }
@@ -669,6 +681,100 @@ async fn fire_claude_post_tool_use(palace: &str) -> Result<()> {
         .remember(content, room, tags, 0.3)
         .await
         .context("remember claude post-tool-use")?;
+    Ok(())
+}
+
+// ── claude.user-prompt ───────────────────────────────────────────────────────
+
+/// Parsed payload for the Claude Code UserPromptSubmit hook.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct UserPromptPayload {
+    pub prompt: Option<String>,
+}
+
+/// Parse a Claude Code `UserPromptSubmit` hook stdin payload.
+///
+/// Why: Pure parser keeps the fire path simple and unit-testable. Claude Code
+/// passes the user's submitted prompt via stdin as JSON; we extract just the
+/// `prompt` text used as the recall query.
+/// What: Extracts `prompt` from the JSON payload. Falls back to treating the
+/// entire stdin string as a raw prompt if JSON parsing fails (defensive — keeps
+/// the hook useful even if Claude Code's schema changes).
+/// Test: `parse_user_prompt_payload_*` covers JSON, missing field, and raw text.
+pub fn parse_user_prompt_payload(json_str: &str) -> UserPromptPayload {
+    let trimmed = json_str.trim();
+    if trimmed.is_empty() {
+        return UserPromptPayload::default();
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+        return UserPromptPayload {
+            prompt: v
+                .get("prompt")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string()),
+        };
+    }
+    // Not JSON — treat the raw stdin as the prompt text.
+    UserPromptPayload {
+        prompt: Some(trimmed.to_string()),
+    }
+}
+
+/// Format recall results into a markdown block suitable for injection.
+///
+/// Why: Pure formatter so we can unit-test the shape without a palace.
+/// What: Renders a short header plus a bulleted list of recall result content,
+/// truncated to a reasonable preview length. Empty input returns an empty
+/// string so the caller can skip injection entirely.
+/// Test: `format_recall_context_*` covers empty + populated cases.
+pub fn format_recall_context(results: &[RecallResult]) -> String {
+    if results.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("Relevant memories from trusty-memory:\n");
+    for r in results {
+        let preview_len = r.drawer.content.len().min(400);
+        let mut preview = r.drawer.content[..preview_len].to_string();
+        if r.drawer.content.len() > preview_len {
+            preview.push('…');
+        }
+        // Normalize whitespace so the injection stays a clean bullet.
+        preview = preview.replace('\n', " ");
+        out.push_str(&format!("- (L{}, {:.2}) {}\n", r.layer, r.score, preview));
+    }
+    out
+}
+
+async fn fire_claude_user_prompt(palace: &str) -> Result<()> {
+    // Read the user's prompt from stdin (Claude Code passes it as JSON).
+    let payload_str = read_stdin_with_timeout(Duration::from_millis(200)).await;
+    let payload = parse_user_prompt_payload(&payload_str);
+    let Some(prompt) = payload.prompt.filter(|s| !s.trim().is_empty()) else {
+        // Nothing to query; exit silently.
+        return Ok(());
+    };
+
+    // Open the palace handle. If anything fails we exit silently — a hook
+    // must never block the user's prompt.
+    let handle = match open_or_create_handle(palace).await {
+        Ok(h) => h,
+        Err(_) => return Ok(()),
+    };
+
+    // L2 recall, top-5. Keep it fast; this runs on every prompt.
+    let results = match recall_with_default_embedder(&handle, &prompt, 5).await {
+        Ok(r) => r,
+        Err(_) => return Ok(()),
+    };
+
+    let context = format_recall_context(&results);
+    if context.is_empty() {
+        return Ok(());
+    }
+
+    // Emit the JSON envelope Claude Code consumes to inject context.
+    let envelope = json!({ "context": context });
+    println!("{envelope}");
     Ok(())
 }
 
@@ -881,6 +987,82 @@ mod tests {
     fn settings_has_trusty_hook_negative() {
         let v = json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other"}]}]}});
         assert!(!settings_has_trusty_hook(&v));
+    }
+
+    #[test]
+    fn parse_user_prompt_payload_json() {
+        let p = parse_user_prompt_payload(r#"{"prompt":"how do I add a hook?"}"#);
+        assert_eq!(p.prompt.as_deref(), Some("how do I add a hook?"));
+    }
+
+    #[test]
+    fn parse_user_prompt_payload_missing_field() {
+        let p = parse_user_prompt_payload(r#"{"session_id":"abc"}"#);
+        assert!(p.prompt.is_none());
+    }
+
+    #[test]
+    fn parse_user_prompt_payload_raw_text_fallback() {
+        let p = parse_user_prompt_payload("plain text query");
+        assert_eq!(p.prompt.as_deref(), Some("plain text query"));
+    }
+
+    #[test]
+    fn parse_user_prompt_payload_empty() {
+        let p = parse_user_prompt_payload("   ");
+        assert_eq!(p, UserPromptPayload::default());
+    }
+
+    #[test]
+    fn format_recall_context_empty() {
+        assert_eq!(format_recall_context(&[]), "");
+    }
+
+    #[test]
+    fn format_recall_context_populated() {
+        use trusty_memory_core::Drawer;
+        use uuid::Uuid;
+        let now = chrono::Utc::now();
+        let drawer = Drawer {
+            id: Uuid::nil(),
+            room_id: Uuid::nil(),
+            content: "hook installation works via merge_claude_settings".to_string(),
+            importance: 0.5,
+            source_file: None,
+            created_at: now,
+            tags: vec![],
+            access_count: 0,
+            last_accessed_at: Some(now),
+        };
+        let results = vec![RecallResult {
+            drawer,
+            score: 0.82,
+            layer: 2,
+        }];
+        let out = format_recall_context(&results);
+        assert!(out.starts_with("Relevant memories"));
+        assert!(out.contains("L2"));
+        assert!(out.contains("0.82"));
+        assert!(out.contains("merge_claude_settings"));
+    }
+
+    #[test]
+    fn trusty_hook_entries_includes_user_prompt_submit() {
+        let v = trusty_hook_entries();
+        let arr = v
+            .get("hooks")
+            .and_then(|h| h.get("UserPromptSubmit"))
+            .and_then(|s| s.as_array())
+            .expect("UserPromptSubmit array");
+        let cmds: Vec<&str> = arr
+            .iter()
+            .filter_map(|e| e.get("hooks").and_then(|h| h.as_array()))
+            .flat_map(|a| a.iter())
+            .filter_map(|c| c.get("command").and_then(|c| c.as_str()))
+            .collect();
+        assert!(cmds
+            .iter()
+            .any(|s| s.contains("trusty-memory hooks fire claude.user-prompt")));
     }
 
     #[test]
