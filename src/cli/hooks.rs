@@ -694,7 +694,7 @@ async fn handle_status(palace: &str, _out: &OutputConfig) -> Result<()> {
     // Fetch git + claude tagged drawers separately, merge, sort by created_at.
     let mut combined = handle.list_drawers(None, Some("source:git".to_string()), 50);
     combined.extend(handle.list_drawers(None, Some("source:claude".to_string()), 50));
-    combined.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    combined.sort_by_key(|b| std::cmp::Reverse(b.created_at));
     combined.truncate(10);
 
     if combined.is_empty() {

@@ -16,9 +16,10 @@
 //! manually.
 
 use crate::cli::ServiceCommands;
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 /// Reverse-DNS label used for the LaunchAgent and `launchctl` identifiers.
+#[cfg(target_os = "macos")]
 const SERVICE_LABEL: &str = "com.trusty.trusty-memory";
 
 /// Top-level dispatcher for `trusty-memory service <sub>`.
@@ -42,6 +43,7 @@ pub fn handle(cmd: ServiceCommands) -> Result<()> {
 #[cfg(target_os = "macos")]
 fn install() -> Result<()> {
     use std::fs;
+    use anyhow::Context;
 
     let binary = std::env::current_exe().context("resolving current binary path")?;
     let home = dirs::home_dir().context("could not resolve home directory")?;
@@ -109,6 +111,7 @@ fn install() -> Result<()> {
 #[cfg(target_os = "macos")]
 fn uninstall() -> Result<()> {
     use std::fs;
+    use anyhow::Context;
 
     let home = dirs::home_dir().context("could not resolve home directory")?;
     let plist_path = home
@@ -151,6 +154,8 @@ fn uninstall() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn status() -> Result<()> {
+    use anyhow::Context;
+
     let output = std::process::Command::new("launchctl")
         .args(["list", SERVICE_LABEL])
         .output()
@@ -193,6 +198,7 @@ fn status() -> Result<()> {
 /// if the file is absent, empty, or unreadable.
 /// Test: Manual — start the daemon, run `trusty-memory service status`,
 /// confirm the printed address matches the daemon-written discovery file.
+#[cfg(target_os = "macos")]
 fn read_http_addr() -> Option<String> {
     trusty_common::read_daemon_addr("trusty-memory")
         .ok()
@@ -204,6 +210,7 @@ fn read_http_addr() -> Option<String> {
 fn logs() -> Result<()> {
     use std::fs;
     use std::io::{BufRead, BufReader};
+    use anyhow::Context;
 
     let home = dirs::home_dir().context("could not resolve home directory")?;
     let log_path = home.join(".trusty-memory").join("logs").join("daemon.log");
