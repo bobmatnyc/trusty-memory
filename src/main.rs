@@ -151,6 +151,35 @@ async fn main() -> Result<()> {
             // it would release the advisory lock.
             let _lock_file = lock_file;
 
+            // Write the PID file unconditionally — *before* the HTTP/stdio
+            // branch — so single-instance discovery works for `--no-http`
+            // daemons too (issue follow-up to #56). Previously this only
+            // happened in the HTTP branch, leaving `--no-http` daemons
+            // invisible to `status`, `stop`, and `doctor`; the result was
+            // status output reading `[discovery file missing/stale — found
+            // via port scan]` or "not running" depending on whether any
+            // *other* trusty-memory HTTP daemon happened to be listening
+            // on 3031..=3050. The PID file is the one universal liveness
+            // marker that applies to every serve mode.
+            //
+            // Why: `--no-http` (the Claude Code hook path) has no HTTP
+            // listener to advertise via `http_addr`, but the daemon process
+            // is still very much alive. Operators and scripts need *some*
+            // discovery artifact regardless of transport.
+            // What: Write the current PID to `<service_root>/trusty-memory.pid`
+            // here, before any branching. Failure is logged but non-fatal so
+            // the daemon still serves even if the data dir is read-only
+            // (e.g. a misconfigured sandbox) — clobbering a previous PID
+            // file is fine because the file-lock above already guarantees
+            // single-instance.
+            // Test: `cargo test --workspace`; manual smoke: run
+            // `trusty-memory serve --no-http &` and confirm
+            // `cat <service_root>/trusty-memory.pid` matches the bg PID
+            // and `trusty-memory status` reports the daemon as running.
+            if let Err(e) = cli::stop::write_pid_file(std::process::id()) {
+                tracing::warn!("could not write daemon pid file: {e:#}");
+            }
+
             // Auto-create the default palace if --palace was supplied and the
             // palace doesn't yet exist on disk.
             //
@@ -244,13 +273,8 @@ async fn main() -> Result<()> {
                     Err(e) => tracing::warn!("could not write daemon addr file: {e:#}"),
                 }
 
-                // Write a PID file alongside the addr file so `trusty-memory stop`
-                // can find this process. Best-effort; failure is logged but
-                // does not abort the daemon (a missing PID file just means
-                // `stop` will print a friendly "no daemon running" message).
-                if let Err(e) = cli::stop::write_pid_file(std::process::id()) {
-                    tracing::warn!("could not write daemon pid file: {e:#}");
-                }
+                // (PID file is written unconditionally above, before this
+                // branch — covers both HTTP and `--no-http` modes.)
 
                 // Spawn Dreamer initialization *after* HTTP binds so the
                 // daemon is immediately healthy. Open palaces one-at-a-time
@@ -450,8 +474,21 @@ async fn main() -> Result<()> {
             // with a different `HOME`). `daemon_probe::probe_daemon` tries
             // the env var, the discovery file, and a candidate port range
             // before giving up.
+            // Check the PID file first: it's the authoritative liveness
+            // signal regardless of transport (HTTP or `--no-http` stdio).
+            // For HTTP daemons we still want to print the bound address, so
+            // we do the HTTP probe second and prefer its richer output —
+            // but only when the source is more specific than a blind
+            // candidate-port scan. Otherwise the PID-file signal wins,
+            // which avoids the failure mode where `status` reports a
+            // misleading `HTTP: http://127.0.0.1:3031` for a `--no-http`
+            // daemon just because some unrelated process answers on 3031.
+            let pid_proc = cli::daemon_probe::probe_pid_file();
             match cli::daemon_probe::probe_daemon() {
-                Some(found) => {
+                Some(found)
+                    if !matches!(found.source, cli::daemon_probe::AddrSource::CandidatePort)
+                        || pid_proc.is_none() =>
+                {
                     let tag = match found.source {
                         cli::daemon_probe::AddrSource::EnvVar => {
                             format!(" [via ${}]", cli::daemon_probe::HTTP_PORT_ENV)
@@ -463,7 +500,13 @@ async fn main() -> Result<()> {
                     };
                     println!("HTTP: http://{}{tag}", found.addr);
                 }
-                None => println!("daemon: not running (serve not started)"),
+                _ => match pid_proc {
+                    Some(proc) => println!(
+                        "daemon: running (PID {}, stdio-only — no HTTP listener)",
+                        proc.pid
+                    ),
+                    None => println!("daemon: not running (serve not started)"),
+                },
             }
         }
 
@@ -551,7 +594,14 @@ async fn ensure_daemon() {
 /// Test: Exercised by the `status` / `doctor` integration smoke and the
 /// `daemon_probe` unit tests.
 fn daemon_alive() -> bool {
-    cli::daemon_probe::probe_daemon().is_some()
+    // HTTP probe OR a live PID file. The PID-file path matters for
+    // `--no-http` daemons (the Claude Code stdio hook), which never bind a
+    // TCP listener but are otherwise fully functional. Without this
+    // disjunction `ensure_daemon` would treat a healthy stdio daemon as
+    // dead and try to spawn a duplicate (which would then fail the
+    // single-instance file-lock check and exit 1, leaving no daemon at all
+    // for the calling CLI).
+    cli::daemon_probe::probe_daemon().is_some() || cli::daemon_probe::probe_pid_file().is_some()
 }
 
 /// Returns true when the `trusty-memory.lock` file at the data root is held

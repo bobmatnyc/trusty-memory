@@ -17,6 +17,7 @@
 //! `parse_addr_handles_bare_port` cover the pure helpers; end-to-end probe
 //! behavior is exercised manually via `trusty-memory doctor`.
 
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
@@ -73,6 +74,75 @@ pub enum AddrSource {
     CandidatePort,
 }
 
+/// Result of a process-level (non-HTTP) liveness probe.
+///
+/// Why: `--no-http` daemons (Claude Code stdio path) have no listener to
+/// connect to but are still very much alive. `status` / `doctor` need to
+/// distinguish that case from "no daemon at all". The PID file is the
+/// authoritative marker for "a daemon process exists" regardless of
+/// transport.
+/// What: Carries the daemon's PID. The probe asserts the process is
+/// signalable (i.e. exists and we have permission to signal it) via
+/// `kill -0` semantics.
+/// Test: `pid_alive_returns_false_for_unused_pid` covers the negative case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonProcess {
+    /// The live PID read from the PID file.
+    pub pid: u32,
+}
+
+/// Returns the running daemon's PID if a live process matches the PID file.
+///
+/// Why: Provides a transport-independent liveness signal for `--no-http`
+/// daemons. The HTTP probes in `probe_daemon` cannot detect a stdio-only
+/// daemon because there is nothing listening on TCP.
+/// What: Reads `<service_root>/trusty-memory.pid` via
+/// `cli::stop::read_pid_file`; if present, calls `pid_alive` (kill 0) to
+/// confirm the process still exists. Returns `Some(DaemonProcess)` only
+/// when both conditions hold.
+/// Test: Indirectly via `status` integration when running `serve --no-http`.
+pub fn probe_pid_file() -> Option<DaemonProcess> {
+    let pid = crate::cli::stop::read_pid_file()?;
+    if pid_alive(pid) {
+        Some(DaemonProcess { pid })
+    } else {
+        None
+    }
+}
+
+/// Best-effort "is this PID currently signalable?" check.
+///
+/// Why: We want to know if the daemon process from the PID file is still
+/// running without killing it. Sending signal 0 to a PID is the canonical
+/// POSIX liveness probe — exit code 0 means "exists and signalable".
+/// What: On Unix invokes `/bin/kill -0 <pid>` via `std::process::Command`
+/// and reports success based on the exit status. Avoids a new `libc`/`nix`
+/// dependency. On non-Unix platforms returns `false` so callers degrade
+/// gracefully to the HTTP-only discovery path.
+/// Test: `pid_alive_returns_false_for_unused_pid` asserts a definitely-unused
+/// PID is reported dead.
+pub fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // `kill -0 <pid>` exits 0 iff the target process exists and we can
+        // signal it. We swallow stdout/stderr because callers only care
+        // about the boolean outcome.
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// Probe every known source for a live trusty-memory daemon address.
 ///
 /// Why: Issue #50. Previously, `doctor` and `status` relied solely on the
@@ -118,24 +188,76 @@ pub fn probe_daemon() -> Option<DaemonAddr> {
     })
 }
 
-/// Try every candidate port on `127.0.0.1` and return the first that answers.
+/// Try every candidate port on `127.0.0.1` and return the first that answers
+/// as a trusty-memory daemon (verified via `/health`).
 ///
 /// Why: Fallback for when both the env var and the discovery file are
 /// missing or stale — covers the launchd-with-different-HOME case from
-/// issue #50.
-/// What: Iterates `CANDIDATE_PORT_START..=CANDIDATE_PORT_END`, attempting a
-/// short TCP connect to `127.0.0.1:<port>`. Returns the first live address
-/// or `None` if none respond.
+/// issue #50. Crucially, a bare TCP connect is not enough: macOS reserves
+/// TCP 3031 for the `eppc` (Remote AppleEvents) system service, which
+/// accepts connects and then resets — that produced a false positive where
+/// `trusty-memory status` claimed the daemon lived on 3031 even when the
+/// daemon was running with `--no-http` (no HTTP listener at all).
+/// What: Iterates `CANDIDATE_PORT_START..=CANDIDATE_PORT_END`. For each
+/// port that accepts a TCP connect we issue a minimal HTTP/1.1 `GET /health`
+/// and require the response to start with `HTTP/1.1 200`. Only then do we
+/// accept the port as a trusty-memory daemon. Returns the first verified
+/// live address or `None` if none respond like trusty-memory.
 /// Test: `probe_candidate_ports_returns_none_when_nothing_listens` runs
-/// after binding nothing and asserts `None`.
+/// after binding nothing and asserts `None`; the eppc false-positive case
+/// is exercised by manual smoke (run `trusty-memory serve --no-http` and
+/// confirm `trusty-memory status` reports "daemon: not running").
 fn probe_candidate_ports() -> Option<SocketAddr> {
     for port in CANDIDATE_PORT_START..=CANDIDATE_PORT_END {
         let sa = SocketAddr::from(([127, 0, 0, 1], port));
-        if tcp_alive(&sa) {
+        if tcp_alive(&sa) && http_health_ok(&sa) {
             return Some(sa);
         }
     }
     None
+}
+
+/// Verify that the endpoint at `addr` is a trusty-memory HTTP daemon by
+/// hitting `/health` and checking for `HTTP/1.1 200`.
+///
+/// Why: A bare TCP connect is insufficient for liveness — macOS's built-in
+/// `eppc` service binds TCP 3031 by default and accepts connects (then
+/// resets), which produces a false positive when the candidate-port probe
+/// runs on a Mac with no trusty-memory HTTP listener. We must speak HTTP to
+/// confirm the listener is ours. We keep the implementation dependency-free
+/// (std `TcpStream`) rather than reaching for `reqwest` because the probe
+/// runs from sync contexts (e.g. `lock_file_held`, sync `status`) and a
+/// short hand-rolled GET request is sufficient.
+/// What: Opens a short-timeout TCP connection, writes a minimal HTTP/1.1
+/// `GET /health` request with `Connection: close`, reads up to 64 bytes of
+/// the response, and returns true iff the bytes start with `HTTP/1.1 200`.
+/// Any I/O error, timeout, or non-200 status returns false.
+/// Test: Implicitly covered by `probe_candidate_ports_returns_none_when_nothing_listens`;
+/// manual smoke with `trusty-memory serve --no-http` confirms port 3031
+/// (macOS eppc) no longer triggers a false positive.
+fn http_health_ok(addr: &SocketAddr) -> bool {
+    let Ok(mut stream) = TcpStream::connect_timeout(addr, PROBE_TIMEOUT) else {
+        return false;
+    };
+    if stream.set_read_timeout(Some(PROBE_TIMEOUT)).is_err()
+        || stream.set_write_timeout(Some(PROBE_TIMEOUT)).is_err()
+    {
+        return false;
+    }
+    let req = format!(
+        "GET /health HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        addr
+    );
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 64];
+    let Ok(n) = stream.read(&mut buf) else {
+        return false;
+    };
+    buf.get(..n)
+        .map(|slice| slice.starts_with(b"HTTP/1.1 200"))
+        .unwrap_or(false)
 }
 
 /// Quick TCP-connect liveness check.
@@ -196,6 +318,21 @@ mod tests {
         // a live addr or None. The pure-logic guarantee is exercised by the
         // parse tests above.
         let _ = probe_candidate_ports();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pid_alive_returns_false_for_unused_pid() {
+        // PID 0x7FFF_FFFF is well outside any platform's pid_max and is
+        // guaranteed not to exist. `kill -0` must report it as dead.
+        assert!(!pid_alive(0x7FFF_FFFF));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pid_alive_returns_true_for_current_process() {
+        // Our own PID is by definition alive and signalable.
+        assert!(pid_alive(std::process::id()));
     }
 
     #[test]

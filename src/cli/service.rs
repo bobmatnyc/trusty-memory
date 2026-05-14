@@ -42,8 +42,8 @@ pub fn handle(cmd: ServiceCommands) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn install() -> Result<()> {
-    use std::fs;
     use anyhow::Context;
+    use std::fs;
 
     let binary = std::env::current_exe().context("resolving current binary path")?;
     let home = dirs::home_dir().context("could not resolve home directory")?;
@@ -110,8 +110,8 @@ fn install() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn uninstall() -> Result<()> {
-    use std::fs;
     use anyhow::Context;
+    use std::fs;
 
     let home = dirs::home_dir().context("could not resolve home directory")?;
     let plist_path = home
@@ -208,9 +208,9 @@ fn read_http_addr() -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn logs() -> Result<()> {
+    use anyhow::Context;
     use std::fs;
     use std::io::{BufRead, BufReader};
-    use anyhow::Context;
 
     let home = dirs::home_dir().context("could not resolve home directory")?;
     let log_path = home.join(".trusty-memory").join("logs").join("daemon.log");
