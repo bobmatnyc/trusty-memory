@@ -3574,7 +3574,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-embedder"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3588,7 +3588,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-mcp-core"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "serde",
@@ -3599,7 +3599,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-memory"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3628,7 +3628,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-memory-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3657,7 +3657,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-memory-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",

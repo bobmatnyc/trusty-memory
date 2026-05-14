@@ -1,0 +1,16 @@
+{
+  "sessions": [
+    {
+      "id": "c904a0e1-c253-475e-bc61-e2919b53a742",
+      "started_at": "2026-05-11T16:17:05.691597Z",
+      "workflow": "pending",
+      "status": "running"
+    },
+    {
+      "id": "15a80ea7-c564-4a82-872d-93df231671e5",
+      "started_at": "2026-05-11T16:17:17.702904Z",
+      "workflow": "pending",
+      "status": "running"
+    }
+  ]
+}
