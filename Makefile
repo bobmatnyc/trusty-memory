@@ -29,20 +29,13 @@ build: ## cargo build (dev)
 release: ## cargo build --release
 	cargo build --release
 
-patch: ## Bump patch version in Cargo.toml, commit, tag
-	@CURRENT=$$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/'); \
-	MAJOR=$$(echo "$$CURRENT" | cut -d. -f1); \
-	MINOR=$$(echo "$$CURRENT" | cut -d. -f2); \
-	PATCH=$$(echo "$$CURRENT" | cut -d. -f3); \
-	NEW_PATCH=$$((PATCH + 1)); \
-	NEW_VERSION="$$MAJOR.$$MINOR.$$NEW_PATCH"; \
-	echo "Bumping $$CURRENT -> $$NEW_VERSION"; \
-	sed -i.bak "0,/^version = \"$$CURRENT\"/s//version = \"$$NEW_VERSION\"/" Cargo.toml && rm -f Cargo.toml.bak; \
-	cargo check --workspace; \
-	git add Cargo.toml Cargo.lock; \
-	git commit -m "chore: bump version to $$NEW_VERSION"; \
+patch: ## Bump patch version across workspace, commit, and tag v* (triggers crates.io publish)
+	cargo set-version --bump patch
+	@NEW_VERSION=$$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/'); \
+	git add Cargo.toml Cargo.lock crates/trusty-memory-core/Cargo.toml crates/trusty-memory-mcp/Cargo.toml; \
+	git commit -m "chore: bump version to v$$NEW_VERSION"; \
 	git tag "v$$NEW_VERSION"; \
-	echo "Tagged v$$NEW_VERSION"
+	echo "Tagged v$$NEW_VERSION — push with: git push origin main --tags"
 
 deploy: ## cargo install --path . --locked (installs trusty-memory binary locally)
 	cargo install --path . --locked
