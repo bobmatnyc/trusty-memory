@@ -13,7 +13,7 @@
 use crate::decay::DecayConfig;
 use crate::embed::{Embedder, FastEmbedder};
 use crate::palace::Drawer;
-use crate::retrieval::{recall_deep, PalaceHandle};
+use crate::retrieval::PalaceHandle;
 use crate::store::vector::VectorStore;
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
@@ -49,7 +49,11 @@ impl Default for DreamConfig {
             idle_secs: 300,
             dedup_threshold: 0.95,
             prune_importance: 0.05,
-            max_cycle_ms: 5_000,
+            // 60s gives the dedup pass room to embed several hundred drawers
+            // in one batch + run pairwise comparisons even on cold-start
+            // embedder loads. The previous 5s budget was exhausted before the
+            // pass could finish on palaces with ~100+ drawers (issue #55).
+            max_cycle_ms: 60_000,
         }
     }
 }
@@ -388,6 +392,20 @@ impl Dreamer {
     }
 
     /// Find near-duplicates and merge survivors; returns the merge count.
+    ///
+    /// Why: The previous implementation initialised `FastEmbedder` once but
+    /// then called `recall_deep` per drawer — each call does a fresh embed
+    /// (50–100ms on the local ONNX model) plus an L3 search. On a palace with
+    /// ~100 drawers that's >5s, which exceeded the per-cycle budget (issue
+    /// #55). Batch-embedding all drawer contents upfront turns the inner loop
+    /// into pure vector arithmetic via `vector_store.search`, which is
+    /// sub-millisecond per query.
+    /// What: Snapshots drawers, batch-embeds every drawer's content in one
+    /// `embed_batch` call, then iterates each drawer and uses its pre-computed
+    /// vector to search the HNSW index for near-duplicates. `vector_store
+    /// .search` returns pure cosine similarity (1 - distance), so no
+    /// importance-renormalisation is required. Survivors are picked by raw
+    /// `importance`; losers are merged in and forgotten.
     async fn dedup_pass(
         &self,
         handle: &Arc<PalaceHandle>,
@@ -399,15 +417,33 @@ impl Dreamer {
             return Ok(0);
         }
 
-        // Embedder is heavy; only build it once we know there's work to do.
+        // Build the embedder once, up front, then batch-embed every drawer's
+        // content in a single call. This is the critical perf win: O(1)
+        // embedder initialisations and one bulk ONNX inference instead of
+        // O(n) inferences scattered across the per-drawer loop.
         let embedder = FastEmbedder::new()
             .await
             .context("init embedder for dream dedup")?;
 
+        let contents: Vec<String> = snapshot.iter().map(|d| d.content.clone()).collect();
+        let vectors = embedder
+            .embed_batch(&contents)
+            .await
+            .context("batch embed drawers for dream dedup")?;
+
+        if vectors.len() != snapshot.len() {
+            // Defensive: embedder must return one vector per input.
+            anyhow::bail!(
+                "embedder returned {} vectors for {} drawers",
+                vectors.len(),
+                snapshot.len()
+            );
+        }
+
         let mut merges: usize = 0;
         let mut already_removed: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
 
-        for drawer in snapshot.iter() {
+        for (drawer, query_vec) in snapshot.iter().zip(vectors.iter()) {
             if started.elapsed() >= budget {
                 break;
             }
@@ -415,36 +451,29 @@ impl Dreamer {
                 continue;
             }
             // Top-3 keeps the dedup pass cheap; the first neighbor is `drawer`
-            // itself (score ~1.0) so we look at index 1+.
-            let hits = recall_deep(handle, &embedder, &drawer.content, 3).await?;
-            for hit in hits.into_iter().skip(1) {
-                if hit.drawer.id == drawer.id || already_removed.contains(&hit.drawer.id) {
+            // itself (score ~1.0) so we look at index 1+. `vector_store.search`
+            // returns pure cosine similarity — no importance weighting baked
+            // in, so we can compare directly to `dedup_threshold`.
+            let hits = handle.vector_store.search(query_vec, 3).await?;
+            for hit in hits.into_iter() {
+                if hit.drawer_id == drawer.id || already_removed.contains(&hit.drawer_id) {
                     continue;
                 }
-                // `hit.score = effective_importance * cosine`; renormalize by
-                // dividing out the survivor's effective importance to recover
-                // a similarity-only signal. If that's not possible (zero
-                // importance) fall back to the raw score.
-                let age = DecayConfig::age_days(hit.drawer.created_at);
-                let boost = hit.drawer.accumulated_boost(&handle.decay_config);
-                let eff =
-                    handle
-                        .decay_config
-                        .effective_importance(hit.drawer.importance, age, boost);
-                let similarity = if eff > 0.0 {
-                    hit.score / eff
-                } else {
-                    hit.score
+                if hit.score < self.config.dedup_threshold {
+                    continue;
+                }
+                // Resolve the loser's drawer record from the snapshot. If it's
+                // not in the snapshot (e.g. orphan vector), skip — the compact
+                // pass will clean it up.
+                let Some(hit_drawer) = snapshot.iter().find(|d| d.id == hit.drawer_id) else {
+                    continue;
                 };
-                if similarity < self.config.dedup_threshold {
-                    continue;
-                }
 
                 // Pick survivor (higher importance wins; ties keep `drawer`).
-                let (survivor, loser) = if drawer.importance >= hit.drawer.importance {
-                    (drawer.clone(), hit.drawer.clone())
+                let (survivor, loser) = if drawer.importance >= hit_drawer.importance {
+                    (drawer.clone(), hit_drawer.clone())
                 } else {
-                    (hit.drawer.clone(), drawer.clone())
+                    (hit_drawer.clone(), drawer.clone())
                 };
                 merge_into(handle, &survivor, &loser);
                 let _ = handle.forget(loser.id).await;
@@ -478,21 +507,14 @@ impl Dreamer {
             let eff = handle
                 .decay_config
                 .effective_importance(drawer.importance, age, boost);
-            if eff < self.config.prune_importance && age > MIN_AGE_DAYS {
+            // `<=` (not `<`): once a drawer's effective importance decays to
+            // the floor — meaning it's old and unimportant enough that the
+            // decay clamp kicked in — it becomes prunable. Using strict `<`
+            // here created the floor-collision bug (#55): with the default
+            // `floor = prune_importance = 0.05`, the condition `eff < 0.05`
+            // was unsatisfiable, so nothing was ever pruned.
+            if eff <= self.config.prune_importance && age > MIN_AGE_DAYS {
                 victims.push(drawer.id);
-            }
-        }
-
-        // The decay floor (`DecayConfig::floor`) clamps `effective_importance`
-        // from below, so very-low-importance drawers may still surface as
-        // `floor`. Treat the user's `prune_importance` as the *base* threshold
-        // when the decay floor would otherwise mask the signal.
-        if victims.is_empty() {
-            for drawer in snapshot.iter() {
-                let age = DecayConfig::age_days(drawer.created_at);
-                if drawer.importance < self.config.prune_importance && age > MIN_AGE_DAYS {
-                    victims.push(drawer.id);
-                }
             }
         }
 
@@ -664,7 +686,7 @@ mod tests {
         assert_eq!(cfg.idle_secs, 300);
         assert!((cfg.dedup_threshold - 0.95).abs() < 1e-6);
         assert!((cfg.prune_importance - 0.05).abs() < 1e-6);
-        assert_eq!(cfg.max_cycle_ms, 5_000);
+        assert_eq!(cfg.max_cycle_ms, 60_000);
     }
 
     /// Why: `touch` must reset the idle clock; with `idle_secs=0` `is_idle`
@@ -778,6 +800,49 @@ mod tests {
             handle.drawers.read().is_empty(),
             "low-importance aged drawer should be removed"
         );
+    }
+
+    /// Why: Regression for issue #55. With the previous strict `<` condition
+    /// and `prune_importance == DecayConfig::floor == 0.05`, a drawer whose
+    /// `effective_importance` decayed to the floor was clamped at exactly
+    /// `0.05`, making `eff < 0.05` unsatisfiable — nothing was ever pruned.
+    /// The `<=` fix means a drawer at the floor (old, unimportant) is now
+    /// correctly eligible for pruning.
+    /// What: Insert one drawer with `importance == prune_importance == floor`,
+    /// age it past 30 days so the decay floor clamps `eff`, run a cycle, and
+    /// assert it gets pruned.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn dream_cycle_prunes_at_floor_importance() {
+        let handle = open_test_handle("dream-prune-floor").await;
+        // Importance exactly at the prune threshold (and decay floor default).
+        handle
+            .remember(
+                "drawer that decays to the floor".into(),
+                RoomType::General,
+                vec![],
+                0.05,
+            )
+            .await
+            .unwrap();
+        {
+            let mut drawers = handle.drawers.write();
+            for d in drawers.iter_mut() {
+                // 60 days ago — well past the 30-day prune-age floor and
+                // enough decay time to push `eff` down to `floor`.
+                d.created_at = Utc::now() - ChronoDuration::days(60);
+            }
+        }
+        assert_eq!(handle.drawers.read().len(), 1);
+
+        let dreamer = Dreamer::new(DreamConfig::default());
+        let stats = dreamer.dream_cycle(&handle).await.unwrap();
+
+        assert_eq!(
+            stats.pruned, 1,
+            "drawer at floor importance + aged > 30d must be prunable (was unsatisfiable under strict `<`)"
+        );
+        assert!(handle.drawers.read().is_empty());
     }
 
     /// Why: The serve daemon must be able to terminate the dream loop on
