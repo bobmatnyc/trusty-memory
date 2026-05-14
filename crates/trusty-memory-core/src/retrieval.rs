@@ -25,7 +25,40 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use tokio::sync::OnceCell;
 use uuid::Uuid;
+
+/// Process-wide shared FastEmbedder.
+///
+/// Why: `FastEmbedder::new()` loads a ~90 MB ONNX session — creating one per
+/// call (as the previous `recall_with_default_embedder` / `remember` /
+/// dream `dedup_pass` did) blew memory to multiple GB and forked dozens of
+/// model instances. Issue #57.
+/// What: A `tokio::sync::OnceCell` initialised on first use and shared by every
+/// caller that lacks a context-supplied embedder. Concurrent first-use races
+/// collapse to a single load.
+/// Test: `shared_embedder_is_singleton` confirms two calls return the same
+/// `Arc` pointer.
+static SHARED_EMBEDDER: OnceCell<Arc<FastEmbedder>> = OnceCell::const_new();
+
+/// Resolve (or initialise) the process-wide shared `FastEmbedder`.
+///
+/// Why: Centralising fallback embedder construction guarantees at most one
+/// ONNX session per process — critical for the daemon footprint (issue #57).
+/// What: Returns a clone of the shared `Arc<FastEmbedder>`, initialising it
+/// on first call. Errors propagate from the underlying ONNX load.
+/// Test: `shared_embedder_is_singleton`.
+pub async fn shared_embedder() -> Result<Arc<FastEmbedder>> {
+    SHARED_EMBEDDER
+        .get_or_try_init(|| async {
+            let e = FastEmbedder::new()
+                .await
+                .context("init shared FastEmbedder")?;
+            Ok::<Arc<FastEmbedder>, anyhow::Error>(Arc::new(e))
+        })
+        .await
+        .cloned()
+}
 
 /// L0 — palace identity. Tiny (~100 tokens), always loaded, read from
 /// `<data_dir>/identity.txt` on palace open.
@@ -334,12 +367,13 @@ impl PalaceHandle {
         drawer.importance = importance.clamp(0.0, 1.0);
         let id = drawer.id;
 
-        // Embed and upsert. Use a per-call FastEmbedder for now; long-lived
-        // services should hold a shared embedder on the registry to amortize
-        // model load.
-        let embedder = FastEmbedder::new()
+        // Embed and upsert. Use the process-wide shared embedder so we don't
+        // spin up a fresh ONNX session per call (issue #57). The
+        // OnceCell-backed `shared_embedder` guarantees at most one model load
+        // for the lifetime of the process.
+        let embedder = shared_embedder()
             .await
-            .context("init embedder for remember")?;
+            .context("acquire shared embedder for remember")?;
         let vecs = embedder
             .embed_batch(&[content])
             .await
@@ -480,22 +514,22 @@ pub async fn recall_with_default_embedder(
     query: &str,
     top_k: usize,
 ) -> Result<Vec<RecallResult>> {
-    let embedder = FastEmbedder::new()
+    let embedder = shared_embedder()
         .await
-        .context("init embedder for recall")?;
-    recall(handle, &embedder, query, top_k).await
+        .context("acquire shared embedder for recall")?;
+    recall(handle, embedder.as_ref(), query, top_k).await
 }
 
-/// Deep recall with the per-call `FastEmbedder`.
+/// Deep recall with the shared `FastEmbedder` (issue #57).
 pub async fn recall_deep_with_default_embedder(
     handle: &PalaceHandle,
     query: &str,
     top_k: usize,
 ) -> Result<Vec<RecallResult>> {
-    let embedder = FastEmbedder::new()
+    let embedder = shared_embedder()
         .await
-        .context("init embedder for recall_deep")?;
-    recall_deep(handle, &embedder, query, top_k).await
+        .context("acquire shared embedder for recall_deep")?;
+    recall_deep(handle, embedder.as_ref(), query, top_k).await
 }
 
 /// Hash a `RoomType` to a deterministic `Uuid` so the room signal survives
@@ -1333,6 +1367,22 @@ mod tests {
         assert!(
             results.iter().any(|r| r.drawer.id == needle_id),
             "low-importance drawer beyond L1 must still be recallable after cold restart; got {results:?}"
+        );
+    }
+
+    /// Why: Issue #57 — at most one FastEmbedder must exist process-wide.
+    /// `shared_embedder` must return the same `Arc` on every call so callers
+    /// transitively share one ONNX session.
+    /// What: Call `shared_embedder` twice and assert the `Arc` pointers are
+    /// identical via `Arc::ptr_eq`.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn shared_embedder_is_singleton() {
+        let a = shared_embedder().await.unwrap();
+        let b = shared_embedder().await.unwrap();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "shared_embedder must return the same Arc on every call"
         );
     }
 

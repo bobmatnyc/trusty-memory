@@ -11,9 +11,9 @@
 //! moving part — defaults, idle clock, merge, prune, closet refresh.
 
 use crate::decay::DecayConfig;
-use crate::embed::{Embedder, FastEmbedder};
+use crate::embed::Embedder;
 use crate::palace::Drawer;
-use crate::retrieval::PalaceHandle;
+use crate::retrieval::{shared_embedder, PalaceHandle};
 use crate::store::vector::VectorStore;
 use anyhow::{Context, Result};
 use parking_lot::RwLock;
@@ -417,13 +417,13 @@ impl Dreamer {
             return Ok(0);
         }
 
-        // Build the embedder once, up front, then batch-embed every drawer's
-        // content in a single call. This is the critical perf win: O(1)
-        // embedder initialisations and one bulk ONNX inference instead of
-        // O(n) inferences scattered across the per-drawer loop.
-        let embedder = FastEmbedder::new()
+        // Reuse the process-wide shared embedder instead of constructing a
+        // fresh ONNX session for every dream cycle (issue #57). The previous
+        // per-cycle construction multiplied the daemon's memory footprint by
+        // the number of palaces.
+        let embedder = shared_embedder()
             .await
-            .context("init embedder for dream dedup")?;
+            .context("acquire shared embedder for dream dedup")?;
 
         let contents: Vec<String> = snapshot.iter().map(|d| d.content.clone()).collect();
         let vectors = embedder
@@ -568,9 +568,9 @@ async fn rebuild_index_from_drawers(
         return Ok(0);
     }
 
-    let embedder = FastEmbedder::new()
+    let embedder = shared_embedder()
         .await
-        .context("init embedder for dream rebuild")?;
+        .context("acquire shared embedder for dream rebuild")?;
 
     let mut rebuilt: usize = 0;
     for drawer in snapshot.iter() {

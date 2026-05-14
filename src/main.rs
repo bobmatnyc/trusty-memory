@@ -8,9 +8,10 @@
 //! Test: `cargo test --test integration_tests` plus `--help` and `status`
 //! integration tests in `tests/integration/cli_test.rs`.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
+use fs4::FileExt;
 use std::io;
 use trusty_memory::cli;
 use trusty_memory::cli::output::OutputConfig;
@@ -93,6 +94,58 @@ async fn main() -> Result<()> {
                 "Starting trusty-memory MCP server"
             );
             let data_root_for_state = cli::palace::data_root()?;
+
+            // Single-instance file lock (issue #56).
+            //
+            // Why: `bind_with_auto_port` silently walks forward to the next free
+            // port, so two `serve` invocations launched in quick succession both
+            // succeed — one on 3031, the next on 3032 — and the daemon count
+            // explodes. The discovery file / port probe in `ensure_daemon` has
+            // a race window between "does daemon exist?" and "spawn child".
+            // An OS-level advisory `flock` collapses that race: only one
+            // process can hold the exclusive lock at a time, and the kernel
+            // releases it on process death (no stale-lock cleanup needed).
+            // What: Open/create `<data_root>/trusty-memory.lock`, request
+            // `try_lock_exclusive`. On failure print a clear error and exit
+            // with status 1. The `_lock_file` binding keeps the handle alive
+            // for the lifetime of the process — dropping it would release the
+            // lock.
+            // Test: `cargo test --workspace` plus manual smoke (two `serve`
+            // invocations: the second exits 1 with the diagnostic).
+            std::fs::create_dir_all(&data_root_for_state).with_context(|| {
+                format!(
+                    "create data root for lock file at {}",
+                    data_root_for_state.display()
+                )
+            })?;
+            let lock_path = data_root_for_state.join("trusty-memory.lock");
+            let lock_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+                .with_context(|| format!("open lock file at {}", lock_path.display()))?;
+            match FileExt::try_lock(&lock_file) {
+                Ok(()) => {
+                    // Successfully acquired the lock; record our PID so other
+                    // probes can tell who holds it.
+                    use std::io::Write as _;
+                    let mut f = &lock_file;
+                    let _ = f.set_len(0);
+                    let _ = writeln!(f, "{}", std::process::id());
+                }
+                Err(_) => {
+                    eprintln!(
+                        "Another trusty-memory instance is already running. \
+                         Use 'trusty-memory stop' to stop it."
+                    );
+                    std::process::exit(1);
+                }
+            }
+            // Keep the handle alive for the lifetime of the daemon. Dropping
+            // it would release the advisory lock.
+            let _lock_file = lock_file;
 
             // Auto-create the default palace if --palace was supplied and the
             // palace doesn't yet exist on disk.
@@ -217,11 +270,28 @@ async fn main() -> Result<()> {
                             return;
                         }
                     };
+                    // Cap eager palace loading to keep startup footprint
+                    // bounded (issue #57). Each opened palace allocates a
+                    // SQLite pool + a usearch index handle + a Dreamer task;
+                    // on hosts with dozens of palaces this multiplied the
+                    // daemon's RSS into the multi-GB range. Palaces not
+                    // opened eagerly will still open lazily on first use
+                    // via `PalaceRegistry::open_palace`.
+                    let max_eager: usize = std::env::var("TRUSTY_MAX_STARTUP_PALACES")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(5);
                     let total = palaces.len();
-                    tracing::info!(count = total, "Dreamer background init starting");
+                    let eager_count = palaces.len().min(max_eager);
+                    tracing::info!(
+                        count = total,
+                        eager = eager_count,
+                        max_eager,
+                        "Dreamer background init starting (capped eager open)"
+                    );
                     let registry = trusty_memory_core::PalaceRegistry::new();
                     let mut opened = 0usize;
-                    for p in palaces {
+                    for p in palaces.into_iter().take(max_eager) {
                         match registry.open_palace(&root, &p.id) {
                             Ok(handle) => {
                                 let dreamer =
@@ -425,6 +495,27 @@ async fn ensure_daemon() {
     if daemon_alive() {
         return;
     }
+    // Issue #56 — even when the TCP probe says "no daemon", another `serve`
+    // process may already be coming up (HTTP not yet bound). Probe the
+    // advisory lock file: if we can't take an exclusive lock, somebody else
+    // holds it and we must not spawn a duplicate.
+    if lock_file_held() {
+        // Wait briefly for the in-flight daemon to bind its listener.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            if daemon_alive() {
+                return;
+            }
+        }
+        // Either it's still coming up or it crashed without releasing the
+        // lock (rare). Either way: don't spawn another instance.
+        eprintln!(
+            "[warn] another trusty-memory instance appears to hold the daemon lock; \
+             not spawning a duplicate"
+        );
+        return;
+    }
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::process::Command::new(&exe)
             .arg("serve")
@@ -457,4 +548,43 @@ async fn ensure_daemon() {
 /// `daemon_probe` unit tests.
 fn daemon_alive() -> bool {
     cli::daemon_probe::probe_daemon().is_some()
+}
+
+/// Returns true when the `trusty-memory.lock` file at the data root is held
+/// exclusively by another process.
+///
+/// Why: Issue #56 — `ensure_daemon` must avoid spawning a duplicate `serve`
+/// when another instance is already mid-startup (HTTP not yet bound). The
+/// exclusive advisory lock that the live daemon holds gives us a definitive
+/// "someone else owns this" signal regardless of discovery-file state.
+/// What: Opens the lock file (creating it if missing) and tries a non-
+/// blocking exclusive lock. If acquisition fails we treat that as "held by
+/// another process" and return true. On success we release immediately so
+/// the calling process doesn't accidentally keep the lock.
+/// Test: Covered indirectly by the start/stop integration smoke.
+fn lock_file_held() -> bool {
+    let Ok(root) = cli::palace::data_root() else {
+        return false;
+    };
+    if std::fs::create_dir_all(&root).is_err() {
+        return false;
+    }
+    let path = root.join("trusty-memory.lock");
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+    else {
+        return false;
+    };
+    match FileExt::try_lock(&file) {
+        Ok(()) => {
+            // We got the lock — nobody else holds it. Release immediately.
+            let _ = FileExt::unlock(&file);
+            false
+        }
+        Err(_) => true,
+    }
 }
