@@ -732,8 +732,16 @@ pub fn format_recall_context(results: &[RecallResult]) -> String {
         return String::new();
     }
     let mut out = String::from("Relevant memories from trusty-memory:\n");
+    const PREVIEW_BYTE_LIMIT: usize = 400;
     for r in results {
-        let preview_len = r.drawer.content.len().min(400);
+        // Use floor_char_boundary so we never slice in the middle of a
+        // multi-byte UTF-8 sequence (emoji, CJK, accented chars). Slicing on
+        // a non-boundary byte index would panic.
+        let preview_len = if r.drawer.content.len() <= PREVIEW_BYTE_LIMIT {
+            r.drawer.content.len()
+        } else {
+            r.drawer.content.floor_char_boundary(PREVIEW_BYTE_LIMIT)
+        };
         let mut preview = r.drawer.content[..preview_len].to_string();
         if r.drawer.content.len() > preview_len {
             preview.push('…');
@@ -1044,6 +1052,51 @@ mod tests {
         assert!(out.contains("L2"));
         assert!(out.contains("0.82"));
         assert!(out.contains("merge_claude_settings"));
+    }
+
+    #[test]
+    fn format_recall_context_multibyte() {
+        // Why: Regression test for panic when content contains multi-byte UTF-8
+        // (emoji/CJK/accented) and byte offset 400 falls mid-character.
+        // What: Builds content >400 bytes packed with 4-byte emojis, calls
+        // format_recall_context, asserts no panic and valid UTF-8 output.
+        // Test: This very test — if the slice were unguarded, it would panic.
+        use trusty_memory_core::Drawer;
+        use uuid::Uuid;
+        // Prefix with two ASCII bytes so that the 4-byte emoji sequences
+        // straddle byte index 400 (400 - 2 = 398, not divisible by 4).
+        // Each "🎉" is 4 bytes; without the prefix, 400 would land on a
+        // boundary (4 * 100). With the 2-byte prefix, byte 400 falls in the
+        // middle of an emoji — exactly the panic condition we're guarding.
+        let mut content = String::from("ab");
+        content.push_str(&"🎉".repeat(200));
+        assert!(content.len() > 400);
+        // Make sure byte 400 is NOT a char boundary so the original bug would fire.
+        assert!(!content.is_char_boundary(400));
+        let now = chrono::Utc::now();
+        let drawer = Drawer {
+            id: Uuid::nil(),
+            room_id: Uuid::nil(),
+            content,
+            importance: 0.5,
+            source_file: None,
+            created_at: now,
+            tags: vec![],
+            access_count: 0,
+            last_accessed_at: Some(now),
+        };
+        let results = vec![RecallResult {
+            drawer,
+            score: 0.5,
+            layer: 2,
+        }];
+        let out = format_recall_context(&results);
+        // Must not panic; output must be valid UTF-8 (guaranteed by String,
+        // but verify it round-trips via as_bytes -> from_utf8) and include
+        // the ellipsis indicating truncation occurred.
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        assert!(out.contains('…'));
+        assert!(out.starts_with("Relevant memories"));
     }
 
     #[test]
