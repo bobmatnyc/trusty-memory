@@ -112,13 +112,17 @@ async fn main() -> Result<()> {
             // lock.
             // Test: `cargo test --workspace` plus manual smoke (two `serve`
             // invocations: the second exits 1 with the diagnostic).
-            std::fs::create_dir_all(&data_root_for_state).with_context(|| {
-                format!(
-                    "create data root for lock file at {}",
-                    data_root_for_state.display()
-                )
-            })?;
-            let lock_path = data_root_for_state.join("trusty-memory.lock");
+            // Lock file lives at `<service_root>/trusty-memory.lock` —
+            // i.e. the *parent* of the `palaces/` directory, alongside
+            // `http_addr` and `trusty-memory.pid`. Issue #56: previously this
+            // was placed inside `palaces/` because `cli::palace::data_root()`
+            // already appends `/palaces`, hiding the lock where users (and
+            // future maintainers) would not look for it. Using
+            // `trusty_common::resolve_data_dir` keeps lifecycle artifacts
+            // (addr, pid, lock) co-located in the service root.
+            let service_root = trusty_common::resolve_data_dir("trusty-memory")
+                .context("resolve trusty-memory service root for lock file")?;
+            let lock_path = service_root.join("trusty-memory.lock");
             let lock_file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -563,12 +567,12 @@ fn daemon_alive() -> bool {
 /// the calling process doesn't accidentally keep the lock.
 /// Test: Covered indirectly by the start/stop integration smoke.
 fn lock_file_held() -> bool {
-    let Ok(root) = cli::palace::data_root() else {
+    // Must match the lock path used by `Commands::Serve` exactly. The lock
+    // sits in the service root (parent of `palaces/`), alongside the addr
+    // and pid files, not inside `palaces/` itself (issue #56).
+    let Ok(root) = trusty_common::resolve_data_dir("trusty-memory") else {
         return false;
     };
-    if std::fs::create_dir_all(&root).is_err() {
-        return false;
-    }
     let path = root.join("trusty-memory.lock");
     let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
