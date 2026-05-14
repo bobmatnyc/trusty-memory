@@ -3,7 +3,7 @@
 
 .DEFAULT_GOAL := help
 
-.PHONY: help check test lint fmt build release patch deploy smoke all
+.PHONY: help check test lint fmt build release patch deploy restart smoke all
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -37,8 +37,17 @@ patch: ## Bump patch version across workspace, commit, and tag v* (triggers crat
 	git tag "v$$NEW_VERSION"; \
 	echo "Tagged v$$NEW_VERSION — push with: git push origin main --tags"
 
-deploy: ## cargo install --path . --locked (installs trusty-memory binary locally)
+deploy: ## Install binary and restart the daemon
 	cargo install --path . --locked
+	$(MAKE) restart
+
+restart: ## Restart the trusty-memory daemon (stop, start in background, verify)
+	@pkill trusty-memory 2>/dev/null || true
+	@sleep 1
+	@trusty-memory serve > /tmp/trusty-memory.log 2>&1 &
+	@sleep 3
+	@trusty-memory status
+	@echo "trusty-memory daemon restarted (PID: $$(pgrep trusty-memory))"
 
 smoke: ## Run smoke test (tests/smoke-test.sh)
 	bash tests/smoke-test.sh
