@@ -173,8 +173,8 @@ pub struct Triple {
 trusty-memory serve [--http <addr>]   # MCP stdio server (and optional HTTP/SSE)
 trusty-memory palace new <name>       # create a palace
 trusty-memory palace list             # list palaces on this machine
-trusty-memory remember <palace> <text> [--room <name>]
-trusty-memory recall <palace> <query> [--top-k N]
+trusty-memory remember <text> --palace <palace> [--room <name>]
+trusty-memory recall <query> --palace <palace> [--top-k N]
 trusty-memory status                  # daemon health and palace summary
 ```
 
@@ -182,18 +182,18 @@ trusty-memory status                  # daemon health and palace summary
 
 The MCP server exposes (at minimum) the following tools:
 
-| Tool                  | Args                                                            | Returns         |
-|-----------------------|------------------------------------------------------------------|-----------------|
-| `memory_remember`     | `palace, text, room?, tags?`                                    | `drawer_id`     |
-| `memory_recall`       | `palace, query, top_k?`  (L0 + L1 + L2)                          | `Vec<Drawer>`   |
-| `memory_recall_deep`  | `palace, query, top_k?`  (L3)                                    | `Vec<Drawer>`   |
-| `memory_list`         | `palace, room?, tag?`                                            | `Vec<Drawer>`   |
-| `memory_forget`       | `palace, drawer_id`                                              | `()`            |
-| `palace_create`       | `name, description?`                                             | `PalaceId`      |
-| `palace_list`         | —                                                                | `Vec<PalaceId>` |
-| `palace_info`         | `palace`                                                         | metadata + count|
-| `kg_assert`           | `palace, subject, predicate, object, confidence?, provenance?`   | `()`            |
-| `kg_query`            | `palace, subject`                                                | `Vec<Triple>`   |
+| Tool                  | Args                                                                  | Returns         |
+|-----------------------|------------------------------------------------------------------------|-----------------|
+| `create_memory`       | `palace_id, content, room?, tags?, importance?`                       | `drawer_id`     |
+| `recall_memories`     | `palace_id, query, top_k?`  (L0 + L1 + L2)                            | `Vec<Drawer>`   |
+| `memory_recall_all`   | `q, top_k?, deep?`  (search across all palaces)                       | `Vec<Drawer>`   |
+| `list_drawers`        | `palace_id`                                                            | `Vec<Drawer>`   |
+| `list_palaces`        | —                                                                      | `Vec<PalaceInfo>`|
+| `get_palace`          | `palace_id`                                                            | metadata + count|
+| `get_status`          | —                                                                      | daemon health   |
+| `get_config`          | —                                                                      | daemon config   |
+| `kg_assert`           | `palace_id, subject, predicate, object, confidence?`                  | `()`            |
+| `kg_query`            | `palace_id, subject`                                                   | `Vec<Triple>`   |
 
 ## Performance targets
 

@@ -87,10 +87,39 @@ pub fn router() -> Router<AppState> {
             "/api/v1/palaces/{id}/chat/sessions/{session_id}",
             get(get_chat_session).delete(delete_chat_session),
         )
-        .route("/health", get(|| async { "ok" }))
+        .route("/health", get(health))
         .fallback(static_handler);
 
     trusty_common::server::with_standard_middleware(router)
+}
+
+// ---------------------------------------------------------------------------
+// Health check
+// ---------------------------------------------------------------------------
+
+/// Liveness/version payload for `GET /health`.
+///
+/// Why: `daemon_probe` requires an HTTP 200 from `/health` to confirm that the
+/// port is owned by this daemon (and not a stale or foreign process).
+/// What: Carries a fixed `status` string plus the compile-time crate version.
+/// Test: Asserted by `health_endpoint_returns_ok` in this module's tests.
+#[derive(serde::Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    version: &'static str,
+}
+
+/// `GET /health` — unauthenticated liveness probe.
+///
+/// Why: Gives `daemon_probe` and external monitors a cheap way to confirm port
+/// ownership without touching palace state.
+/// What: Returns HTTP 200 with `{"status":"ok","version":"<crate version>"}`.
+/// Test: `health_endpoint_returns_ok` drives this through the router.
+async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1823,6 +1852,26 @@ mod tests {
         let root = tmp.path().to_path_buf();
         std::mem::forget(tmp);
         AppState::new(root)
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_returns_ok() {
+        let state = test_state();
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[tokio::test]
