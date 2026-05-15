@@ -74,7 +74,11 @@ fn install() -> Result<()> {
     }
 
     let home_str = home.to_string_lossy();
-    let plist = render_plist(&binary.to_string_lossy(), &log_path.to_string_lossy(), &home_str);
+    let plist = render_plist(
+        &binary.to_string_lossy(),
+        &log_path.to_string_lossy(),
+        &home_str,
+    );
     fs::write(&plist_path, plist).with_context(|| format!("writing {}", plist_path.display()))?;
 
     // Load immediately via `launchctl bootstrap gui/$UID <plist>`.

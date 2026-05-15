@@ -163,11 +163,7 @@ fn parse_marker(contents: &str) -> Option<String> {
         let value = value
             .strip_prefix('"')
             .and_then(|v| v.strip_suffix('"'))
-            .or_else(|| {
-                value
-                    .strip_prefix('\'')
-                    .and_then(|v| v.strip_suffix('\''))
-            })
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
             .unwrap_or(value)
             .trim();
         if !value.is_empty() {
