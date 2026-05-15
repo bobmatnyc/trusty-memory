@@ -3609,7 +3609,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-memory"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3639,7 +3639,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-memory-core"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3669,7 +3669,7 @@ dependencies = [
 
 [[package]]
 name = "trusty-memory-mcp"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "async-trait",
