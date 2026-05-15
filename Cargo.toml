@@ -42,14 +42,15 @@ mime_guess = "2"
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower = { version = "0.4", features = ["util"] }
-trusty-mcp-core = "0.1.0"
-trusty-embedder = "0.1.3"
+trusty-mcp-core = "0.1.1"
+trusty-embedder = "0.1.5"
 trusty-common = { version = "0.3.2", features = ["axum-server"] }
 
-# Local-development override: redirect crates.io resolution to the sibling
-# trusty-common checkout so unreleased changes are available without publishing.
-# Remove this section (or comment it out) before cutting a release — the
-# version declarations above remain the authoritative crates.io coordinates.
+# LOCAL DEV OVERRIDE — redirects crates.io resolution to sibling checkouts.
+# Before publishing to crates.io:
+#   1. Ensure all three trusty-common crates are published at the versions declared above.
+#   2. Remove or comment out this entire [patch.crates-io] section.
+#   3. Run `cargo check --workspace` to verify the published versions resolve correctly.
 [patch.crates-io]
 trusty-common = { path = "../trusty-common/crates/trusty-common" }
 trusty-embedder = { path = "../trusty-common/crates/trusty-embedder" }
