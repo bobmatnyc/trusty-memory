@@ -5,7 +5,7 @@
 > One install per machine. Multiple named palaces. Sub-5 ms baseline retrieval.
 
 [![crates.io](https://img.shields.io/crates/v/trusty-memory)](https://crates.io/crates/trusty-memory)
-[![License: ELv2](https://img.shields.io/badge/license-ELv2-blue)](./LICENSE)
+[![License: ELv2](https://img.shields.io/badge/license-ELv2%20(no%20hosted%20service)-blue)](./LICENSE)
 
 ---
 
@@ -247,3 +247,7 @@ databases for projects that already have one.
 ## License
 
 [Elastic License 2.0](./LICENSE) (ELv2).
+
+Free to use for personal, internal, and commercial purposes. You may **not**
+provide this software to third parties as a hosted or managed service. See
+[LICENSE](./LICENSE) for the full terms.
