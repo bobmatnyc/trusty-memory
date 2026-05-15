@@ -1,6 +1,6 @@
 [package]
 name = "trusty-memory-mcp"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2021"
 description = "MCP server (stdio + HTTP/SSE) for trusty-memory"
 license = "MIT"
@@ -14,7 +14,7 @@ license = "MIT"
 crate-type = ["rlib"]
 
 [dependencies]
-trusty-memory-core = { path = "../trusty-memory-core", version = "0.1.16" }
+trusty-memory-core = { path = "../trusty-memory-core", version = "0.1.17" }
 trusty-mcp-core = { workspace = true }
 trusty-common = { workspace = true }
 tokio = { workspace = true }
