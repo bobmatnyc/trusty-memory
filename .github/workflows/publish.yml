@@ -86,7 +86,9 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish -p trusty-memory-core --dry-run --allow-dirty
           else
-            cargo publish -p trusty-memory-core --no-verify --allow-dirty
+            out=$(cargo publish -p trusty-memory-core --no-verify --allow-dirty 2>&1) \
+              && echo "$out" \
+              || { echo "$out"; echo "$out" | grep -q "already exists" && echo "Already published, continuing." || exit 1; }
           fi
 
       - name: Wait for index propagation (trusty-memory-core)
@@ -98,7 +100,9 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish -p trusty-memory-mcp --dry-run --allow-dirty
           else
-            cargo publish -p trusty-memory-mcp --no-verify --allow-dirty
+            out=$(cargo publish -p trusty-memory-mcp --no-verify --allow-dirty 2>&1) \
+              && echo "$out" \
+              || { echo "$out"; echo "$out" | grep -q "already exists" && echo "Already published, continuing." || exit 1; }
           fi
 
       - name: Wait for index propagation (trusty-memory-mcp)
@@ -110,5 +114,7 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             cargo publish -p trusty-memory --dry-run --allow-dirty
           else
-            cargo publish -p trusty-memory --no-verify --allow-dirty
+            out=$(cargo publish -p trusty-memory --no-verify --allow-dirty 2>&1) \
+              && echo "$out" \
+              || { echo "$out"; echo "$out" | grep -q "already exists" && echo "Already published, continuing." || exit 1; }
           fi
