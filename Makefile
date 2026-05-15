@@ -2,6 +2,7 @@
 # Workflow: ticket -> implement/test -> commit -> patch bump -> deploy -> smoke test
 
 .DEFAULT_GOAL := help
+CLOSES ?=
 
 .PHONY: help check test lint fmt build release patch deploy restart smoke all
 
@@ -33,7 +34,9 @@ patch: ## Bump patch version across workspace, commit, and tag v* (triggers crat
 	cargo set-version --bump patch
 	@NEW_VERSION=$$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/'); \
 	git add Cargo.toml Cargo.lock crates/trusty-memory-core/Cargo.toml crates/trusty-memory-mcp/Cargo.toml; \
-	git commit -m "chore: bump version to v$$NEW_VERSION"; \
+	COMMIT_MSG="chore: bump version to v$$NEW_VERSION"; \
+	if [ -n "$(CLOSES)" ]; then COMMIT_MSG="$$COMMIT_MSG (closes #$(CLOSES))"; fi; \
+	git commit -m "$$COMMIT_MSG"; \
 	git tag "v$$NEW_VERSION"; \
 	echo "Tagged v$$NEW_VERSION — push with: git push origin main --tags"
 
