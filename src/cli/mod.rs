@@ -200,9 +200,11 @@ pub enum Commands {
         #[arg(long = "no-http", hide = true)]
         no_http: bool,
         /// Default palace for MCP tool calls. When omitted, the palace is
-        /// auto-detected from the working directory (`.trusty-memory` marker
-        /// file, or the cwd directory name). Auto-created on startup if it
-        /// does not exist. Returned in the `initialize` response under
+        /// auto-detected from the working directory: a `.trusty-memory.toml`
+        /// or `.trusty-memory` marker file (`palace = "<name>"`), else the
+        /// git repository root directory name, else the cwd directory name,
+        /// falling back to `default`. Auto-created on startup if it does not
+        /// exist. Returned in the `initialize` response under
         /// `serverInfo.default_palace` so MCP clients can verify the namespace.
         #[arg(long, value_name = "NAME")]
         palace: Option<String>,

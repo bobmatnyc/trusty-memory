@@ -102,6 +102,7 @@ async fn main() -> Result<()> {
             let default_palace = resolve_palace_for_serve(serve_palace.as_deref());
             if auto_detected {
                 if let Some(name) = default_palace.as_deref() {
+                    tracing::info!(palace = %name, "auto-detected palace from working directory");
                     eprintln!("info: auto-detected palace '{name}' from working directory");
                 }
             }
