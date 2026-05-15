@@ -182,15 +182,18 @@ trusty-memory status                  # daemon health and palace summary
 
 The MCP server exposes (at minimum) the following tools:
 
-| Tool                  | Args                                                            | Returns        |
-|-----------------------|------------------------------------------------------------------|----------------|
-| `memory_remember`     | `palace, text, room?, tags?`                                    | `drawer_id`    |
-| `memory_recall`       | `palace, query, top_k?`  (L0 + L1 + L2)                          | `Vec<Drawer>`  |
-| `memory_recall_deep`  | `palace, query, top_k?`  (L3)                                    | `Vec<Drawer>`  |
-| `palace_create`       | `name, description?`                                            | `PalaceId`     |
-| `palace_list`         | —                                                                | `Vec<PalaceId>`|
-| `kg_assert`           | `palace, subject, predicate, object, confidence?, provenance?`   | `()`           |
-| `kg_query`            | `palace, subject`                                                | `Vec<Triple>`  |
+| Tool                  | Args                                                            | Returns         |
+|-----------------------|------------------------------------------------------------------|-----------------|
+| `memory_remember`     | `palace, text, room?, tags?`                                    | `drawer_id`     |
+| `memory_recall`       | `palace, query, top_k?`  (L0 + L1 + L2)                          | `Vec<Drawer>`   |
+| `memory_recall_deep`  | `palace, query, top_k?`  (L3)                                    | `Vec<Drawer>`   |
+| `memory_list`         | `palace, room?, tag?`                                            | `Vec<Drawer>`   |
+| `memory_forget`       | `palace, drawer_id`                                              | `()`            |
+| `palace_create`       | `name, description?`                                             | `PalaceId`      |
+| `palace_list`         | —                                                                | `Vec<PalaceId>` |
+| `palace_info`         | `palace`                                                         | metadata + count|
+| `kg_assert`           | `palace, subject, predicate, object, confidence?, provenance?`   | `()`            |
+| `kg_query`            | `palace, subject`                                                | `Vec<Triple>`   |
 
 ## Performance targets
 
