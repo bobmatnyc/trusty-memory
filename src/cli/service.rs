@@ -52,8 +52,12 @@ fn install() -> Result<()> {
         .join("Library")
         .join("LaunchAgents")
         .join(format!("{SERVICE_LABEL}.plist"));
-    let log_dir = home.join(".trusty-memory").join("logs");
-    let log_path = log_dir.join("daemon.log");
+    let log_dir = home
+        .join("Library")
+        .join("Logs")
+        .join("trusty-memory");
+    let log_path = log_dir.join("trusty-memory.log");
+    let err_path = log_dir.join("trusty-memory.error.log");
 
     // Idempotent: if the plist already exists, don't clobber whatever the user
     // (or a previous install) configured.
@@ -74,7 +78,12 @@ fn install() -> Result<()> {
     }
 
     let home_str = home.to_string_lossy();
-    let plist = render_plist(&binary.to_string_lossy(), &log_path.to_string_lossy(), &home_str);
+    let plist = render_plist(
+        &binary.to_string_lossy(),
+        &log_path.to_string_lossy(),
+        &err_path.to_string_lossy(),
+        &home_str,
+    );
     fs::write(&plist_path, plist).with_context(|| format!("writing {}", plist_path.display()))?;
 
     // Load immediately via `launchctl bootstrap gui/$UID <plist>`.
@@ -101,7 +110,8 @@ fn install() -> Result<()> {
 
     println!("Installed trusty-memory service:");
     println!("  plist:   {}", plist_path.display());
-    println!("  logs:    {}", log_path.display());
+    println!("  stdout:  {}", log_path.display());
+    println!("  stderr:  {}", err_path.display());
     println!("  http:    dynamic port — discover via `trusty-memory status`");
     println!("           or `trusty-memory service status`");
     println!();
@@ -214,7 +224,11 @@ fn logs() -> Result<()> {
     use std::io::{BufRead, BufReader};
 
     let home = dirs::home_dir().context("could not resolve home directory")?;
-    let log_path = home.join(".trusty-memory").join("logs").join("daemon.log");
+    let log_path = home
+        .join("Library")
+        .join("Logs")
+        .join("trusty-memory")
+        .join("trusty-memory.log");
 
     if !log_path.exists() {
         println!("No logs yet — start the service first with `trusty-memory service install`.");
@@ -249,7 +263,7 @@ fn logs() -> Result<()> {
 /// variable to prevent read-only filesystem errors on SIP-protected paths.
 /// Test: `render_plist_contains_paths` below.
 #[cfg(target_os = "macos")]
-fn render_plist(binary: &str, log_path: &str, home: &str) -> String {
+fn render_plist(binary: &str, stdout_path: &str, stderr_path: &str, home: &str) -> String {
     let cache_path = format!("{}/.cache/fastembed", home);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -263,11 +277,14 @@ fn render_plist(binary: &str, log_path: &str, home: &str) -> String {
   <array>
     <string>{binary}</string>
     <string>serve</string>
+    <string>--http</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>FASTEMBED_CACHE_PATH</key>
     <string>{cache_path}</string>
+    <key>RUST_LOG</key>
+    <string>info</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -276,9 +293,9 @@ fn render_plist(binary: &str, log_path: &str, home: &str) -> String {
   <key>StandardInPath</key>
   <string>/dev/null</string>
   <key>StandardOutPath</key>
-  <string>{log_path}</string>
+  <string>{stdout_path}</string>
   <key>StandardErrorPath</key>
-  <string>{log_path}</string>
+  <string>{stderr_path}</string>
   <key>ThrottleInterval</key>
   <integer>10</integer>
 </dict>
@@ -342,14 +359,19 @@ mod tests {
 
     #[test]
     fn render_plist_contains_paths() {
-        let plist = render_plist(
-            "/usr/local/bin/trusty-memory",
-            "/Users/u/.trusty-memory/logs/daemon.log",
-            "/Users/u",
-        );
+        let stdout = "/Users/u/Library/Logs/trusty-memory/trusty-memory.log";
+        let stderr = "/Users/u/Library/Logs/trusty-memory/trusty-memory.error.log";
+        let plist = render_plist("/usr/local/bin/trusty-memory", stdout, stderr, "/Users/u");
         assert!(plist.contains("<string>/usr/local/bin/trusty-memory</string>"));
         assert!(plist.contains("<string>serve</string>"));
-        assert!(plist.contains("/Users/u/.trusty-memory/logs/daemon.log"));
+        // --http keeps the daemon alive when stdin is /dev/null (launchd default)
+        assert!(plist.contains("<string>--http</string>"));
+        // RUST_LOG=info ensures startup, dream, and FASTEMBED lines are captured
+        assert!(plist.contains("<key>RUST_LOG</key>"));
+        assert!(plist.contains("<string>info</string>"));
+        // stdout and stderr go to separate files under ~/Library/Logs/trusty-memory/
+        assert!(plist.contains(stdout));
+        assert!(plist.contains(stderr));
         assert!(plist.contains(SERVICE_LABEL));
         assert!(plist.contains("<key>RunAtLoad</key>"));
         assert!(plist.contains("<key>KeepAlive</key>"));
@@ -364,7 +386,7 @@ mod tests {
 
     #[test]
     fn render_plist_is_well_formed_xml() {
-        let plist = render_plist("/bin/trusty-memory", "/tmp/log", "/tmp");
+        let plist = render_plist("/bin/trusty-memory", "/tmp/out.log", "/tmp/err.log", "/tmp");
         assert!(plist.starts_with("<?xml"));
         assert!(plist.trim_end().ends_with("</plist>"));
     }
