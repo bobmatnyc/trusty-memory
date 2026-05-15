@@ -73,7 +73,8 @@ fn install() -> Result<()> {
             .with_context(|| format!("creating LaunchAgents directory {}", parent.display()))?;
     }
 
-    let plist = render_plist(&binary.to_string_lossy(), &log_path.to_string_lossy());
+    let home_str = home.to_string_lossy();
+    let plist = render_plist(&binary.to_string_lossy(), &log_path.to_string_lossy(), &home_str);
     fs::write(&plist_path, plist).with_context(|| format!("writing {}", plist_path.display()))?;
 
     // Load immediately via `launchctl bootstrap gui/$UID <plist>`.
@@ -243,11 +244,13 @@ fn logs() -> Result<()> {
 ///
 /// Why: Isolated for unit testing — keeps the install path easy to verify
 /// without writing to the filesystem.
-/// What: Returns the full plist XML with the binary path and log path
-/// substituted.
+/// What: Returns the full plist XML with the binary path, log path, and
+/// home directory substituted. Includes FASTEMBED_CACHE_PATH environment
+/// variable to prevent read-only filesystem errors on SIP-protected paths.
 /// Test: `render_plist_contains_paths` below.
 #[cfg(target_os = "macos")]
-fn render_plist(binary: &str, log_path: &str) -> String {
+fn render_plist(binary: &str, log_path: &str, home: &str) -> String {
+    let cache_path = format!("{}/.cache/fastembed", home);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -261,6 +264,11 @@ fn render_plist(binary: &str, log_path: &str) -> String {
     <string>{binary}</string>
     <string>serve</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>FASTEMBED_CACHE_PATH</key>
+    <string>{cache_path}</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -337,6 +345,7 @@ mod tests {
         let plist = render_plist(
             "/usr/local/bin/trusty-memory",
             "/Users/u/.trusty-memory/logs/daemon.log",
+            "/Users/u",
         );
         assert!(plist.contains("<string>/usr/local/bin/trusty-memory</string>"));
         assert!(plist.contains("<string>serve</string>"));
@@ -348,11 +357,14 @@ mod tests {
         // exiting due to stdin EOF in the stdio MCP loop.
         assert!(plist.contains("<key>StandardInPath</key>"));
         assert!(plist.contains("<string>/dev/null</string>"));
+        // Verify FASTEMBED_CACHE_PATH is set to prevent read-only filesystem errors.
+        assert!(plist.contains("<key>FASTEMBED_CACHE_PATH</key>"));
+        assert!(plist.contains("/Users/u/.cache/fastembed"));
     }
 
     #[test]
     fn render_plist_is_well_formed_xml() {
-        let plist = render_plist("/bin/trusty-memory", "/tmp/log");
+        let plist = render_plist("/bin/trusty-memory", "/tmp/log", "/tmp");
         assert!(plist.starts_with("<?xml"));
         assert!(plist.trim_end().ends_with("</plist>"));
     }
