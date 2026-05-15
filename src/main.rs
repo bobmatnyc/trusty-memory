@@ -15,7 +15,7 @@ use fs4::FileExt;
 use std::io;
 use trusty_memory::cli;
 use trusty_memory::cli::output::OutputConfig;
-use trusty_memory::cli::palace_resolver::resolve_palace;
+use trusty_memory::cli::palace_resolver::{detect_serve_palace, resolve_palace};
 use trusty_memory::cli::{Cli, Commands};
 
 #[tokio::main]
@@ -88,16 +88,22 @@ async fn main() -> Result<()> {
 
         Commands::Serve {
             http,
-            no_http,
             mcp: _,
-            palace: default_palace,
+            palace: serve_palace,
         } => {
-            tracing::info!(
-                ?http,
-                no_http,
-                ?default_palace,
-                "Starting trusty-memory MCP server"
-            );
+            // Auto-detect the default palace from the working directory when
+            // `--palace` is omitted (issue #61). A single user-level
+            // `~/.claude.json` entry then works across every project without
+            // per-project `.mcp.json` overrides.
+            let auto_detected = serve_palace.is_none();
+            let default_palace = resolve_palace_for_serve(serve_palace.as_deref());
+            if auto_detected {
+                if let Some(name) = default_palace.as_deref() {
+                    eprintln!("info: auto-detected palace '{name}' from working directory");
+                }
+            }
+
+            tracing::info!(?http, ?default_palace, "Starting trusty-memory MCP server");
             let data_root_for_state = cli::palace::data_root()?;
 
             // Single-instance file lock (issue #56).
@@ -157,9 +163,9 @@ async fn main() -> Result<()> {
             let _lock_file = lock_file;
 
             // Write the PID file unconditionally — *before* the HTTP/stdio
-            // branch — so single-instance discovery works for `--no-http`
+            // branch — so single-instance discovery works for stdio-only
             // daemons too (issue follow-up to #56). Previously this only
-            // happened in the HTTP branch, leaving `--no-http` daemons
+            // happened in the HTTP branch, leaving stdio-only daemons
             // invisible to `status`, `stop`, and `doctor`; the result was
             // status output reading `[discovery file missing/stale — found
             // via port scan]` or "not running" depending on whether any
@@ -167,10 +173,10 @@ async fn main() -> Result<()> {
             // on 3031..=3050. The PID file is the one universal liveness
             // marker that applies to every serve mode.
             //
-            // Why: `--no-http` (the Claude Code hook path) has no HTTP
-            // listener to advertise via `http_addr`, but the daemon process
-            // is still very much alive. Operators and scripts need *some*
-            // discovery artifact regardless of transport.
+            // Why: stdio-only mode (the default Claude Code hook path since
+            // issue #61) has no HTTP listener to advertise via `http_addr`,
+            // but the daemon process is still very much alive. Operators and
+            // scripts need *some* discovery artifact regardless of transport.
             // What: Write the current PID to `<service_root>/trusty-memory.pid`
             // here, before any branching. Failure is logged but non-fatal so
             // the daemon still serves even if the data dir is read-only
@@ -178,7 +184,7 @@ async fn main() -> Result<()> {
             // file is fine because the file-lock above already guarantees
             // single-instance.
             // Test: `cargo test --workspace`; manual smoke: run
-            // `trusty-memory serve --no-http &` and confirm
+            // `trusty-memory serve &` and confirm
             // `cat <service_root>/trusty-memory.pid` matches the bg PID
             // and `trusty-memory status` reports the daemon as running.
             if let Err(e) = cli::stop::write_pid_file(std::process::id()) {
@@ -244,123 +250,130 @@ async fn main() -> Result<()> {
             // Test: `cargo test --workspace`; manual smoke via `make deploy`
             // + `curl /health` immediately after launchctl start.
             let mut addr_written = false;
-            let serve_result = if no_http {
-                // stdio-only — Claude Code hook path, no HTTP listener.
-                tokio::select! {
-                    r = trusty_memory_mcp::run_stdio(state) => r,
-                    _ = tokio::signal::ctrl_c() => {
-                        tracing::info!("ctrl-c received, shutting down");
-                        Ok(())
+            let serve_result = match http {
+                None => {
+                    // Default: stdio-only — the primary Claude Code MCP path,
+                    // no HTTP listener (issue #61).
+                    tokio::select! {
+                        r = trusty_memory_mcp::run_stdio(state) => r,
+                        _ = tokio::signal::ctrl_c() => {
+                            tracing::info!("ctrl-c received, shutting down");
+                            Ok(())
+                        }
                     }
                 }
-            } else {
-                // Default: bind HTTP+SSE *and* serve stdio concurrently.
-                // Port auto-detect: if `http` is taken (or is 0), let the OS
-                // pick / walk forward and discover the actual bound address.
-                let listener = trusty_common::bind_with_auto_port(http, 20).await?;
-                let bound_addr = listener.local_addr()?;
+                Some(http_addr) => {
+                    // Opt-in: bind HTTP+SSE *and* serve stdio concurrently.
+                    // Port auto-detect: if `http_addr` is taken (or is 0), let the
+                    // OS pick / walk forward and discover the actual bound address.
+                    let listener = trusty_common::bind_with_auto_port(http_addr, 20).await?;
+                    let bound_addr = listener.local_addr()?;
 
-                // Report the actual address prominently to stdout so users
-                // and scripts can see where the daemon landed.
-                println!(
-                    "trusty-memory v{} — HTTP admin panel: http://{}",
-                    env!("CARGO_PKG_VERSION"),
-                    bound_addr
-                );
-                tracing::info!(%bound_addr, "HTTP server bound");
-
-                // Write addr to the shared trusty-* discovery location so other
-                // commands and scripts can find the running daemon without a
-                // fixed port. Uses `trusty_common::write_daemon_addr` to keep
-                // the file layout identical to trusty-search.
-                match trusty_common::write_daemon_addr("trusty-memory", &bound_addr.to_string()) {
-                    Ok(()) => addr_written = true,
-                    Err(e) => tracing::warn!("could not write daemon addr file: {e:#}"),
-                }
-
-                // (PID file is written unconditionally above, before this
-                // branch — covers both HTTP and `--no-http` modes.)
-
-                // Spawn Dreamer initialization *after* HTTP binds so the
-                // daemon is immediately healthy. Open palaces one-at-a-time
-                // with a small sleep between each to spread SQLite pool
-                // creation and avoid FD exhaustion on hosts with many
-                // palaces (issue #43).
-                let dream_handles_bg = dream_handles.clone();
-                let shutdown_rx_bg = shutdown_rx.clone();
-                tokio::spawn(async move {
-                    let root = match cli::palace::data_root() {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::warn!("failed to resolve data root for Dreamer: {e:#}");
-                            return;
-                        }
-                    };
-                    let palaces = match trusty_memory_core::PalaceRegistry::list_palaces(&root) {
-                        Ok(ps) => ps,
-                        Err(e) => {
-                            tracing::warn!("failed to enumerate palaces for Dreamer: {e:#}");
-                            return;
-                        }
-                    };
-                    // Cap eager palace loading to keep startup footprint
-                    // bounded (issue #57). Each opened palace allocates a
-                    // SQLite pool + a usearch index handle + a Dreamer task;
-                    // on hosts with dozens of palaces this multiplied the
-                    // daemon's RSS into the multi-GB range. Palaces not
-                    // opened eagerly will still open lazily on first use
-                    // via `PalaceRegistry::open_palace`.
-                    let max_eager: usize = std::env::var("TRUSTY_MAX_STARTUP_PALACES")
-                        .ok()
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .unwrap_or(5);
-                    let total = palaces.len();
-                    let eager_count = palaces.len().min(max_eager);
-                    tracing::info!(
-                        count = total,
-                        eager = eager_count,
-                        max_eager,
-                        "Dreamer background init starting (capped eager open)"
+                    // Report the actual address prominently to stdout so users
+                    // and scripts can see where the daemon landed.
+                    println!(
+                        "trusty-memory v{} — HTTP admin panel: http://{}",
+                        env!("CARGO_PKG_VERSION"),
+                        bound_addr
                     );
-                    let registry = trusty_memory_core::PalaceRegistry::new();
-                    let mut opened = 0usize;
-                    for p in palaces.into_iter().take(max_eager) {
-                        match registry.open_palace(&root, &p.id) {
-                            Ok(handle) => {
-                                let dreamer =
-                                    std::sync::Arc::new(trusty_memory_core::dream::Dreamer::new(
-                                        trusty_memory_core::dream::DreamConfig::default(),
-                                    ));
-                                let jh =
-                                    dreamer.start_with_shutdown(handle, shutdown_rx_bg.clone());
-                                dream_handles_bg.lock().await.push(jh);
-                                opened += 1;
+                    tracing::info!(%bound_addr, "HTTP server bound");
+
+                    // Write addr to the shared trusty-* discovery location so other
+                    // commands and scripts can find the running daemon without a
+                    // fixed port. Uses `trusty_common::write_daemon_addr` to keep
+                    // the file layout identical to trusty-search.
+                    match trusty_common::write_daemon_addr("trusty-memory", &bound_addr.to_string())
+                    {
+                        Ok(()) => addr_written = true,
+                        Err(e) => tracing::warn!("could not write daemon addr file: {e:#}"),
+                    }
+
+                    // (PID file is written unconditionally above, before this
+                    // branch — covers both HTTP and `--no-http` modes.)
+
+                    // Spawn Dreamer initialization *after* HTTP binds so the
+                    // daemon is immediately healthy. Open palaces one-at-a-time
+                    // with a small sleep between each to spread SQLite pool
+                    // creation and avoid FD exhaustion on hosts with many
+                    // palaces (issue #43).
+                    let dream_handles_bg = dream_handles.clone();
+                    let shutdown_rx_bg = shutdown_rx.clone();
+                    tokio::spawn(async move {
+                        let root = match cli::palace::data_root() {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::warn!("failed to resolve data root for Dreamer: {e:#}");
+                                return;
                             }
-                            Err(e) => tracing::warn!(
-                                palace = %p.id,
-                                "failed to open palace for dreamer: {e:#}"
-                            ),
+                        };
+                        let palaces = match trusty_memory_core::PalaceRegistry::list_palaces(&root)
+                        {
+                            Ok(ps) => ps,
+                            Err(e) => {
+                                tracing::warn!("failed to enumerate palaces for Dreamer: {e:#}");
+                                return;
+                            }
+                        };
+                        // Cap eager palace loading to keep startup footprint
+                        // bounded (issue #57). Each opened palace allocates a
+                        // SQLite pool + a usearch index handle + a Dreamer task;
+                        // on hosts with dozens of palaces this multiplied the
+                        // daemon's RSS into the multi-GB range. Palaces not
+                        // opened eagerly will still open lazily on first use
+                        // via `PalaceRegistry::open_palace`.
+                        let max_eager: usize = std::env::var("TRUSTY_MAX_STARTUP_PALACES")
+                            .ok()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or(5);
+                        let total = palaces.len();
+                        let eager_count = palaces.len().min(max_eager);
+                        tracing::info!(
+                            count = total,
+                            eager = eager_count,
+                            max_eager,
+                            "Dreamer background init starting (capped eager open)"
+                        );
+                        let registry = trusty_memory_core::PalaceRegistry::new();
+                        let mut opened = 0usize;
+                        for p in palaces.into_iter().take(max_eager) {
+                            match registry.open_palace(&root, &p.id) {
+                                Ok(handle) => {
+                                    let dreamer = std::sync::Arc::new(
+                                        trusty_memory_core::dream::Dreamer::new(
+                                            trusty_memory_core::dream::DreamConfig::default(),
+                                        ),
+                                    );
+                                    let jh =
+                                        dreamer.start_with_shutdown(handle, shutdown_rx_bg.clone());
+                                    dream_handles_bg.lock().await.push(jh);
+                                    opened += 1;
+                                }
+                                Err(e) => tracing::warn!(
+                                    palace = %p.id,
+                                    "failed to open palace for dreamer: {e:#}"
+                                ),
+                            }
+                            // Stagger SQLite pool creation to avoid FD pressure.
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            tokio::task::yield_now().await;
                         }
-                        // Stagger SQLite pool creation to avoid FD pressure.
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        tokio::task::yield_now().await;
-                    }
-                    tracing::info!(
-                        opened,
-                        total,
-                        "Dreamer background init complete — consolidation active"
-                    );
-                });
+                        tracing::info!(
+                            opened,
+                            total,
+                            "Dreamer background init complete — consolidation active"
+                        );
+                    });
 
-                // In HTTP mode, stdio is best-effort: spawn it detached so that
-                // stdin EOF (e.g., terminal session ending, launchd's /dev/null) does
-                // not terminate the daemon. The HTTP server owns daemon lifecycle.
-                tokio::spawn(trusty_memory_mcp::run_stdio(state.clone()));
-                tokio::select! {
-                    r = trusty_memory_mcp::run_http_on(state, listener) => r,
-                    _ = tokio::signal::ctrl_c() => {
-                        tracing::info!("ctrl-c received, shutting down");
-                        Ok(())
+                    // In HTTP mode, stdio is best-effort: spawn it detached so that
+                    // stdin EOF (e.g., terminal session ending, launchd's /dev/null) does
+                    // not terminate the daemon. The HTTP server owns daemon lifecycle.
+                    tokio::spawn(trusty_memory_mcp::run_stdio(state.clone()));
+                    tokio::select! {
+                        r = trusty_memory_mcp::run_http_on(state, listener) => r,
+                        _ = tokio::signal::ctrl_c() => {
+                            tracing::info!("ctrl-c received, shutting down");
+                            Ok(())
+                        }
                     }
                 }
             };
@@ -536,6 +549,20 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Resolve the default palace for `serve`, auto-detecting from the working
+/// directory when `--palace` is omitted.
+///
+/// Why: Issue #61 — `serve` running as a per-project Claude Code MCP stdio
+/// server should not require an explicit `--palace`; a single user-level
+/// `~/.claude.json` entry should resolve the correct palace per project.
+/// What: Delegates to `detect_serve_palace`, which honours an explicit value,
+/// then a `.trusty-memory` marker file, then the cwd directory name — all
+/// sanitized to lowercase kebab-case.
+/// Test: `palace_resolver::detect_serve_palace_*` unit tests.
+fn resolve_palace_for_serve(explicit: Option<&str>) -> Option<String> {
+    detect_serve_palace(explicit)
+}
+
 /// Ensure the HTTP daemon is running. Spawns it detached if not, waits up to
 /// 5 s. Silent on success; prints one warning line on timeout.
 ///
@@ -572,8 +599,13 @@ async fn ensure_daemon() {
         return;
     }
     if let Ok(exe) = std::env::current_exe() {
+        // Spawn with `--http` (no address — `serve` defaults to 127.0.0.1:3031
+        // and auto-increments on conflict). HTTP is opt-in since issue #61, so
+        // the auto-spawned background daemon must request it explicitly to
+        // keep the web admin panel and discovery file available for CLI use.
         let _ = std::process::Command::new(&exe)
             .arg("serve")
+            .arg("--http")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

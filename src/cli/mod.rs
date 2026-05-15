@@ -171,31 +171,34 @@ pub enum Commands {
 
     /// Start the MCP server.
     ///
-    /// By default binds the HTTP+SSE server on an OS-chosen free port *and*
-    /// serves the stdio MCP transport concurrently. The bound address is
-    /// printed on startup and written to `trusty-memory's data-dir discovery file` so
-    /// other commands and scripts can discover the running daemon without a
-    /// hard-coded port. Use `--no-http` to disable the HTTP listener (e.g.
-    /// when invoked by a Claude Code stdio hook).
+    /// By default serves *only* the stdio MCP transport — the primary use is
+    /// as a Claude Code MCP stdio server. Pass `--http` to additionally bind
+    /// the HTTP+SSE admin server (optionally with an explicit address; defaults
+    /// to `127.0.0.1:3031` when given without one). When HTTP is enabled the
+    /// bound address is printed on startup and written to trusty-memory's
+    /// data-dir discovery file so other commands can discover the daemon.
     #[command(
-        after_help = "Examples:\n  trusty-memory serve                       # OS picks a free port; address printed and written to trusty-memory's data-dir discovery file\n  trusty-memory serve --http 127.0.0.1:3031 # pin a specific port\n  trusty-memory serve --no-http             # stdio MCP only"
+        after_help = "Examples:\n  trusty-memory serve                       # stdio MCP only (default)\n  trusty-memory serve --http                # also bind HTTP on 127.0.0.1:3031\n  trusty-memory serve --http 127.0.0.1:8080 # also bind HTTP on a specific address"
     )]
     Serve {
-        /// HTTP bind address. Prefers 3031; auto-increments on conflict (up to +20).
-        /// Use --no-http to suppress HTTP entirely.
-        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:3031")]
-        http: SocketAddr,
-        /// Disable HTTP server (MCP stdio only, for Claude Code integration).
-        #[arg(long)]
-        no_http: bool,
+        /// Enable the HTTP+SSE admin server. Optional address; defaults to
+        /// `127.0.0.1:3031` when the flag is given without one. Auto-increments
+        /// the port on conflict (up to +20). Omit the flag for stdio-only mode.
+        #[arg(
+            long,
+            value_name = "ADDR",
+            num_args = 0..=1,
+            default_missing_value = "127.0.0.1:3031"
+        )]
+        http: Option<SocketAddr>,
         /// stdio MCP mode (used by Claude Code hook)
         #[arg(long)]
         mcp: bool,
-        /// Default palace for MCP tool calls when `palace` arg is omitted.
-        ///
-        /// Auto-created on startup if it does not exist. Returned in the
-        /// `initialize` response under `serverInfo.default_palace` so MCP
-        /// clients can verify the namespace they're bound to.
+        /// Default palace for MCP tool calls. When omitted, the palace is
+        /// auto-detected from the working directory (`.trusty-memory` marker
+        /// file, or the cwd directory name). Auto-created on startup if it
+        /// does not exist. Returned in the `initialize` response under
+        /// `serverInfo.default_palace` so MCP clients can verify the namespace.
         #[arg(long, value_name = "NAME")]
         palace: Option<String>,
     },
