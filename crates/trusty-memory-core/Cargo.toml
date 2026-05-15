@@ -26,6 +26,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
+futures = { workspace = true }
 
 # storage
 usearch = { workspace = true }

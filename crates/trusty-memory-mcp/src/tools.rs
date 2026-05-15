@@ -23,7 +23,7 @@ use crate::AppState;
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use trusty_memory_core::palace::{Palace, PalaceId, RoomType};
-use trusty_memory_core::retrieval::{recall, recall_deep};
+use trusty_memory_core::retrieval::{recall, recall_across_palaces, recall_deep};
 use trusty_memory_core::store::kg::Triple;
 use uuid::Uuid;
 
@@ -234,6 +234,19 @@ pub fn tool_definitions_with(has_default: bool) -> Value {
                         "palace": {"type": "string"}
                     },
                     "required": palace_compact_required,
+                }
+            },
+            {
+                "name": "memory_recall_all",
+                "description": "Semantic search across ALL palaces simultaneously. Returns the top-k most relevant drawers ranked by similarity, regardless of which palace they belong to. Each result includes a `palace_id` field identifying its source.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "q":     {"type": "string", "description": "Free-text query"},
+                        "top_k": {"type": "integer", "default": 10},
+                        "deep":  {"type": "boolean", "default": false}
+                    },
+                    "required": ["q"],
                 }
             }
         ]
@@ -541,6 +554,57 @@ pub async fn dispatch_tool(state: &AppState, name: &str, args: Value) -> Result<
                 "index_size_after": res.index_size_after,
             }))
         }
+        "memory_recall_all" => {
+            let query = args
+                .get("q")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("memory_recall_all: missing 'q'"))?;
+            let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+            let deep = args.get("deep").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            // List every palace on disk and open a handle for each. Palaces
+            // that fail to open are skipped with a warning so a single bad
+            // namespace cannot fail the whole fan-out.
+            let root = state.data_root.clone();
+            let palaces = tokio::task::spawn_blocking(move || {
+                trusty_memory_core::PalaceRegistry::list_palaces(&root)
+            })
+            .await
+            .context("join list_palaces")??;
+
+            let mut handles = Vec::with_capacity(palaces.len());
+            for p in &palaces {
+                match state.registry.open_palace(&state.data_root, &p.id) {
+                    Ok(h) => handles.push(h),
+                    Err(e) => {
+                        tracing::warn!(palace = %p.id, "memory_recall_all: open failed: {e:#}")
+                    }
+                }
+            }
+
+            let embedder = state.embedder().await?;
+            let erased: std::sync::Arc<dyn trusty_memory_core::embed::Embedder + Send + Sync> =
+                embedder;
+            let results = recall_across_palaces(&handles, &erased, query, top_k, deep)
+                .await
+                .context("recall_across_palaces")?;
+
+            let payload: Vec<Value> = results
+                .iter()
+                .map(|r| {
+                    json!({
+                        "palace_id":  r.palace_id,
+                        "drawer_id":  r.result.drawer.id.to_string(),
+                        "content":    r.result.drawer.content,
+                        "importance": r.result.drawer.importance,
+                        "tags":       r.result.drawer.tags,
+                        "score":      r.result.score,
+                        "layer":      r.result.layer,
+                    })
+                })
+                .collect();
+            Ok(json!({ "query": query, "results": payload }))
+        }
         other => anyhow::bail!("unknown tool: {other}"),
     }
 }
@@ -628,7 +692,7 @@ mod tests {
             .get("tools")
             .and_then(|t| t.as_array())
             .expect("tools array");
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 12);
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
@@ -645,6 +709,7 @@ mod tests {
             "palace_compact",
             "kg_assert",
             "kg_query",
+            "memory_recall_all",
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }

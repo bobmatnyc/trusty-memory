@@ -28,7 +28,8 @@ use trusty_common::{ChatEvent, ChatMessage, ToolDef};
 use trusty_memory_core::dream::{DreamConfig, Dreamer, PersistedDreamStats};
 use trusty_memory_core::palace::{Palace, PalaceId, RoomType};
 use trusty_memory_core::retrieval::{
-    recall_deep_with_default_embedder, recall_with_default_embedder,
+    recall_across_palaces_with_default_embedder, recall_deep_with_default_embedder,
+    recall_with_default_embedder,
 };
 use trusty_memory_core::store::kg::Triple;
 use trusty_memory_core::{PalaceHandle, PalaceRegistry};
@@ -68,6 +69,7 @@ pub fn router() -> Router<AppState> {
             delete(delete_drawer),
         )
         .route("/api/v1/palaces/{id}/recall", get(recall_handler))
+        .route("/api/v1/recall", get(recall_all_handler))
         .route("/api/v1/palaces/{id}/kg", get(kg_query).post(kg_assert))
         .route(
             "/api/v1/palaces/{id}/dream/status",
@@ -531,6 +533,32 @@ async fn recall_handler(
     Ok(Json(json!(payload)))
 }
 
+/// `GET /api/v1/recall?q=<query>&top_k=<n>&deep=<bool>` — cross-palace semantic
+/// search.
+///
+/// Why: Agents and dashboard widgets often need the most relevant memories
+/// regardless of palace boundary; forcing the caller to issue one request per
+/// palace and merge client-side is both slower (no fan-out) and wrong (no
+/// dedup/rerank). Serving the merged top-k from the daemon collapses the
+/// round-trip and reuses the shared embedder singleton.
+/// What: Lists all palaces, opens each (skipping any that fail to open with a
+/// warning), and delegates to `execute_recall_all`. Returns a JSON array of
+/// `{ palace_id, drawer, score, layer }` entries sorted by score descending.
+/// Test: Exercised via `execute_recall_all` directly and through the MCP
+/// `memory_recall_all` tool dispatch.
+async fn recall_all_handler(
+    State(state): State<AppState>,
+    Query(q): Query<RecallQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let top_k = q.top_k.unwrap_or(10);
+    let deep = q.deep.unwrap_or(false);
+    let value = execute_recall_all(&state, &q.q, top_k, deep).await;
+    if let Some(err) = value.get("error").and_then(|v| v.as_str()) {
+        return Err(ApiError::internal(err.to_string()));
+    }
+    Ok(Json(value))
+}
+
 // ---------------------------------------------------------------------------
 // Knowledge Graph
 // ---------------------------------------------------------------------------
@@ -849,6 +877,19 @@ fn all_tools() -> Vec<ToolDef> {
                 "required": ["palace_id", "subject", "predicate", "object"],
             }),
         },
+        ToolDef {
+            name: "memory_recall_all".into(),
+            description: "Semantic search across ALL palaces simultaneously. Returns the top-k most relevant drawers ranked by similarity, regardless of which palace they belong to. Each result includes a `palace_id` field identifying its source.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "q": { "type": "string", "description": "Free-text query" },
+                    "top_k": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 },
+                    "deep": { "type": "boolean", "default": false }
+                },
+                "required": ["q"],
+            }),
+        },
     ]
 }
 
@@ -942,6 +983,18 @@ async fn execute_tool(name: &str, args: &str, state: &AppState) -> Value {
                 }),
             }
         }
+        "memory_recall_all" => {
+            let q = parsed.get("q").and_then(|v| v.as_str());
+            let top_k = parsed.get("top_k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+            let deep = parsed
+                .get("deep")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            match q {
+                Some(q) => execute_recall_all(state, q, top_k, deep).await,
+                None => json!({ "error": "missing required argument: q" }),
+            }
+        }
         _ => json!({ "error": format!("unknown tool: {name}") }),
     }
 }
@@ -997,6 +1050,50 @@ async fn execute_recall(state: &AppState, palace_id: &str, query: &str, top_k: u
             }))
             .collect::<Vec<_>>()),
         Err(e) => json!({ "error": format!("recall: {e:#}") }),
+    }
+}
+
+/// Execute a cross-palace recall and return JSON results tagged with palace id.
+///
+/// Why: Both the MCP `memory_recall_all` tool and the `GET /api/v1/recall`
+/// HTTP route share the same wiring — list palaces, open handles, fan out via
+/// `recall_across_palaces_with_default_embedder`, and serialize.
+/// What: Lists every palace on disk, opens each (skipping any that fail with
+/// a `tracing::warn!`), and delegates to the core fan-out. On success returns
+/// a JSON array; on listing failure returns `{ "error": "..." }`.
+/// Test: Indirectly via `recall_across_palaces_merges_results` (core merge
+/// logic) and the HTTP/MCP integration paths.
+async fn execute_recall_all(state: &AppState, query: &str, top_k: usize, deep: bool) -> Value {
+    let palaces = match PalaceRegistry::list_palaces(&state.data_root) {
+        Ok(v) => v,
+        Err(e) => return json!({ "error": format!("list palaces: {e:#}") }),
+    };
+    let mut handles = Vec::with_capacity(palaces.len());
+    for p in &palaces {
+        match state.registry.open_palace(&state.data_root, &p.id) {
+            Ok(h) => handles.push(h),
+            Err(e) => {
+                tracing::warn!(palace = %p.id, "execute_recall_all: open failed: {e:#}");
+            }
+        }
+    }
+    if handles.is_empty() {
+        return json!([]);
+    }
+    match recall_across_palaces_with_default_embedder(&handles, query, top_k, deep).await {
+        Ok(results) => json!(results
+            .into_iter()
+            .map(|r| json!({
+                "palace_id": r.palace_id,
+                "drawer_id": r.result.drawer.id.to_string(),
+                "content": r.result.drawer.content,
+                "importance": r.result.drawer.importance,
+                "tags": r.result.drawer.tags,
+                "score": r.result.score,
+                "layer": r.result.layer,
+            }))
+            .collect::<Vec<_>>()),
+        Err(e) => json!({ "error": format!("recall_across_palaces: {e:#}") }),
     }
 }
 
@@ -2005,6 +2102,7 @@ mod tests {
                 "get_palace_dream_status",
                 "create_memory",
                 "kg_assert",
+                "memory_recall_all",
             ]
         );
         // Every tool's `parameters` must be a JSON Schema object with a
@@ -2135,6 +2233,172 @@ mod tests {
         assert!(
             text.contains("\"type\":\"connected\""),
             "expected connected frame, got: {text}"
+        );
+    }
+
+    /// Why: `/api/v1/dream/status` must sum per-palace `dream_stats.json`
+    /// counters and surface the most recent `last_run_at`. A regression that
+    /// returned only the first palace's stats would silently break the
+    /// "global dream activity" dashboard panel.
+    /// What: Pre-seeds two palace dirs under the AppState root, writes a
+    /// distinct `PersistedDreamStats` JSON file into each, hits the endpoint,
+    /// and asserts the integer fields are summed and `last_run_at` equals the
+    /// newer of the two timestamps.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn dream_status_aggregates_across_palaces() {
+        use trusty_memory_core::dream::{DreamStats, PersistedDreamStats};
+
+        let state = test_state();
+        // Two palace directories — each must contain a `palace.json` so
+        // `PalaceRegistry::list_palaces` sees them, plus a `dream_stats.json`
+        // with distinct counter values.
+        for (id, stats, ts) in [
+            (
+                "palace-a",
+                DreamStats {
+                    merged: 1,
+                    pruned: 2,
+                    compacted: 3,
+                    closets_updated: 4,
+                    duration_ms: 100,
+                },
+                chrono::Utc::now() - chrono::Duration::seconds(60),
+            ),
+            (
+                "palace-b",
+                DreamStats {
+                    merged: 10,
+                    pruned: 20,
+                    compacted: 30,
+                    closets_updated: 40,
+                    duration_ms: 200,
+                },
+                chrono::Utc::now(),
+            ),
+        ] {
+            let palace = trusty_memory_core::Palace {
+                id: PalaceId::new(id),
+                name: id.to_string(),
+                description: None,
+                created_at: chrono::Utc::now(),
+                data_dir: state.data_root.join(id),
+            };
+            state
+                .registry
+                .create_palace(&state.data_root, palace)
+                .expect("create palace");
+            let persisted = PersistedDreamStats {
+                last_run_at: ts,
+                stats,
+            };
+            persisted
+                .save(&state.data_root.join(id))
+                .expect("save dream stats");
+        }
+
+        let later = chrono::Utc::now();
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/dream/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+
+        // Aggregated counters.
+        assert_eq!(v["merged"], 11);
+        assert_eq!(v["pruned"], 22);
+        assert_eq!(v["compacted"], 33);
+        assert_eq!(v["closets_updated"], 44);
+        assert_eq!(v["duration_ms"], 300);
+
+        // `last_run_at` is the more-recent of the two timestamps.
+        let last = v["last_run_at"].as_str().expect("last_run_at is string");
+        let parsed: chrono::DateTime<chrono::Utc> = last
+            .parse()
+            .expect("last_run_at parses as RFC3339 timestamp");
+        assert!(
+            parsed <= later,
+            "last_run_at ({parsed}) should not exceed wall clock ({later})"
+        );
+        // Must have picked palace-b's newer stamp, not palace-a's older one.
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(30);
+        assert!(
+            parsed >= cutoff,
+            "expected the newer (palace-b) timestamp; got {parsed}"
+        );
+    }
+
+    /// Why: `POST /api/v1/dream/run` triggers a dream cycle across every
+    /// palace and must return the aggregated stats. Even when no palace
+    /// has work to do (empty registry) the endpoint must round-trip 200
+    /// with the well-formed payload shape so the dashboard's "Run now"
+    /// button never fails the UI.
+    /// What: Pre-creates one palace via the registry, posts to the endpoint,
+    /// and asserts the response is 200 with all expected fields present.
+    /// Deeper assertions (specific merged/pruned counts) are skipped here
+    /// because running a full dream cycle requires the ONNX embedder load
+    /// path and we want this test to stay fast and embedder-free.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn dream_run_aggregates_stats() {
+        let state = test_state();
+        let palace = trusty_memory_core::Palace {
+            id: PalaceId::new("dream-run-test"),
+            name: "dream-run-test".to_string(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            data_dir: state.data_root.join("dream-run-test"),
+        };
+        state
+            .registry
+            .create_palace(&state.data_root, palace)
+            .expect("create palace");
+
+        let app = router().with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/dream/run")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+
+        // Shape: every aggregated counter must be present (even if zero) and
+        // `last_run_at` is set by the handler to "now".
+        for key in [
+            "merged",
+            "pruned",
+            "compacted",
+            "closets_updated",
+            "duration_ms",
+        ] {
+            assert!(
+                v.get(key).is_some(),
+                "missing key {key} in dream_run payload: {v}"
+            );
+            assert!(
+                v[key].is_u64() || v[key].is_i64(),
+                "{key} should be integer, got {}",
+                v[key]
+            );
+        }
+        assert!(
+            v["last_run_at"].is_string(),
+            "last_run_at must be set by dream_run; got {v}"
         );
     }
 

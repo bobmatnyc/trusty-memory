@@ -61,8 +61,13 @@ async fn main() -> Result<()> {
             room,
             deep,
             decay: _,
+            all_palaces,
         } => {
-            cli::handle_recall(&palace, query, top_k, room, deep, &out).await?;
+            if all_palaces {
+                cli::handle_recall_all(query, top_k, deep, &out).await?;
+            } else {
+                cli::handle_recall(&palace, query, top_k, room, deep, &out).await?;
+            }
         }
 
         Commands::Forget { id } => {

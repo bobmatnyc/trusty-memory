@@ -32,7 +32,7 @@ pub mod output;
 pub mod start;
 pub mod stop;
 
-pub use memory::{handle_forget, handle_list, handle_recall, handle_remember};
+pub use memory::{handle_forget, handle_list, handle_recall, handle_recall_all, handle_remember};
 pub mod palace;
 pub mod palace_resolver;
 pub mod service;
@@ -110,6 +110,12 @@ pub enum Commands {
         /// Apply temporal decay to scores
         #[arg(long, default_value = "true")]
         decay: bool,
+        /// Fan out the query across every palace on this machine,
+        /// merge the results, deduplicate by drawer id, and rank by
+        /// score descending. When set, the positional `<palace>` /
+        /// `--palace` argument is ignored.
+        #[arg(short = 'a', long = "all-palaces")]
+        all_palaces: bool,
     },
 
     /// Remove a memory by ID.

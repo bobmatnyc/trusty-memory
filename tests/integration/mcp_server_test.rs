@@ -14,7 +14,7 @@ fn all_tools_are_advertised() {
         .get("tools")
         .and_then(|t| t.as_array())
         .expect("tools array");
-    assert_eq!(tools.len(), 11, "expected exactly 11 MCP tools");
+    assert_eq!(tools.len(), 12, "expected exactly 12 MCP tools");
 
     let names: Vec<&str> = tools
         .iter()
@@ -33,6 +33,7 @@ fn all_tools_are_advertised() {
         "kg_assert",
         "kg_query",
         "palace_compact",
+        "memory_recall_all",
     ] {
         assert!(
             names.contains(&expected),
@@ -78,7 +79,7 @@ async fn initialize_then_list_then_call_handshake() {
         json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
     )
     .await;
-    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 11);
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 12);
 
     // 4) palace_create — the real registry needs the palace on disk before
     //    memory_remember can target it.

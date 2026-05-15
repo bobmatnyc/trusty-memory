@@ -3647,6 +3647,7 @@ dependencies = [
  "criterion",
  "dashmap",
  "dirs 5.0.1",
+ "futures",
  "git2",
  "kuzu",
  "parking_lot",

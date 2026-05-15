@@ -15,7 +15,8 @@ use chrono::Utc;
 use serde_json::json;
 use std::sync::Arc;
 use trusty_memory_core::retrieval::{
-    recall_deep_with_default_embedder, recall_with_default_embedder, PalaceHandle, RecallResult,
+    recall_across_palaces_with_default_embedder, recall_deep_with_default_embedder,
+    recall_with_default_embedder, PalaceHandle, RecallResult,
 };
 use trusty_memory_core::{Palace, PalaceId, PalaceRegistry, RoomType};
 use uuid::Uuid;
@@ -119,6 +120,96 @@ pub async fn handle_recall(
             let preview = &r.drawer.content[..preview_len];
             let room_label = format!("L{}", r.layer);
             println!("[{:.3}] [{}] {}", r.score, room_label, preview);
+        }
+        let layer = if deep { "L3" } else { "L2" };
+        out.print_footer(results.len(), layer, elapsed_ms);
+    }
+    Ok(())
+}
+
+/// `recall --all-palaces` — fan a recall across every palace on this machine
+/// and present a single ranked, deduplicated result list.
+///
+/// Why: Agents often don't care which palace a fact lives in; they want the
+/// most relevant memories regardless of namespace. Forcing the operator to
+/// repeat a recall per palace is slow and produces no merged ranking. This
+/// helper opens every persisted palace, fans out concurrently, and prints the
+/// top-k with a `[palace: <id>]` prefix so the source is still obvious.
+/// What: Lists palaces via `PalaceRegistry::list_palaces`, opens a handle for
+/// each (skipping failures), and delegates to
+/// `recall_across_palaces_with_default_embedder`. Honours both human and JSON
+/// output modes.
+/// Test: Exercised end-to-end via `cargo run -- recall <q> --all-palaces`;
+/// core merge logic is covered by `recall_across_palaces_merges_results`.
+pub async fn handle_recall_all(
+    query: String,
+    top_k: usize,
+    deep: bool,
+    out: &OutputConfig,
+) -> Result<()> {
+    out.print_header("(all palaces)", "all");
+    let root = data_root()?;
+
+    // List + open palaces on a blocking thread — the registry calls are
+    // synchronous and we keep the async reactor free for the embedder load.
+    let handles = tokio::task::spawn_blocking(move || -> Result<Vec<Arc<PalaceHandle>>> {
+        let palaces = PalaceRegistry::list_palaces(&root).context("list palaces")?;
+        if palaces.is_empty() {
+            return Ok(Vec::new());
+        }
+        let reg = PalaceRegistry::new();
+        let mut out = Vec::with_capacity(palaces.len());
+        for p in &palaces {
+            match reg.open_palace(&root, &p.id) {
+                Ok(h) => out.push(h),
+                Err(e) => tracing::warn!(palace = %p.id, "open failed, skipping: {e:#}"),
+            }
+        }
+        Ok(out)
+    })
+    .await
+    .context("join open_all_palaces")??;
+
+    if handles.is_empty() {
+        if out.json {
+            let empty: Vec<serde_json::Value> = Vec::new();
+            out.print_json(&json!({"results": empty}));
+        } else {
+            println!("(no palaces on this machine)");
+        }
+        return Ok(());
+    }
+
+    let started = std::time::Instant::now();
+    let results = recall_across_palaces_with_default_embedder(&handles, &query, top_k, deep)
+        .await
+        .context("recall_across_palaces")?;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+
+    if out.json {
+        let arr: Vec<_> = results
+            .iter()
+            .map(|r| {
+                json!({
+                    "palace_id":  r.palace_id,
+                    "drawer_id":  r.result.drawer.id.to_string(),
+                    "score":      r.result.score,
+                    "layer":      r.result.layer,
+                    "content":    r.result.drawer.content,
+                    "importance": r.result.drawer.importance,
+                    "tags":       r.result.drawer.tags,
+                })
+            })
+            .collect();
+        out.print_json(&json!({"results": arr}));
+    } else {
+        for r in &results {
+            let preview_len = r.result.drawer.content.len().min(120);
+            let preview = &r.result.drawer.content[..preview_len];
+            println!(
+                "[{:.3}] [L{}] [palace: {}] {}",
+                r.result.score, r.result.layer, r.palace_id, preview
+            );
         }
         let layer = if deep { "L3" } else { "L2" };
         out.print_footer(results.len(), layer, elapsed_ms);

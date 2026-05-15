@@ -532,6 +532,137 @@ pub async fn recall_deep_with_default_embedder(
     recall_deep(handle, embedder.as_ref(), query, top_k).await
 }
 
+/// A cross-palace recall result, tagging each ranked drawer with its source
+/// palace id so callers can attribute hits back to a namespace.
+///
+/// Why: When agents fan out a query across every palace on the machine, the
+/// raw `RecallResult` loses the namespace signal — without the palace id the
+/// caller cannot decide which palace a fact lives in. Wrapping rather than
+/// extending `RecallResult` keeps single-palace call sites untouched.
+/// What: Bundles the originating `palace_id` (kebab-case string) with the
+/// underlying `RecallResult`.
+/// Test: `recall_across_palaces_merges_results` asserts both palace ids appear
+/// in the merged output.
+#[derive(Debug, Clone)]
+pub struct CrossPalaceResult {
+    pub palace_id: String,
+    pub result: RecallResult,
+}
+
+/// Fan out a recall across every palace handle and merge the results.
+///
+/// Why: Agents often want the most relevant memories regardless of which palace
+/// they are stored in. This function fans out a single query across every open
+/// palace handle, merges the results, deduplicates by drawer id, and re-ranks
+/// by score descending.
+/// What: For each palace handle in `handles`, runs `recall` (L0+L1+L2) or
+/// `recall_deep` (L0+L1+L3) depending on `deep`, concurrently via
+/// `futures::future::join_all`. Errors from individual palaces are logged via
+/// `tracing::warn!` and skipped (not fatal). The merged list is deduplicated
+/// by `result.drawer.id` (highest score wins on collision), sorted by
+/// `result.score` descending, then truncated to `top_k`.
+/// Test: `recall_across_palaces_merges_results` verifies results from two
+/// palaces appear in the combined output.
+pub async fn recall_across_palaces(
+    handles: &[Arc<PalaceHandle>],
+    embedder: &Arc<dyn Embedder + Send + Sync>,
+    query: &str,
+    top_k: usize,
+    deep: bool,
+) -> Result<Vec<CrossPalaceResult>> {
+    if handles.is_empty() || top_k == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Fan out concurrently. Each future returns (palace_id, Result<Vec<...>>);
+    // we keep the palace id alongside the result so failures can be logged
+    // with the right context.
+    let mut futures = Vec::with_capacity(handles.len());
+    for handle in handles {
+        let palace_id = handle.id.as_str().to_string();
+        let handle = handle.clone();
+        let embedder = embedder.clone();
+        let query = query.to_string();
+        futures.push(async move {
+            let result = if deep {
+                recall_deep(&handle, embedder.as_ref(), &query, top_k).await
+            } else {
+                recall(&handle, embedder.as_ref(), &query, top_k).await
+            };
+            (palace_id, result)
+        });
+    }
+
+    let outcomes = futures::future::join_all(futures).await;
+
+    // Deduplicate by drawer id — keep the highest-scoring occurrence. We index
+    // into `merged` via a parallel `HashMap<Uuid, usize>` so we can mutate the
+    // chosen entry in place when a higher-scoring duplicate arrives.
+    let mut merged: Vec<CrossPalaceResult> = Vec::new();
+    let mut by_drawer: HashMap<Uuid, usize> = HashMap::new();
+
+    for (palace_id, outcome) in outcomes {
+        match outcome {
+            Ok(hits) => {
+                for r in hits {
+                    let drawer_id = r.drawer.id;
+                    let candidate = CrossPalaceResult {
+                        palace_id: palace_id.clone(),
+                        result: r,
+                    };
+                    match by_drawer.get(&drawer_id).copied() {
+                        Some(idx) if merged[idx].result.score >= candidate.result.score => {
+                            // Existing entry wins; drop the candidate.
+                        }
+                        Some(idx) => {
+                            merged[idx] = candidate;
+                        }
+                        None => {
+                            by_drawer.insert(drawer_id, merged.len());
+                            merged.push(candidate);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(palace = %palace_id, "recall_across_palaces: skipping palace: {e:#}");
+            }
+        }
+    }
+
+    merged.sort_by(|a, b| {
+        b.result
+            .score
+            .partial_cmp(&a.result.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    merged.truncate(top_k);
+    Ok(merged)
+}
+
+/// Convenience wrapper for `recall_across_palaces` using the process-wide
+/// shared `FastEmbedder`.
+///
+/// Why: CLI / MCP / HTTP entry points should not have to thread an embedder
+/// through every call; the shared singleton (issue #57) is the right default
+/// for cross-palace fan-out too.
+/// What: Resolves `shared_embedder()`, erases it to `Arc<dyn Embedder + Send +
+/// Sync>`, and delegates to `recall_across_palaces`.
+/// Test: Indirectly exercised via the MCP / HTTP / CLI integration paths;
+/// `recall_across_palaces_merges_results` covers the core merge logic.
+pub async fn recall_across_palaces_with_default_embedder(
+    handles: &[Arc<PalaceHandle>],
+    query: &str,
+    top_k: usize,
+    deep: bool,
+) -> Result<Vec<CrossPalaceResult>> {
+    let embedder = shared_embedder()
+        .await
+        .context("acquire shared embedder for recall_across_palaces")?;
+    let erased: Arc<dyn Embedder + Send + Sync> = embedder;
+    recall_across_palaces(handles, &erased, query, top_k, deep).await
+}
+
 /// Hash a `RoomType` to a deterministic `Uuid` so the room signal survives
 /// through the in-memory drawer table without a real `Room` row.
 ///
@@ -1438,5 +1569,90 @@ mod tests {
             "tagged drawer should rank first; got {:?}",
             results[0].drawer.content
         );
+    }
+
+    /// Why: Cross-palace recall is the foundation of `memory_recall_all` —
+    /// agents need to fan a query across every palace and merge the hits.
+    /// Without this test a regression in the merge/dedup/rerank logic could
+    /// silently return a single palace's results or drop palace_id tagging.
+    /// What: Build two disk-backed palaces with distinct distinctive drawers,
+    /// run `recall_across_palaces_with_default_embedder`, and assert at least
+    /// one result from each palace appears in the merged output sorted by
+    /// score descending.
+    /// Test: This test itself.
+    #[tokio::test]
+    async fn recall_across_palaces_merges_results() {
+        use crate::palace::Palace;
+        let dir = tempdir().unwrap();
+
+        let palace_a = Palace {
+            id: PalaceId::new("alpha"),
+            name: "Alpha".into(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            data_dir: dir.path().join("alpha"),
+        };
+        std::fs::create_dir_all(&palace_a.data_dir).unwrap();
+        let handle_a = PalaceHandle::open(&palace_a).unwrap();
+        handle_a
+            .remember(
+                "the pangolin is a scaly nocturnal mammal".into(),
+                RoomType::Research,
+                vec![],
+                0.6,
+            )
+            .await
+            .unwrap();
+
+        let palace_b = Palace {
+            id: PalaceId::new("beta"),
+            name: "Beta".into(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            data_dir: dir.path().join("beta"),
+        };
+        std::fs::create_dir_all(&palace_b.data_dir).unwrap();
+        let handle_b = PalaceHandle::open(&palace_b).unwrap();
+        handle_b
+            .remember(
+                "the platypus is a venomous monotreme".into(),
+                RoomType::Research,
+                vec![],
+                0.6,
+            )
+            .await
+            .unwrap();
+
+        let handles = vec![handle_a, handle_b];
+        let results = recall_across_palaces_with_default_embedder(
+            &handles,
+            "pangolin platypus mammal",
+            10,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(!results.is_empty(), "expected merged results, got none");
+        assert!(
+            results.iter().any(|r| r.palace_id == "alpha"),
+            "expected at least one alpha result; got {:?}",
+            results.iter().map(|r| &r.palace_id).collect::<Vec<_>>()
+        );
+        assert!(
+            results.iter().any(|r| r.palace_id == "beta"),
+            "expected at least one beta result; got {:?}",
+            results.iter().map(|r| &r.palace_id).collect::<Vec<_>>()
+        );
+
+        // Sorted by score descending.
+        for w in results.windows(2) {
+            assert!(
+                w[0].result.score >= w[1].result.score,
+                "results not sorted: {} < {}",
+                w[0].result.score,
+                w[1].result.score
+            );
+        }
     }
 }
