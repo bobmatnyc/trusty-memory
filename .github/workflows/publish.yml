@@ -84,9 +84,9 @@ jobs:
       - name: Publish trusty-memory-core
         run: |
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish -p trusty-memory-core --dry-run
+            cargo publish -p trusty-memory-core --dry-run --allow-dirty
           else
-            cargo publish -p trusty-memory-core --no-verify
+            cargo publish -p trusty-memory-core --no-verify --allow-dirty
           fi
 
       - name: Wait for index propagation (trusty-memory-core)
@@ -96,9 +96,9 @@ jobs:
       - name: Publish trusty-memory-mcp
         run: |
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish -p trusty-memory-mcp --dry-run
+            cargo publish -p trusty-memory-mcp --dry-run --allow-dirty
           else
-            cargo publish -p trusty-memory-mcp --no-verify
+            cargo publish -p trusty-memory-mcp --no-verify --allow-dirty
           fi
 
       - name: Wait for index propagation (trusty-memory-mcp)
@@ -108,7 +108,7 @@ jobs:
       - name: Publish trusty-memory (binary crate)
         run: |
           if [ "${{ inputs.dry_run }}" = "true" ]; then
-            cargo publish -p trusty-memory --dry-run
+            cargo publish -p trusty-memory --dry-run --allow-dirty
           else
-            cargo publish -p trusty-memory --no-verify
+            cargo publish -p trusty-memory --no-verify --allow-dirty
           fi
