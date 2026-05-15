@@ -14,7 +14,7 @@ license = "MIT"
 crate-type = ["rlib"]
 
 [dependencies]
-trusty-memory-core = { path = "../trusty-memory-core" }
+trusty-memory-core = { path = "../trusty-memory-core", version = "0.1.16" }
 trusty-mcp-core = { workspace = true }
 trusty-common = { workspace = true }
 tokio = { workspace = true }
