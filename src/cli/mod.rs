@@ -194,6 +194,11 @@ pub enum Commands {
         /// stdio MCP mode (used by Claude Code hook)
         #[arg(long)]
         mcp: bool,
+        /// Deprecated no-op. HTTP is now opt-in via `--http`, so `--no-http`
+        /// is the default behaviour. Kept hidden and accepted only so that
+        /// pre-existing configs/scripts passing `--no-http` do not break.
+        #[arg(long = "no-http", hide = true)]
+        no_http: bool,
         /// Default palace for MCP tool calls. When omitted, the palace is
         /// auto-detected from the working directory (`.trusty-memory` marker
         /// file, or the cwd directory name). Auto-created on startup if it

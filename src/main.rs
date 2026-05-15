@@ -89,6 +89,9 @@ async fn main() -> Result<()> {
         Commands::Serve {
             http,
             mcp: _,
+            // `--no-http` is a deprecated no-op kept for backward compatibility:
+            // HTTP is opt-in via `--http`, so passing `--no-http` changes nothing.
+            no_http: _,
             palace: serve_palace,
         } => {
             // Auto-detect the default palace from the working directory when
