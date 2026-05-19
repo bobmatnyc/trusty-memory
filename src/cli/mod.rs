@@ -18,6 +18,7 @@ pub mod bench;
 pub mod chat;
 pub mod config;
 pub mod convert;
+pub mod cursor;
 pub mod daemon_probe;
 pub mod dashboard;
 pub mod decay;
@@ -262,6 +263,17 @@ pub enum Commands {
         after_help = "Examples:\n  trusty-memory hooks install --git\n  trusty-memory hooks install --claude-code\n  trusty-memory hooks install --all\n  trusty-memory hooks list\n  trusty-memory hooks status"
     )]
     Hooks(hooks::HooksArgs),
+
+    /// Sync palace memories into Cursor editor rules (`.cursor/rules/`).
+    ///
+    /// Exports the top memories of a palace into
+    /// `.cursor/rules/trusty-memory.mdc` so the Cursor editor surfaces them as
+    /// project context. `cursor status` reports on an existing rules file.
+    #[command(
+        subcommand,
+        after_help = "Examples:\n  trusty-memory cursor sync --palace my-app\n  trusty-memory cursor sync --palace my-app --top-k 100 --watch 30\n  trusty-memory cursor sync --palace my-app --dry-run\n  trusty-memory cursor status"
+    )]
+    Cursor(cursor::CursorSubcommand),
 
     /// Migrate from another memory tool to trusty-memory.
     ///
