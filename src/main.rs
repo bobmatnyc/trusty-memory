@@ -467,6 +467,10 @@ async fn main() -> Result<()> {
             cli::hooks::handle(args, &palace, &out).await?;
         }
 
+        Commands::Migrate(sub) => {
+            cli::migrate::handle(sub, &out).await?;
+        }
+
         Commands::Backup(args) => {
             cli::backup::handle_backup(args, &out).await?;
         }

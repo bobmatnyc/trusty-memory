@@ -28,6 +28,7 @@ pub mod hooks;
 pub mod kg;
 pub mod kuzu;
 pub mod memory;
+pub mod migrate;
 pub mod output;
 pub mod start;
 pub mod stop;
@@ -261,6 +262,16 @@ pub enum Commands {
         after_help = "Examples:\n  trusty-memory hooks install --git\n  trusty-memory hooks install --claude-code\n  trusty-memory hooks install --all\n  trusty-memory hooks list\n  trusty-memory hooks status"
     )]
     Hooks(hooks::HooksArgs),
+
+    /// Migrate from another memory tool to trusty-memory.
+    ///
+    /// Currently supports `kuzu-memory`: rewrites Claude `settings.json`
+    /// `mcpServers` entries and imports stored memories into a palace.
+    #[command(
+        subcommand,
+        after_help = "Examples:\n  trusty-memory migrate kuzu-memory\n  trusty-memory migrate kuzu-memory --dry-run\n  trusty-memory migrate kuzu-memory --palace my-app"
+    )]
+    Migrate(migrate::MigrateSubcommand),
 
     /// Back up a palace (or all palaces) to a `.tar.gz` archive.
     #[command(
