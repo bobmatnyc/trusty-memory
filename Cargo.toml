@@ -58,7 +58,7 @@ trusty-mcp-core = { path = "../trusty-common/crates/trusty-mcp-core" }
 
 [package]
 name = "trusty-memory"
-version = "0.1.47"
+version = "0.1.48"
 edition = "2021"
 description = "Machine-wide, blazingly fast AI memory service"
 license-file = "LICENSE"
@@ -75,8 +75,8 @@ name = "trusty-memory"
 path = "src/main.rs"
 
 [dependencies]
-trusty-memory-core = { path = "crates/trusty-memory-core", version = "0.1.18" }
-trusty-memory-mcp = { path = "crates/trusty-memory-mcp", version = "0.1.18" }
+trusty-memory-core = { path = "crates/trusty-memory-core", version = "0.1.19" }
+trusty-memory-mcp = { path = "crates/trusty-memory-mcp", version = "0.1.19" }
 trusty-common = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
