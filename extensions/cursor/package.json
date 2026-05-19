@@ -1,0 +1,112 @@
+{
+  "name": "trusty-memory-cursor",
+  "displayName": "Trusty Memory",
+  "description": "Store, recall, and browse Trusty Memory palaces from VS Code / Cursor.",
+  "version": "0.1.0",
+  "publisher": "trusty",
+  "license": "Elastic-2.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "AI"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "trustyMemory.storeSelection",
+        "title": "Trusty Memory: Store Selection"
+      },
+      {
+        "command": "trustyMemory.recall",
+        "title": "Trusty Memory: Recall"
+      },
+      {
+        "command": "trustyMemory.syncCursorRules",
+        "title": "Trusty Memory: Sync Cursor Rules"
+      },
+      {
+        "command": "trustyMemory.refreshSidebar",
+        "title": "Trusty Memory: Refresh",
+        "icon": "$(refresh)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "trustyMemory",
+          "title": "Trusty Memory",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "trustyMemory": [
+        {
+          "id": "trustyMemory.palaces",
+          "name": "Palaces",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "trustyMemory.refreshSidebar",
+          "when": "view == trustyMemory.palaces",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "trustyMemory.storeSelection",
+          "when": "editorHasSelection",
+          "group": "trustyMemory"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Trusty Memory",
+      "properties": {
+        "trustyMemory.httpPort": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "default": null,
+          "description": "TCP port of the trusty-memory daemon. When null, the port is read from the daemon's http_addr discovery file."
+        },
+        "trustyMemory.defaultPalace": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "description": "Name of the palace to operate on. When null, the active workspace folder name is used."
+        },
+        "trustyMemory.binaryPath": {
+          "type": "string",
+          "default": "trusty-memory",
+          "description": "Path to the trusty-memory CLI binary (used for the Sync Cursor Rules command)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "node esbuild.config.js",
+    "watch": "node esbuild.config.js --watch",
+    "typecheck": "tsc --noEmit",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.24.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.6.0"
+  }
+}

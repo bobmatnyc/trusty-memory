@@ -4,7 +4,7 @@
 .DEFAULT_GOAL := help
 CLOSES ?=
 
-.PHONY: help check test lint fmt build release patch deploy restart smoke all
+.PHONY: help check test lint fmt build release patch deploy restart smoke all ext-build
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -60,6 +60,9 @@ restart: ## Restart the daemon via launchd (install service first with: trusty-m
 	@sleep 3
 	@trusty-memory status
 	@echo "trusty-memory daemon restarted"
+
+ext-build: ## Build the VS Code / Cursor extension (extensions/cursor)
+	cd extensions/cursor && npm install && npm run typecheck && npm run build
 
 smoke: ## Run smoke test (tests/smoke-test.sh)
 	bash tests/smoke-test.sh
