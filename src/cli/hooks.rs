@@ -179,13 +179,26 @@ fn install_claude_hooks() -> Result<()> {
     Ok(())
 }
 
+/// Default timeout (milliseconds) applied to the `UserPromptSubmit` hook.
+///
+/// Why: Issue #63 — without a timeout the Claude Code REPL freezes
+/// indefinitely if `trusty-memory` is slow (cold start, DB lock). Claude Code
+/// kills the hook process once this elapses.
+/// What: 5 seconds — long enough for a warm recall, short enough to avoid a
+/// visible REPL stall.
+/// Test: `trusty_hook_entries_user_prompt_has_timeout` asserts the value.
+const USER_PROMPT_HOOK_TIMEOUT_MS: u64 = 5_000;
+
 /// Hook entries to merge into `~/.claude/settings.json`.
 ///
 /// Why: Keep the canonical hook payload in one place so install + list +
 /// tests agree on shape.
 /// What: A JSON object matching Claude Code's `settings.json` `hooks` schema
-/// for Stop + PostToolUse events.
-/// Test: `merge_claude_settings_*` tests use this exact shape.
+/// for Stop + PostToolUse + UserPromptSubmit events. The UserPromptSubmit
+/// command carries an explicit `timeout` (see `USER_PROMPT_HOOK_TIMEOUT_MS`)
+/// so a slow daemon never freezes the REPL.
+/// Test: `merge_claude_settings_*` tests use this exact shape;
+/// `trusty_hook_entries_user_prompt_has_timeout` asserts the timeout.
 fn trusty_hook_entries() -> Value {
     json!({
         "hooks": {
@@ -209,7 +222,11 @@ fn trusty_hook_entries() -> Value {
                 {
                     "matcher": "",
                     "hooks": [
-                        {"type": "command", "command": "trusty-memory hooks fire claude.user-prompt"}
+                        {
+                            "type": "command",
+                            "command": "trusty-memory hooks fire claude.user-prompt",
+                            "timeout": USER_PROMPT_HOOK_TIMEOUT_MS
+                        }
                     ]
                 }
             ]
@@ -262,7 +279,51 @@ pub fn merge_claude_settings(existing: &Value, additions: &Value) -> Value {
             }
         }
     }
+
+    // Backfill: older installs wrote the UserPromptSubmit hook without a
+    // `timeout`. Even when the command already exists (so the loop above
+    // skipped it), ensure every trusty-memory hook command has the default
+    // timeout so a slow daemon never freezes the Claude Code REPL (issue #63).
+    backfill_user_prompt_timeout(hooks_obj);
+
     merged
+}
+
+/// Ensure every installed `trusty-memory hooks fire` command entry carries the
+/// default `timeout` value.
+///
+/// Why: Issue #63 — hooks installed before the timeout fix lack a `timeout`
+/// field, so re-running `hooks install` must patch them in place rather than
+/// leave the REPL exposed to an indefinite freeze.
+/// What: Walks every event array, finds inner `hooks` command objects whose
+/// `command` starts with `trusty-memory hooks fire`, and inserts/overwrites
+/// `timeout` with `USER_PROMPT_HOOK_TIMEOUT_MS` when it is missing.
+/// Test: `merge_claude_settings_backfills_missing_timeout` adds a timeout-less
+/// entry and asserts the merge result has the timeout.
+fn backfill_user_prompt_timeout(hooks_obj: &mut serde_json::Map<String, Value>) {
+    for event_arr in hooks_obj.values_mut() {
+        let Some(entries) = event_arr.as_array_mut() else {
+            continue;
+        };
+        for entry in entries.iter_mut() {
+            let Some(inner) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+                continue;
+            };
+            for cmd in inner.iter_mut() {
+                let Some(obj) = cmd.as_object_mut() else {
+                    continue;
+                };
+                let is_trusty = obj
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.starts_with("trusty-memory hooks fire"))
+                    .unwrap_or(false);
+                if is_trusty && !obj.contains_key("timeout") {
+                    obj.insert("timeout".to_string(), json!(USER_PROMPT_HOOK_TIMEOUT_MS));
+                }
+            }
+        }
+    }
 }
 
 /// Returns true if `existing` already includes the same trusty-memory
@@ -753,6 +814,17 @@ pub fn format_recall_context(results: &[RecallResult]) -> String {
     out
 }
 
+/// Internal self-termination timeout for the `claude.user-prompt` hook.
+///
+/// Why: Issue #63 — a defense-in-depth backstop in case Claude Code's external
+/// timeout is misconfigured or removed. Set slightly longer than
+/// `USER_PROMPT_HOOK_TIMEOUT_MS` so, under normal conditions, Claude Code's
+/// timeout fires first and this never triggers.
+/// What: 8 seconds. If recall exceeds it, we log a warning and exit silently.
+/// Test: covered indirectly — `fire_claude_user_prompt` wraps its work in a
+/// `tokio::time::timeout` of this duration.
+const USER_PROMPT_INTERNAL_TIMEOUT: Duration = Duration::from_secs(8);
+
 async fn fire_claude_user_prompt(palace: &str) -> Result<()> {
     // Read the user's prompt from stdin (Claude Code passes it as JSON).
     let payload_str = read_stdin_with_timeout(Duration::from_millis(200)).await;
@@ -762,28 +834,57 @@ async fn fire_claude_user_prompt(palace: &str) -> Result<()> {
         return Ok(());
     };
 
+    // Wrap the recall in an internal timeout so the hook self-terminates if a
+    // cold start or DB lock makes the operation hang (issue #63). This is a
+    // backstop behind Claude Code's external 5s timeout.
+    match tokio::time::timeout(
+        USER_PROMPT_INTERNAL_TIMEOUT,
+        recall_user_prompt_context(palace, &prompt),
+    )
+    .await
+    {
+        Ok(Some(context)) => {
+            // Emit the JSON envelope Claude Code consumes to inject context.
+            let envelope = json!({ "context": context });
+            println!("{envelope}");
+        }
+        Ok(None) => {
+            // No usable context or a recoverable failure — exit silently.
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = USER_PROMPT_INTERNAL_TIMEOUT.as_secs(),
+                "claude.user-prompt hook timed out; skipping memory injection"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Run the L2 recall for a user prompt and format injectable context.
+///
+/// Why: Extracted from `fire_claude_user_prompt` so the recall work can be
+/// wrapped in a `tokio::time::timeout` backstop (issue #63).
+/// What: Opens the palace, runs an L2 recall (top-5), and formats the results.
+/// Returns `None` whenever there is nothing useful to inject or a recoverable
+/// error occurred — a hook must never block the user's prompt.
+/// Test: exercised end-to-end via the `claude.user-prompt` fire path.
+async fn recall_user_prompt_context(palace: &str, prompt: &str) -> Option<String> {
     // Open the palace handle. If anything fails we exit silently — a hook
     // must never block the user's prompt.
-    let handle = match open_or_create_handle(palace).await {
-        Ok(h) => h,
-        Err(_) => return Ok(()),
-    };
+    let handle = open_or_create_handle(palace).await.ok()?;
 
     // L2 recall, top-5. Keep it fast; this runs on every prompt.
-    let results = match recall_with_default_embedder(&handle, &prompt, 5).await {
-        Ok(r) => r,
-        Err(_) => return Ok(()),
-    };
+    let results = recall_with_default_embedder(&handle, prompt, 5)
+        .await
+        .ok()?;
 
     let context = format_recall_context(&results);
     if context.is_empty() {
-        return Ok(());
+        None
+    } else {
+        Some(context)
     }
-
-    // Emit the JSON envelope Claude Code consumes to inject context.
-    let envelope = json!({ "context": context });
-    println!("{envelope}");
-    Ok(())
 }
 
 // ── stdin / status helpers ──────────────────────────────────────────────────
@@ -1116,6 +1217,114 @@ mod tests {
         assert!(cmds
             .iter()
             .any(|s| s.contains("trusty-memory hooks fire claude.user-prompt")));
+    }
+
+    #[test]
+    fn trusty_hook_entries_user_prompt_has_timeout() {
+        let v = trusty_hook_entries();
+        let arr = v
+            .get("hooks")
+            .and_then(|h| h.get("UserPromptSubmit"))
+            .and_then(|s| s.as_array())
+            .expect("UserPromptSubmit array");
+        let cmd = arr
+            .iter()
+            .filter_map(|e| e.get("hooks").and_then(|h| h.as_array()))
+            .flat_map(|a| a.iter())
+            .find(|c| {
+                c.get("command")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.contains("claude.user-prompt"))
+                    .unwrap_or(false)
+            })
+            .expect("user-prompt command entry");
+        assert_eq!(
+            cmd.get("timeout").and_then(|t| t.as_u64()),
+            Some(USER_PROMPT_HOOK_TIMEOUT_MS),
+            "user-prompt hook must carry the default timeout"
+        );
+    }
+
+    #[test]
+    fn merge_claude_settings_backfills_missing_timeout() {
+        // Simulate an older install: UserPromptSubmit hook present but with no
+        // `timeout` field. Re-running install must patch the timeout in place.
+        let existing = json!({
+            "hooks": {
+                "UserPromptSubmit": [
+                    {
+                        "matcher": "",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "trusty-memory hooks fire claude.user-prompt"
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+        let merged = merge_claude_settings(&existing, &trusty_hook_entries());
+        let arr = merged
+            .get("hooks")
+            .and_then(|h| h.get("UserPromptSubmit"))
+            .and_then(|s| s.as_array())
+            .expect("UserPromptSubmit array");
+        // No duplicate command should have been appended.
+        assert_eq!(arr.len(), 1, "existing entry must not be duplicated");
+        let cmd = arr
+            .iter()
+            .filter_map(|e| e.get("hooks").and_then(|h| h.as_array()))
+            .flat_map(|a| a.iter())
+            .find(|c| {
+                c.get("command")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.contains("claude.user-prompt"))
+                    .unwrap_or(false)
+            })
+            .expect("user-prompt command entry");
+        assert_eq!(
+            cmd.get("timeout").and_then(|t| t.as_u64()),
+            Some(USER_PROMPT_HOOK_TIMEOUT_MS),
+            "missing timeout must be backfilled on re-install"
+        );
+    }
+
+    #[test]
+    fn merge_claude_settings_preserves_explicit_timeout() {
+        // A user who set a custom timeout should keep it — backfill only fills
+        // a missing field, never overwrites an existing one.
+        let existing = json!({
+            "hooks": {
+                "UserPromptSubmit": [
+                    {
+                        "matcher": "",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "trusty-memory hooks fire claude.user-prompt",
+                                "timeout": 12000
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+        let merged = merge_claude_settings(&existing, &trusty_hook_entries());
+        let cmd = merged
+            .get("hooks")
+            .and_then(|h| h.get("UserPromptSubmit"))
+            .and_then(|s| s.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|e| e.get("hooks"))
+            .and_then(|h| h.as_array())
+            .and_then(|a| a.first())
+            .expect("user-prompt command entry");
+        assert_eq!(
+            cmd.get("timeout").and_then(|t| t.as_u64()),
+            Some(12_000),
+            "explicit user timeout must be preserved"
+        );
     }
 
     #[test]
