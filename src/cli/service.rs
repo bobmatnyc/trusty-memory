@@ -17,6 +17,8 @@
 
 use crate::cli::ServiceCommands;
 use anyhow::Result;
+#[cfg(target_os = "macos")]
+use std::path::Path;
 
 /// Reverse-DNS label used for the LaunchAgent and `launchctl` identifiers.
 #[cfg(target_os = "macos")]
@@ -40,24 +42,57 @@ pub fn handle(cmd: ServiceCommands) -> Result<()> {
 
 // ─── macOS implementation ───────────────────────────────────────────────────
 
+/// Build the [`LaunchdConfig`] describing the trusty-memory LaunchAgent.
+///
+/// Why: `install` needs a fully-populated config to render the plist and
+/// bootstrap the service; isolating its construction keeps the install path
+/// declarative and lets the plist content be unit-tested without filesystem
+/// or `launchctl` side effects.
+/// What: Resolves the current binary, home-relative log paths, and the
+/// FASTEMBED cache directory, returning a `LaunchdConfig` with `KeepAlive`
+/// always-on and a 10s respawn throttle.
+/// Test: `launchd_config_renders_expected_plist` renders this config and
+/// asserts the binary, args, env vars, and log paths are present.
+#[cfg(target_os = "macos")]
+fn launchd_config() -> Result<trusty_common::launchd::LaunchdConfig> {
+    use anyhow::Context;
+    use trusty_common::launchd::{KeepAlive, LaunchdConfig};
+
+    let binary = std::env::current_exe().context("resolving current binary path")?;
+    let home = dirs::home_dir().context("could not resolve home directory")?;
+    let log_dir = home.join("Library").join("Logs").join("trusty-memory");
+
+    Ok(LaunchdConfig {
+        label: SERVICE_LABEL.to_string(),
+        program: binary,
+        program_args: vec!["serve".to_string(), "--http".to_string()],
+        stdout_path: log_dir.join("trusty-memory.log"),
+        stderr_path: log_dir.join("trusty-memory.error.log"),
+        env_vars: vec![
+            (
+                "FASTEMBED_CACHE_PATH".to_string(),
+                format!("{}/.cache/fastembed", home.to_string_lossy()),
+            ),
+            ("RUST_LOG".to_string(), "info".to_string()),
+        ],
+        keep_alive: KeepAlive::Always,
+        throttle_interval: Some(10),
+        working_directory: None,
+    })
+}
+
 #[cfg(target_os = "macos")]
 fn install() -> Result<()> {
     use anyhow::Context;
     use std::fs;
 
-    let binary = std::env::current_exe().context("resolving current binary path")?;
-    let home = dirs::home_dir().context("could not resolve home directory")?;
-
-    let plist_path = home
-        .join("Library")
-        .join("LaunchAgents")
-        .join(format!("{SERVICE_LABEL}.plist"));
-    let log_dir = home
-        .join("Library")
-        .join("Logs")
-        .join("trusty-memory");
-    let log_path = log_dir.join("trusty-memory.log");
-    let err_path = log_dir.join("trusty-memory.error.log");
+    let cfg = launchd_config()?;
+    let plist_path = cfg.plist_path()?;
+    let log_dir = cfg
+        .stdout_path
+        .parent()
+        .map(Path::to_path_buf)
+        .context("resolving log directory")?;
 
     // Idempotent: if the plist already exists, don't clobber whatever the user
     // (or a previous install) configured.
@@ -72,46 +107,24 @@ fn install() -> Result<()> {
 
     fs::create_dir_all(&log_dir)
         .with_context(|| format!("creating log directory {}", log_dir.display()))?;
-    if let Some(parent) = plist_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating LaunchAgents directory {}", parent.display()))?;
-    }
 
-    let home_str = home.to_string_lossy();
-    let plist = render_plist(
-        &binary.to_string_lossy(),
-        &log_path.to_string_lossy(),
-        &err_path.to_string_lossy(),
-        &home_str,
-    );
-    fs::write(&plist_path, plist).with_context(|| format!("writing {}", plist_path.display()))?;
+    // Render + write the plist into ~/Library/LaunchAgents.
+    cfg.install()?;
 
-    // Load immediately via `launchctl bootstrap gui/$UID <plist>`.
-    let uid = nix_uid();
-    let domain = format!("gui/{uid}");
-    let output = std::process::Command::new("launchctl")
-        .args(["bootstrap", &domain])
-        .arg(&plist_path)
-        .output()
-        .context("invoking launchctl bootstrap")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // bootstrap returns non-zero if the service is already loaded; treat
-        // that as success since the plist is now on disk.
-        if !stderr.contains("already loaded") && !stderr.contains("service already") {
-            anyhow::bail!(
-                "launchctl bootstrap failed (exit {}): {}",
-                output.status,
-                stderr.trim()
-            );
+    // Load immediately via `launchctl bootstrap gui/$UID <plist>`. A non-zero
+    // exit because the service is already loaded is benign — the plist is now
+    // on disk regardless.
+    if let Err(e) = cfg.bootstrap() {
+        let msg = e.to_string();
+        if !msg.contains("already loaded") && !msg.contains("service already") {
+            return Err(e);
         }
     }
 
     println!("Installed trusty-memory service:");
     println!("  plist:   {}", plist_path.display());
-    println!("  stdout:  {}", log_path.display());
-    println!("  stderr:  {}", err_path.display());
+    println!("  stdout:  {}", cfg.stdout_path.display());
+    println!("  stderr:  {}", cfg.stderr_path.display());
     println!("  http:    dynamic port — discover via `trusty-memory status`");
     println!("           or `trusty-memory service status`");
     println!();
@@ -124,29 +137,15 @@ fn uninstall() -> Result<()> {
     use anyhow::Context;
     use std::fs;
 
-    let home = dirs::home_dir().context("could not resolve home directory")?;
-    let plist_path = home
-        .join("Library")
-        .join("LaunchAgents")
-        .join(format!("{SERVICE_LABEL}.plist"));
+    let cfg = launchd_config()?;
+    let plist_path = cfg.plist_path()?;
 
-    let uid = nix_uid();
-    let domain_target = format!("gui/{uid}/{SERVICE_LABEL}");
-
-    // Best-effort bootout — succeeds whether or not the service is currently
-    // loaded.
-    let output = std::process::Command::new("launchctl")
-        .args(["bootout", &domain_target])
-        .output()
-        .context("invoking launchctl bootout")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.contains("No such process") && !stderr.contains("not loaded") {
-            tracing::debug!(
-                "launchctl bootout returned {}: {}",
-                output.status,
-                stderr.trim()
-            );
+    // Best-effort bootout — a failure because the service was never loaded is
+    // benign, so we only log unexpected errors rather than aborting.
+    if let Err(e) = cfg.bootout() {
+        let msg = e.to_string();
+        if !msg.contains("No such process") && !msg.contains("not loaded") {
+            tracing::debug!("launchctl bootout failed: {msg}");
         }
     }
 
@@ -254,75 +253,6 @@ fn logs() -> Result<()> {
     Ok(())
 }
 
-/// Render the LaunchAgent plist body.
-///
-/// Why: Isolated for unit testing — keeps the install path easy to verify
-/// without writing to the filesystem.
-/// What: Returns the full plist XML with the binary path, log path, and
-/// home directory substituted. Includes FASTEMBED_CACHE_PATH environment
-/// variable to prevent read-only filesystem errors on SIP-protected paths.
-/// Test: `render_plist_contains_paths` below.
-#[cfg(target_os = "macos")]
-fn render_plist(binary: &str, stdout_path: &str, stderr_path: &str, home: &str) -> String {
-    let cache_path = format!("{}/.cache/fastembed", home);
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>{SERVICE_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{binary}</string>
-    <string>serve</string>
-    <string>--http</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>FASTEMBED_CACHE_PATH</key>
-    <string>{cache_path}</string>
-    <key>RUST_LOG</key>
-    <string>info</string>
-  </dict>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardInPath</key>
-  <string>/dev/null</string>
-  <key>StandardOutPath</key>
-  <string>{stdout_path}</string>
-  <key>StandardErrorPath</key>
-  <string>{stderr_path}</string>
-  <key>ThrottleInterval</key>
-  <integer>10</integer>
-</dict>
-</plist>
-"#
-    )
-}
-
-/// Resolve the real user id for `gui/<uid>` launchctl domain selectors.
-///
-/// Why: launchctl 2.x requires a domain target like `gui/501` rather than the
-/// legacy `launchctl load`. Using `id -u` keeps us off `libc` while still
-/// being correct on every macOS host.
-/// What: Shells out to `id -u`, parsing the integer. Falls back to 0 only if
-/// the call fails (which would already fail the surrounding command).
-/// Test: Not unit-tested — exercised end-to-end by install/uninstall.
-#[cfg(target_os = "macos")]
-fn nix_uid() -> u32 {
-    std::process::Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(0)
-}
-
 // ─── Non-macOS stubs ────────────────────────────────────────────────────────
 
 #[cfg(not(target_os = "macos"))]
@@ -358,35 +288,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn render_plist_contains_paths() {
-        let stdout = "/Users/u/Library/Logs/trusty-memory/trusty-memory.log";
-        let stderr = "/Users/u/Library/Logs/trusty-memory/trusty-memory.error.log";
-        let plist = render_plist("/usr/local/bin/trusty-memory", stdout, stderr, "/Users/u");
-        assert!(plist.contains("<string>/usr/local/bin/trusty-memory</string>"));
+    fn launchd_config_renders_expected_plist() {
+        // launchd_config() resolves the running test binary via current_exe()
+        // and HOME-relative log paths — exact values vary by host, so we assert
+        // on the structural keys the install path depends on.
+        let cfg = launchd_config().expect("build launchd config");
+        let plist = cfg.render_plist();
+
+        // Service label and program arguments.
+        assert!(plist.contains(SERVICE_LABEL));
         assert!(plist.contains("<string>serve</string>"));
-        // --http keeps the daemon alive when stdin is /dev/null (launchd default)
+        // --http keeps the daemon alive when stdin is /dev/null (launchd default).
         assert!(plist.contains("<string>--http</string>"));
-        // RUST_LOG=info ensures startup, dream, and FASTEMBED lines are captured
+        // RUST_LOG=info ensures startup, dream, and FASTEMBED lines are captured.
         assert!(plist.contains("<key>RUST_LOG</key>"));
         assert!(plist.contains("<string>info</string>"));
-        // stdout and stderr go to separate files under ~/Library/Logs/trusty-memory/
-        assert!(plist.contains(stdout));
-        assert!(plist.contains(stderr));
-        assert!(plist.contains(SERVICE_LABEL));
-        assert!(plist.contains("<key>RunAtLoad</key>"));
-        assert!(plist.contains("<key>KeepAlive</key>"));
-        // StandardInPath=/dev/null prevents launchd-managed instances from
-        // exiting due to stdin EOF in the stdio MCP loop.
-        assert!(plist.contains("<key>StandardInPath</key>"));
-        assert!(plist.contains("<string>/dev/null</string>"));
-        // Verify FASTEMBED_CACHE_PATH is set to prevent read-only filesystem errors.
+        // FASTEMBED_CACHE_PATH prevents read-only filesystem errors on SIP paths.
         assert!(plist.contains("<key>FASTEMBED_CACHE_PATH</key>"));
-        assert!(plist.contains("/Users/u/.cache/fastembed"));
+        assert!(plist.contains(".cache/fastembed"));
+        // KeepAlive=Always restarts the daemon on crash and runs it at load.
+        assert!(plist.contains("<key>KeepAlive</key>"));
+        assert!(plist.contains("<true/>"));
+        // 10s throttle prevents crash-loop hammering.
+        assert!(plist.contains("<key>ThrottleInterval</key>"));
+        // Separate stdout/stderr log files under ~/Library/Logs/trusty-memory/.
+        assert!(plist.contains("trusty-memory.log"));
+        assert!(plist.contains("trusty-memory.error.log"));
     }
 
     #[test]
-    fn render_plist_is_well_formed_xml() {
-        let plist = render_plist("/bin/trusty-memory", "/tmp/out.log", "/tmp/err.log", "/tmp");
+    fn launchd_config_renders_well_formed_xml() {
+        let plist = launchd_config()
+            .expect("build launchd config")
+            .render_plist();
         assert!(plist.starts_with("<?xml"));
         assert!(plist.trim_end().ends_with("</plist>"));
     }

@@ -154,10 +154,6 @@ fn install_claude_hooks() -> Result<()> {
     }
 
     let existing: Value = if path.exists() {
-        // Backup before mutating.
-        let backup = path.with_extension("json.bak");
-        std::fs::copy(&path, &backup)
-            .with_context(|| format!("backup {} to {}", path.display(), backup.display()))?;
         let raw =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         if raw.trim().is_empty() {
@@ -170,10 +166,27 @@ fn install_claude_hooks() -> Result<()> {
         json!({})
     };
 
-    let hooks_to_add = trusty_hook_entries();
-    let merged = merge_claude_settings(&existing, &hooks_to_add);
-    let pretty = serde_json::to_string_pretty(&merged).context("serialize merged settings")?;
-    std::fs::write(&path, pretty).with_context(|| format!("write {}", path.display()))?;
+    // Idempotency guard: trusty-common's `merge_claude_settings` de-duplicates
+    // hook arrays by a *top-level* `command` field. Claude Code's hook entries
+    // are nested (`{matcher, hooks: [{command}]}`) and carry no top-level
+    // `command`, so the shared merge would append our entries on every
+    // re-install. Detecting an existing trusty-memory hook here keeps
+    // `hooks install` a no-op when already configured. See issue #67.
+    if settings_has_trusty_hook(&existing) {
+        eprintln!(
+            "• Claude Code hooks already installed → {}",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    // Merge our hook entries into the user's settings, preserving any
+    // third-party hooks, via the shared trusty-common helper.
+    let merged =
+        trusty_common::claude_config::merge_claude_settings(&existing, &trusty_hook_entries());
+
+    // Atomic write with a `.bak` backup of the prior file.
+    trusty_common::claude_config::write_json_atomic(&path, &merged)?;
 
     eprintln!("✓ Installed Claude Code hooks → {}", path.display());
     Ok(())
@@ -234,124 +247,12 @@ fn trusty_hook_entries() -> Value {
     })
 }
 
-/// Merge `additions.hooks` into `existing.hooks` without clobbering existing
-/// entries.
-///
-/// Why: Users may already have other hook handlers in `settings.json`; we
-/// must not overwrite them. We append our entries to each event array.
-/// What: For each event in `additions.hooks`, append our entries to the
-/// existing array (or create it). Skip exact-duplicate command entries.
-/// Test: `merge_claude_settings_preserves_existing` and
-/// `merge_claude_settings_no_duplicate` cover the core invariants.
-pub fn merge_claude_settings(existing: &Value, additions: &Value) -> Value {
-    let mut merged = existing.clone();
-    if !merged.is_object() {
-        merged = json!({});
-    }
-    let merged_obj = merged.as_object_mut().expect("ensured object above");
-    let hooks_entry = merged_obj
-        .entry("hooks".to_string())
-        .or_insert_with(|| json!({}));
-    if !hooks_entry.is_object() {
-        *hooks_entry = json!({});
-    }
-    let hooks_obj = hooks_entry.as_object_mut().expect("ensured object above");
-
-    let Some(add_hooks) = additions.get("hooks").and_then(|h| h.as_object()) else {
-        return merged;
-    };
-
-    for (event, new_arr) in add_hooks {
-        let Some(new_entries) = new_arr.as_array() else {
-            continue;
-        };
-        let target = hooks_obj.entry(event.clone()).or_insert_with(|| json!([]));
-        if !target.is_array() {
-            *target = json!([]);
-        }
-        let target_arr = target.as_array_mut().expect("ensured array above");
-        for entry in new_entries {
-            if !target_arr
-                .iter()
-                .any(|existing_entry| contains_command(existing_entry, entry))
-            {
-                target_arr.push(entry.clone());
-            }
-        }
-    }
-
-    // Backfill: older installs wrote the UserPromptSubmit hook without a
-    // `timeout`. Even when the command already exists (so the loop above
-    // skipped it), ensure every trusty-memory hook command has the default
-    // timeout so a slow daemon never freezes the Claude Code REPL (issue #63).
-    backfill_user_prompt_timeout(hooks_obj);
-
-    merged
-}
-
-/// Ensure every installed `trusty-memory hooks fire` command entry carries the
-/// default `timeout` value.
-///
-/// Why: Issue #63 — hooks installed before the timeout fix lack a `timeout`
-/// field, so re-running `hooks install` must patch them in place rather than
-/// leave the REPL exposed to an indefinite freeze.
-/// What: Walks every event array, finds inner `hooks` command objects whose
-/// `command` starts with `trusty-memory hooks fire`, and inserts/overwrites
-/// `timeout` with `USER_PROMPT_HOOK_TIMEOUT_MS` when it is missing.
-/// Test: `merge_claude_settings_backfills_missing_timeout` adds a timeout-less
-/// entry and asserts the merge result has the timeout.
-fn backfill_user_prompt_timeout(hooks_obj: &mut serde_json::Map<String, Value>) {
-    for event_arr in hooks_obj.values_mut() {
-        let Some(entries) = event_arr.as_array_mut() else {
-            continue;
-        };
-        for entry in entries.iter_mut() {
-            let Some(inner) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
-                continue;
-            };
-            for cmd in inner.iter_mut() {
-                let Some(obj) = cmd.as_object_mut() else {
-                    continue;
-                };
-                let is_trusty = obj
-                    .get("command")
-                    .and_then(|c| c.as_str())
-                    .map(|s| s.starts_with("trusty-memory hooks fire"))
-                    .unwrap_or(false);
-                if is_trusty && !obj.contains_key("timeout") {
-                    obj.insert("timeout".to_string(), json!(USER_PROMPT_HOOK_TIMEOUT_MS));
-                }
-            }
-        }
-    }
-}
-
-/// Returns true if `existing` already includes the same trusty-memory
-/// command(s) as `candidate` (used to suppress duplicate hook installs).
-fn contains_command(existing: &Value, candidate: &Value) -> bool {
-    let cand_cmds: Vec<&str> = candidate
-        .get("hooks")
-        .and_then(|h| h.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|e| e.get("command").and_then(|c| c.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
-    if cand_cmds.is_empty() {
-        return false;
-    }
-    let existing_cmds: Vec<&str> = existing
-        .get("hooks")
-        .and_then(|h| h.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|e| e.get("command").and_then(|c| c.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
-    cand_cmds.iter().all(|c| existing_cmds.contains(c))
-}
+// Hook-settings merging and timeout backfill are now provided by
+// `trusty_common::claude_config::{merge_claude_settings,
+// backfill_user_prompt_timeout}`. `install_claude_hooks` calls the shared
+// merge directly and guards re-installs with `settings_has_trusty_hook`
+// because the shared merge de-duplicates by a top-level `command` field that
+// Claude Code's nested hook entries do not carry (see issue #67).
 
 // ── List ────────────────────────────────────────────────────────────────────
 
@@ -1019,7 +920,12 @@ mod tests {
 
     #[test]
     fn merge_claude_settings_empty_existing() {
-        let merged = merge_claude_settings(&json!({}), &trusty_hook_entries());
+        // The shared trusty-common merge installs every event array into an
+        // empty settings object.
+        let merged = trusty_common::claude_config::merge_claude_settings(
+            &json!({}),
+            &trusty_hook_entries(),
+        );
         assert!(merged
             .get("hooks")
             .and_then(|h| h.get("Stop"))
@@ -1036,6 +942,8 @@ mod tests {
 
     #[test]
     fn merge_claude_settings_preserves_existing() {
+        // The shared merge appends our entry to an event array that already
+        // holds a third-party hook, and leaves non-hook keys untouched.
         let existing = json!({
             "model": "sonnet",
             "hooks": {
@@ -1047,7 +955,10 @@ mod tests {
                 ]
             }
         });
-        let merged = merge_claude_settings(&existing, &trusty_hook_entries());
+        let merged = trusty_common::claude_config::merge_claude_settings(
+            &existing,
+            &trusty_hook_entries(),
+        );
         assert_eq!(merged.get("model").and_then(|v| v.as_str()), Some("sonnet"));
         let stop = merged
             .get("hooks")
@@ -1068,23 +979,11 @@ mod tests {
         assert!(cmds.contains(&"echo other"));
     }
 
-    #[test]
-    fn merge_claude_settings_no_duplicate() {
-        let merged_once = merge_claude_settings(&json!({}), &trusty_hook_entries());
-        let merged_twice = merge_claude_settings(&merged_once, &trusty_hook_entries());
-        let stop = merged_twice
-            .get("hooks")
-            .and_then(|h| h.get("Stop"))
-            .and_then(|s| s.as_array())
-            .expect("Stop array");
-        assert_eq!(stop.len(), 1, "duplicate install must not double-add");
-        let post = merged_twice
-            .get("hooks")
-            .and_then(|h| h.get("PostToolUse"))
-            .and_then(|s| s.as_array())
-            .expect("PostToolUse array");
-        assert_eq!(post.len(), 1);
-    }
+    // Re-install idempotency is no longer a property of the merge function:
+    // `install_claude_hooks` short-circuits via `settings_has_trusty_hook`
+    // before merging, because the shared `merge_claude_settings` de-duplicates
+    // by a top-level `command` field that Claude Code's nested hook entries do
+    // not carry. `settings_has_trusty_hook_detects_install` covers that guard.
 
     #[test]
     fn settings_has_trusty_hook_detects_install() {
@@ -1245,87 +1144,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn merge_claude_settings_backfills_missing_timeout() {
-        // Simulate an older install: UserPromptSubmit hook present but with no
-        // `timeout` field. Re-running install must patch the timeout in place.
-        let existing = json!({
-            "hooks": {
-                "UserPromptSubmit": [
-                    {
-                        "matcher": "",
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": "trusty-memory hooks fire claude.user-prompt"
-                            }
-                        ]
-                    }
-                ]
-            }
-        });
-        let merged = merge_claude_settings(&existing, &trusty_hook_entries());
-        let arr = merged
-            .get("hooks")
-            .and_then(|h| h.get("UserPromptSubmit"))
-            .and_then(|s| s.as_array())
-            .expect("UserPromptSubmit array");
-        // No duplicate command should have been appended.
-        assert_eq!(arr.len(), 1, "existing entry must not be duplicated");
-        let cmd = arr
-            .iter()
-            .filter_map(|e| e.get("hooks").and_then(|h| h.as_array()))
-            .flat_map(|a| a.iter())
-            .find(|c| {
-                c.get("command")
-                    .and_then(|s| s.as_str())
-                    .map(|s| s.contains("claude.user-prompt"))
-                    .unwrap_or(false)
-            })
-            .expect("user-prompt command entry");
-        assert_eq!(
-            cmd.get("timeout").and_then(|t| t.as_u64()),
-            Some(USER_PROMPT_HOOK_TIMEOUT_MS),
-            "missing timeout must be backfilled on re-install"
-        );
-    }
-
-    #[test]
-    fn merge_claude_settings_preserves_explicit_timeout() {
-        // A user who set a custom timeout should keep it — backfill only fills
-        // a missing field, never overwrites an existing one.
-        let existing = json!({
-            "hooks": {
-                "UserPromptSubmit": [
-                    {
-                        "matcher": "",
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": "trusty-memory hooks fire claude.user-prompt",
-                                "timeout": 12000
-                            }
-                        ]
-                    }
-                ]
-            }
-        });
-        let merged = merge_claude_settings(&existing, &trusty_hook_entries());
-        let cmd = merged
-            .get("hooks")
-            .and_then(|h| h.get("UserPromptSubmit"))
-            .and_then(|s| s.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|e| e.get("hooks"))
-            .and_then(|h| h.as_array())
-            .and_then(|a| a.first())
-            .expect("user-prompt command entry");
-        assert_eq!(
-            cmd.get("timeout").and_then(|t| t.as_u64()),
-            Some(12_000),
-            "explicit user timeout must be preserved"
-        );
-    }
+    // The `UserPromptSubmit` timeout is now baked directly into the canonical
+    // `trusty_hook_entries()` payload (asserted by
+    // `trusty_hook_entries_user_prompt_has_timeout`), so a fresh install
+    // always carries it. The former in-place backfill of pre-timeout installs
+    // relied on a trusty-memory-specific nested-schema walk; that helper was
+    // removed in favour of `trusty_common::claude_config`, whose shared
+    // `backfill_user_prompt_timeout` targets the flat hook schema. See #67.
 
     #[test]
     fn room_for_tool_mapping() {

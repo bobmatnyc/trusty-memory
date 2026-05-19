@@ -25,11 +25,6 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// Maximum directory depth searched under `$HOME` for nested Claude settings
-/// files. Keeps the scan bounded so a deep project tree cannot stall the
-/// command. Matches the "~5 levels" requirement in issue #64.
-const MAX_SCAN_DEPTH: usize = 5;
-
 /// The MCP server key that `kuzu-memory` registers itself under in Claude
 /// `settings.json`. Centralized so the scanner and rewriter agree.
 const KUZU_SERVER_KEY: &str = "kuzu-memory";
@@ -94,7 +89,8 @@ async fn migrate_kuzu_memory(opts: KuzuMemoryArgs, out: &OutputConfig) -> Result
     out.print_header("migrate", "kuzu-memory");
 
     // ── Phase 1: MCP config migration ────────────────────────────────────
-    let settings_files = discover_claude_settings()?;
+    let home = dirs::home_dir().context("resolve home directory")?;
+    let settings_files = trusty_common::claude_config::discover_claude_settings(&home);
     let mut config_changed = 0usize;
     for path in &settings_files {
         match migrate_settings_file(path, opts.dry_run) {
@@ -152,101 +148,15 @@ async fn migrate_kuzu_memory(opts: KuzuMemoryArgs, out: &OutputConfig) -> Result
 
 // ── Phase 1: MCP config migration ────────────────────────────────────────────
 
-/// Discover every Claude `settings.json` / `settings.local.json` file that may
-/// hold MCP server registrations.
-///
-/// Why: `kuzu-memory` can be registered globally (`~/.claude/settings.json`) or
-/// per-project (`<repo>/.claude/settings.json`); we must scan both.
-/// What: Returns the two top-level `~/.claude` files plus every
-/// `**/.claude/settings*.json` under `$HOME`, depth-limited to `MAX_SCAN_DEPTH`.
-/// Only existing files are returned; the result is deduplicated.
-/// Test: `discover_claude_settings_includes_top_level` builds a temp HOME and
-/// asserts the top-level files are found.
-pub fn discover_claude_settings() -> Result<Vec<PathBuf>> {
-    let home = dirs::home_dir().context("resolve home directory")?;
-    let mut found: Vec<PathBuf> = Vec::new();
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-
-    for name in ["settings.json", "settings.local.json"] {
-        let p = home.join(".claude").join(name);
-        if p.is_file() && seen.insert(p.clone()) {
-            found.push(p);
-        }
-    }
-
-    scan_for_claude_settings(&home, 0, &mut found, &mut seen);
-    Ok(found)
-}
-
-/// Recursively walk `dir` looking for `.claude/settings*.json` files.
-///
-/// Why: Per-project Claude settings live under each repo's `.claude/`
-/// directory; a bounded walk finds them without an external crate.
-/// What: Descends up to `MAX_SCAN_DEPTH` levels, skipping hidden directories
-/// (except `.claude` itself) and common heavy directories so the scan stays
-/// fast.
-/// Test: `scan_for_claude_settings_finds_nested` builds a nested temp tree.
-fn scan_for_claude_settings(
-    dir: &Path,
-    depth: usize,
-    found: &mut Vec<PathBuf>,
-    seen: &mut HashSet<PathBuf>,
-) {
-    if depth > MAX_SCAN_DEPTH {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-
-        if name == ".claude" {
-            for file in ["settings.json", "settings.local.json"] {
-                let p = path.join(file);
-                if p.is_file() && seen.insert(p.clone()) {
-                    found.push(p);
-                }
-            }
-            continue;
-        }
-
-        // Skip hidden and well-known heavy directories to keep the scan bounded.
-        if name.starts_with('.') || is_skipped_dir(&name) {
-            continue;
-        }
-        scan_for_claude_settings(&path, depth + 1, found, seen);
-    }
-}
-
-/// Returns true for directory names that should never be descended into during
-/// the settings scan (build output, dependency caches, VCS internals).
-fn is_skipped_dir(name: &str) -> bool {
-    matches!(
-        name,
-        "node_modules"
-            | "target"
-            | "vendor"
-            | "dist"
-            | "build"
-            | "Library"
-            | ".git"
-            | "__pycache__"
-    )
-}
-
 /// Migrate one Claude settings file in place (or report what would change).
 ///
 /// Why: Each discovered file may or may not register `kuzu-memory`; we only
 /// touch — and only back up — files that actually need rewriting.
 /// What: Parses the JSON, rewrites any `mcpServers.kuzu-memory` entry to
-/// `trusty-memory`, and (unless `dry_run`) writes a `.bak` backup followed by
-/// the updated file. Returns `Ok(true)` when a change was made.
+/// `trusty-memory`, and (unless `dry_run`) writes the updated file via
+/// `trusty_common::claude_config::write_json_atomic`, which backs the original
+/// up to `<path>.bak` and swaps the new content into place atomically.
+/// Returns `Ok(true)` when a change was made.
 /// Test: `migrate_settings_file_*` round-trip the rewrite on a temp file.
 pub fn migrate_settings_file(path: &Path, dry_run: bool) -> Result<bool> {
     let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
@@ -264,21 +174,18 @@ pub fn migrate_settings_file(path: &Path, dry_run: bool) -> Result<bool> {
         return Ok(true);
     }
 
-    // Back up the original before mutating (issue #64 acceptance criteria).
-    let backup = backup_path(path);
-    std::fs::copy(path, &backup)
-        .with_context(|| format!("back up {} to {}", path.display(), backup.display()))?;
-
-    let pretty = serde_json::to_string_pretty(&rewritten).context("serialize migrated settings")?;
-    std::fs::write(path, pretty).with_context(|| format!("write {}", path.display()))?;
+    // Atomic write with a `.bak` backup of the original (issue #64 acceptance
+    // criteria). Delegated to the shared trusty-common helper.
+    trusty_common::claude_config::write_json_atomic(path, &rewritten)?;
     Ok(true)
 }
 
 /// Compute the `.bak` backup path for a settings file.
 ///
-/// Why: The acceptance criteria require a `.bak` backup before modification;
-/// appending the suffix (rather than replacing the extension) keeps the
-/// original name visible — e.g. `settings.json` → `settings.json.bak`.
+/// Why: Used by tests to assert that `migrate_settings_file` produced the
+/// backup `trusty_common::claude_config::write_json_atomic` writes. Appending
+/// the suffix (rather than replacing the extension) keeps the original name
+/// visible — e.g. `settings.json` → `settings.json.bak`.
 /// What: Appends `.bak` to the file name.
 /// Test: `backup_path_appends_suffix`.
 pub fn backup_path(path: &Path) -> PathBuf {
@@ -631,59 +538,9 @@ mod tests {
         assert!(!migrate_settings_file(&path, false).expect("migrate"));
     }
 
-    #[test]
-    fn scan_for_claude_settings_finds_nested() {
-        let dir = tempdir().expect("tempdir");
-        let root = dir.path();
-        // root/project/.claude/settings.json
-        let claude = root.join("project").join(".claude");
-        fs::create_dir_all(&claude).unwrap();
-        let settings = claude.join("settings.json");
-        fs::write(&settings, "{}").unwrap();
-        // A skipped directory must not be descended into.
-        let nm = root.join("node_modules").join(".claude");
-        fs::create_dir_all(&nm).unwrap();
-        fs::write(nm.join("settings.json"), "{}").unwrap();
-
-        let mut found = Vec::new();
-        let mut seen = HashSet::new();
-        scan_for_claude_settings(root, 0, &mut found, &mut seen);
-
-        assert!(found.contains(&settings), "nested .claude settings found");
-        assert!(
-            !found
-                .iter()
-                .any(|p| p.starts_with(root.join("node_modules"))),
-            "node_modules skipped"
-        );
-    }
-
-    #[test]
-    fn scan_for_claude_settings_respects_depth_limit() {
-        let dir = tempdir().expect("tempdir");
-        let root = dir.path();
-        // Build a path deeper than MAX_SCAN_DEPTH.
-        let mut deep = root.to_path_buf();
-        for i in 0..(MAX_SCAN_DEPTH + 3) {
-            deep = deep.join(format!("d{i}"));
-        }
-        let claude = deep.join(".claude");
-        fs::create_dir_all(&claude).unwrap();
-        fs::write(claude.join("settings.json"), "{}").unwrap();
-
-        let mut found = Vec::new();
-        let mut seen = HashSet::new();
-        scan_for_claude_settings(root, 0, &mut found, &mut seen);
-        assert!(found.is_empty(), "settings beyond depth limit are skipped");
-    }
-
-    #[test]
-    fn is_skipped_dir_matches_known_heavy_dirs() {
-        assert!(is_skipped_dir("node_modules"));
-        assert!(is_skipped_dir("target"));
-        assert!(!is_skipped_dir("src"));
-        assert!(!is_skipped_dir("project"));
-    }
+    // Settings-file discovery is now provided by
+    // `trusty_common::claude_config::discover_claude_settings` and covered by
+    // that crate's `discover_finds_nested_claude_settings` test.
 
     #[test]
     fn dedup_count_collapses_duplicates() {

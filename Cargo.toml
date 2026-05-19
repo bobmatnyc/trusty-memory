@@ -34,7 +34,6 @@ dirs = "5"
 kuzu = "0.9"
 clap_complete = "4"
 colored = "2"
-walkdir = "2"
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
@@ -44,7 +43,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tower = { version = "0.4", features = ["util"] }
 trusty-mcp-core = "0.1.1"
 trusty-embedder = "0.1.5"
-trusty-common = { version = "0.3.2", features = ["axum-server"] }
+trusty-common = { version = "0.4.0", features = ["axum-server"] }
 
 # LOCAL DEV OVERRIDE — redirects crates.io resolution to sibling checkouts.
 # Before publishing to crates.io:
@@ -86,7 +85,6 @@ anyhow = { workspace = true }
 dotenvy = { workspace = true }
 clap_complete = { workspace = true }
 colored = { workspace = true }
-walkdir = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 chrono = { workspace = true }

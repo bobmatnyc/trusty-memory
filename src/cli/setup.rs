@@ -55,7 +55,7 @@ pub async fn handle_setup(opts: SetupOpts, _out: &OutputConfig) -> Result<()> {
     println!();
 
     // 2. Discover Claude Code projects.
-    let candidates = discover_claude_projects();
+    let candidates = trusty_common::project_discovery::discover_claude_projects();
     if candidates.is_empty() {
         println!(
             "{}",
@@ -132,43 +132,6 @@ fn print_welcome() {
     );
     println!("Machine-wide AI memory service with Memory Palace architecture.");
     println!();
-}
-
-/// Walk a small set of standard locations (`~/Projects`, `~/src`, `~/dev`,
-/// `~/code`) and return any subdirectory that looks like a Claude Code or
-/// git project.
-///
-/// Why: Most users keep their projects in one of these roots; offering a
-/// curated discovery list beats forcing them to type each path.
-/// What: For every existing root we list its immediate children and keep
-/// directories that contain `.claude/`, `CLAUDE.md`, or `.git/`.
-/// Test: Implicitly exercised by manual setup runs; logic is small and
-/// has no IO mocking.
-pub fn discover_claude_projects() -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
-    let Some(home) = dirs::home_dir() else {
-        return out;
-    };
-    let roots = ["Projects", "src", "dev", "code"];
-    for r in roots {
-        let root = home.join(r);
-        let Ok(entries) = std::fs::read_dir(&root) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            if path.join(".claude").exists()
-                || path.join("CLAUDE.md").exists()
-                || path.join(".git").exists()
-            {
-                out.push(path);
-            }
-        }
-    }
-    out
 }
 
 fn register_palaces_for(paths: &[PathBuf], data_root: &Path) -> Result<()> {
@@ -275,37 +238,21 @@ fn print_claude_code_hook(interactive: bool) -> Result<()> {
     Ok(())
 }
 
-/// Insert (or update) the `trusty-memory` entry in
-/// `~/.claude/claude_code_config.json`. Returns `Ok(true)` if a write
-/// happened, `Ok(false)` if the file already had the entry.
+/// Insert (or update) the `trusty-memory` entry in a Claude Code MCP config
+/// file, delegating the JSON upsert and atomic write to `trusty-common`.
+///
+/// Why: Every trusty-* installer needs to register itself in Claude's
+/// `mcpServers` map; sharing `trusty_common::claude_config::patch_mcp_server`
+/// keeps the atomic-write + `.bak` behaviour identical across the ecosystem.
+/// What: Upserts `mcpServers.trusty-memory` with the standard `serve` entry.
+/// Returns `Ok(true)` if a write happened, `Ok(false)` if the entry already
+/// matched.
+/// Test: `patch_adds_trusty_memory_entry` and `patch_preserves_existing_servers`
+/// exercise first-write, idempotency, and preservation of other servers.
 pub fn patch_claude_code_config(path: &Path) -> Result<bool> {
-    let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let mut json: serde_json::Value =
-        serde_json::from_str(&raw).with_context(|| format!("parse {} as JSON", path.display()))?;
-
-    let server = serde_json::json!({
-        "command": "trusty-memory",
-        "args": ["serve"],
-    });
-
-    let map = json
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("config root is not a JSON object"))?;
-    let servers = map
-        .entry("mcpServers".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    let servers_obj = servers
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("mcpServers is not an object"))?;
-
-    if servers_obj.get("trusty-memory") == Some(&server) {
-        return Ok(false);
-    }
-    servers_obj.insert("trusty-memory".to_string(), server);
-
-    let pretty = serde_json::to_string_pretty(&json).context("serialize MCP config")?;
-    std::fs::write(path, pretty).with_context(|| format!("write {}", path.display()))?;
-    Ok(true)
+    use trusty_common::claude_config::{mcp_server_entry, patch_mcp_server};
+    let entry = mcp_server_entry("trusty-memory", &["serve"]);
+    patch_mcp_server(path, "trusty-memory", &entry)
 }
 
 fn prompt(msg: &str) -> Result<String> {
